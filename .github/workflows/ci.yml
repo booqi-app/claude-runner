@@ -72,5 +72,20 @@ jobs:
       # job cannot catch a type-level mistake: dropping a field from an
       # interface is invisible to it. This job is the only thing that reads
       # them. Scope is tsconfig.json -- the Booqi-only modules and their tests.
+      # Installed into a scratch directory and symlinked in, rather than with
+      # `npm install` here: this package declares @anthropic-ai/claude-agent-sdk
+      # as a dependency, and a plain install would pull the whole Agent SDK
+      # down for a typecheck that does not read a line of it. `npx --package`
+      # is not an option either -- it resolves the packages in its own temp
+      # prefix, so tsc cannot find @types/node from this directory
+      # (`error TS2688: Cannot find type definition file for 'node'`).
       - name: tsc --noEmit
-        run: npx -y --package typescript@5 --package @types/node@24 -- tsc --noEmit -p tsconfig.json
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d)"
+          npm --prefix "$scratch" init -y >/dev/null
+          npm --prefix "$scratch" install --silent --no-audit --no-fund \
+            typescript@5 @types/node@24
+          ln -s "$scratch/node_modules" node_modules
+          "$scratch/node_modules/.bin/tsc" --noEmit -p tsconfig.json
+          rm node_modules
