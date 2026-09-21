@@ -25,6 +25,7 @@ import { startBridgeServer, stopBridgeServer } from "./src/claude-bridge.js";
 import {
   buildBridgeOptions,
   droppedMcpServersMessage,
+  plural,
   summariseMcpServers,
 } from "./src/bridge-config.js";
 import type { ExtensionBridgeOptions } from "./src/bridge-config.js";
@@ -91,10 +92,6 @@ const MODELS = [
 ];
 
 let bridgeServer: Awaited<ReturnType<typeof startBridgeServer>> | null = null;
-
-function plural(n: number, one: string, many: string): string {
-  return n === 1 ? one : many;
-}
 
 // The shape comes from src/bridge-config.ts, which is where it can be tested.
 // A second declaration here would just be a copy that drifts.

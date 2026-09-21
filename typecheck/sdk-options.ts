@@ -8,8 +8,8 @@
  * `Record<string, any>`, so without this a misspelt or invented option name
  * compiles, passes every behavioural test, and is discarded by the SDK.
  *
- * That is not hypothetical: `appendSystemPrompt` has been set here for the
- * life of the fork and is not an `Options` key at all. It is listed in
+ * That is not hypothetical: `appendSystemPrompt` IS still set by the bridge
+ * today and is not an `Options` key at all. It is listed in
  * KNOWN_NON_SDK_OPTION_NAMES, which the second assertion below keeps honest --
  * an entry there that the SDK *does* accept is also a compile error, so the
  * list cannot outlive the defect it records.

@@ -220,6 +220,10 @@ Verify the bridge has session data: `curl http://127.0.0.1:7779/v1/sessions`
 
 MIT
 
+## Known limitations
+
+- **The system prompt a caller sends does not reach the model.** The bridge passes it to the Agent SDK as `appendSystemPrompt`, which is not an SDK query option — it exists only on the SDK's internal control-protocol message, which the SDK derives from `systemPrompt`. Measured against `@anthropic-ai/claude-agent-sdk@0.2.92`: the key is discarded, `systemPrompt` is then sent as `""`, and the CLI treats that as falsy and falls back to its own default prompt. So a session runs on the Claude Code default system prompt, not on the one the agent was configured with. This predates the Booqi fork. Fixing it carries a product decision — whether to keep the Claude Code default and append to it, or to replace it — and a second change to the resume path, which only sends a system prompt on the first turn. Tracked in [booqi-app/infra#202](https://github.com/booqi-app/infra/issues/202); the name is listed in `KNOWN_NON_SDK_OPTIONS` in `src/bridge-config.ts`, and a compile-time check will fail if the SDK ever starts accepting it.
+
 ## Relationship to upstream
 
 This is a patch fork of [`siimvene/openclaw-claude-runner`](https://github.com/siimvene/openclaw-claude-runner). The fork point is `6286a07`; every commit up to and including it is upstream's.

@@ -93,13 +93,15 @@ export const SDK_OPTION_NAMES = [
 ] as const;
 
 /**
- * Keys `buildQueryOptions` sets that the SDK does NOT accept.
+ * Keys `buildQueryOptions` sets that the SDK does NOT accept, each mapped to
+ * the issue tracking its fix.
  *
- * Every entry is a known defect with a tracking issue, listed here so the guard
- * in `typecheck/sdk-options.ts` documents it instead of a future reader
- * discovering it the hard way. `typecheck/sdk-options.ts` also asserts the
- * reverse -- that nothing in this list IS an `Options` key -- so an entry
- * cannot be left behind once it is fixed.
+ * This is an escape hatch from the guard in `typecheck/sdk-options.ts`, so it
+ * is deliberately awkward to widen: the type requires an issue reference, a
+ * unit test pins the exact contents, and `typecheck/sdk-options.ts` asserts the
+ * reverse direction -- that nothing listed here IS an `Options` key -- so an
+ * entry cannot be left behind once it is fixed. Adding a name here to silence
+ * the guard is a visible, reviewable act, not a two-line edit.
  *
  * - `appendSystemPrompt`: not an `Options` key. It exists only on the SDK's
  *   internal control-protocol initialize message, which the SDK derives from
@@ -114,7 +116,13 @@ export const SDK_OPTION_NAMES = [
  *   becomes live the moment this is fixed. Tracked in booqi-app/infra#202; not
  *   in the scope of infra#166 AC-3.
  */
-export const KNOWN_NON_SDK_OPTION_NAMES = ["appendSystemPrompt"] as const;
+export const KNOWN_NON_SDK_OPTIONS = {
+  appendSystemPrompt: "booqi-app/infra#202",
+} as const satisfies Record<string, `booqi-app/infra#${number}`>;
+
+export const KNOWN_NON_SDK_OPTION_NAMES = Object.keys(
+  KNOWN_NON_SDK_OPTIONS,
+) as unknown as readonly (keyof typeof KNOWN_NON_SDK_OPTIONS)[];
 
 export const DEFAULT_MAX_TURNS = 30;
 export const DEFAULT_PORT = 7779;
@@ -200,15 +208,20 @@ export function summariseMcpServers(raw: unknown): {
 }
 
 /**
- * The log line for entries `readMcpServers` threw away.
+ * The log line for the entries `summariseMcpServers` reports as dropped --
+ * the same ones `readMcpServers` throws away.
  *
  * Lives here rather than inline in `index.ts` so it can be asserted: the
  * `__proto__` clause is conditional, and an unconditional one points the reader
  * at a name that is nowhere in the message.
  */
+export function plural(n: number, one: string, many: string): string {
+  return n === 1 ? one : many;
+}
+
 export function droppedMcpServersMessage(dropped: string[]): string {
   const names = dropped.map((n) => JSON.stringify(n)).join(", ");
-  const noun = dropped.length === 1 ? "entry" : "entries";
+  const noun = plural(dropped.length, "entry", "entries");
   const protoNote = dropped.includes("__proto__")
     ? ', and "__proto__" is not a usable server name'
     : "";

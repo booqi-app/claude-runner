@@ -21,6 +21,7 @@ import {
   buildBridgeOptions,
   buildQueryOptions,
   droppedMcpServersMessage,
+  KNOWN_NON_SDK_OPTIONS,
   KNOWN_NON_SDK_OPTION_NAMES,
   readMcpServers,
   SDK_OPTION_NAMES,
@@ -541,7 +542,36 @@ test("the system prompt is still set under the known-broken name", () => {
   );
 
   assert.equal(opts.appendSystemPrompt, "you are a bookkeeper");
-  assert.ok(KNOWN_NON_SDK_OPTION_NAMES.includes("appendSystemPrompt" as never));
+  assert.equal(KNOWN_NON_SDK_OPTIONS.appendSystemPrompt, "booqi-app/infra#202");
+});
+
+test("the known-non-SDK list holds exactly the defects we know about", () => {
+  // The list is an escape hatch from the compile-time option-name guard: a
+  // name added here is certified by both guards as "correctly not an SDK
+  // option". Pinning the contents makes widening it a visible, deliberate act
+  // rather than a two-line edit that turns the guard green again.
+  assert.deepEqual(Object.keys(KNOWN_NON_SDK_OPTIONS), ["appendSystemPrompt"]);
+  assert.deepEqual([...KNOWN_NON_SDK_OPTION_NAMES], ["appendSystemPrompt"]);
+
+  for (const [name, issue] of Object.entries(KNOWN_NON_SDK_OPTIONS)) {
+    assert.match(issue, /^booqi-app\/infra#\d+$/, `${name} names no tracking issue`);
+  }
+});
+
+test("the README records the defect an operator would otherwise not see", () => {
+  // The system prompt a caller sends does not reach the model. That lives in
+  // source comments, a tracking issue and a test name -- none of which an
+  // operator configuring a cell reads. Without a line in the README, deferring
+  // the fix is only defensible to reviewers.
+  const readme = readFileSync(join(repoRoot, "README.md"), "utf-8");
+
+  for (const issue of Object.values(KNOWN_NON_SDK_OPTIONS)) {
+    assert.ok(
+      readme.includes(issue),
+      `README does not mention ${issue}, the issue tracking a defect this code ships with`,
+    );
+  }
+  assert.match(readme, /## Known limitations/);
 });
 
 test("no system prompt leaves the key off entirely", () => {
