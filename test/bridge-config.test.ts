@@ -742,9 +742,11 @@ test("the known-non-SDK escape hatch is empty, and every entry names a tracking 
 
 test("the README documents what the agent's prompt does and does not include", () => {
   // AC-3 of booqi-app/infra#202. The choice between append and replace is a
-  // product decision with a consequence an operator has to know about -- under
-  // "replace" a session has no memory loading and no date. That must live
-  // somewhere an operator reads, not only in a source comment.
+  // product decision, and the thing an operator most needs from the README is
+  // what the modes do NOT differ on: CLAUDE.md/memory loading and today's date
+  // are injected from `cwd` in BOTH modes. An earlier revision claimed the
+  // opposite and used it to pick the default. That must live somewhere an
+  // operator reads, not only in a source comment.
   const readme = readFileSync(join(repoRoot, "README.md"), "utf-8");
 
   assert.match(readme, /systemPromptMode/);
