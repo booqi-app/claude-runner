@@ -40,7 +40,37 @@ jobs:
       - name: the JSON files parse
         run: |
           set -euo pipefail
-          for f in package.json openclaw.plugin.json config.example.json; do
+          for f in package.json openclaw.plugin.json config.example.json tsconfig.json; do
             node -e "JSON.parse(require('node:fs').readFileSync('$f','utf8'))" \
               && echo "ok  $f"
           done
+
+      # `npm test` globs test/**/*.test.ts. A file under test/ that does not
+      # match is simply never run, and the job stays green over it -- which is
+      # the one failure mode a test suite must not have.
+      - name: every file under test/ is picked up by the glob
+        run: |
+          set -euo pipefail
+          stray=$(find test -type f ! -name '*.test.ts')
+          if [ -n "$stray" ]; then
+            echo "not run by npm test:"; echo "$stray"; exit 1
+          fi
+          echo "ok  every file under test/ matches test/**/*.test.ts"
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Node's type stripping erases types without checking them, so the unit
+      # job cannot catch a type-level mistake: dropping a field from an
+      # interface is invisible to it. This job is the only thing that reads
+      # them. Scope is tsconfig.json -- the Booqi-only modules and their tests.
+      - name: tsc --noEmit
+        run: npx -y --package typescript@5 --package @types/node@24 -- tsc --noEmit -p tsconfig.json

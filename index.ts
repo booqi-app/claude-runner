@@ -22,11 +22,10 @@ import type {
   ProviderDiscoveryContext,
 } from "openclaw/plugin-sdk/core";
 import { startBridgeServer, stopBridgeServer } from "./src/claude-bridge.js";
-import { readMcpServers } from "./src/bridge-config.js";
-import type { McpServerConfig } from "./src/bridge-config.js";
+import { buildBridgeOptions, summariseMcpServers } from "./src/bridge-config.js";
+import type { ExtensionBridgeOptions } from "./src/bridge-config.js";
 
 const PROVIDER_ID = "claude-runner";
-const DEFAULT_PORT = 7779;
 const DEFAULT_WORK_DIR = "~/.openclaw/workspace";
 
 function loadExtensionConfig(): Record<string, unknown> {
@@ -89,19 +88,9 @@ const MODELS = [
 
 let bridgeServer: Awaited<ReturnType<typeof startBridgeServer>> | null = null;
 
-interface BridgeOpts {
-  port: number;
-  skipPermissions: boolean;
-  maxTurns: number;
-  queueMinDelayMs?: number;
-  queueMaxDelayMs?: number;
-  queueMaxConcurrency?: number;
-  sessionTtlMs?: number;
-  tools?: string[];
-  mcpServers?: Record<string, McpServerConfig>;
-  effort?: "low" | "medium" | "high" | "max";
-  maxBudgetUsd?: number;
-}
+// The shape comes from src/bridge-config.ts, which is where it can be tested.
+// A second declaration here would just be a copy that drifts.
+type BridgeOpts = ExtensionBridgeOptions;
 
 async function ensureBridgeRunning(
   ctx: {
@@ -118,21 +107,34 @@ async function ensureBridgeRunning(
   try {
     const rawWorkDir = ctx.workspaceDir ?? DEFAULT_WORK_DIR;
     const workDir = rawWorkDir.startsWith("~") ? rawWorkDir.replace("~", homedir()) : rawWorkDir;
-    bridgeServer = await startBridgeServer({
-      port: config.port,
-      skipPermissions: config.skipPermissions,
-      workDir,
-      maxTurns: config.maxTurns,
-      queueMinDelayMs: config.queueMinDelayMs,
-      queueMaxDelayMs: config.queueMaxDelayMs,
-      queueMaxConcurrency: config.queueMaxConcurrency,
-      sessionTtlMs: config.sessionTtlMs,
-      tools: config.tools,
-      mcpServers: config.mcpServers,
-      effort: config.effort,
-      maxBudgetUsd: config.maxBudgetUsd,
-    });
+    // Spread, not a hand-copied field list: a list has to be extended by hand
+    // for every new option and silently drops the ones someone forgot.
+    bridgeServer = await startBridgeServer({ ...config, workDir });
     ctx.logger?.info?.(`Claude Runner bridge listening on 127.0.0.1:${config.port}`);
+
+    // The SDK session's MCP servers decide whether this bridge can reach any
+    // tool at all. With the built-in tools restricted, a silently dropped
+    // entry means a session with no tools, which is indistinguishable from a
+    // working one until someone asks it to do something.
+    const mcp = summariseMcpServers(config.mcpServers);
+    if (mcp.accepted.length > 0) {
+      ctx.logger?.info?.(`Claude Runner MCP servers for the SDK session: ${mcp.accepted.join(", ")}`);
+    } else {
+      ctx.logger?.info?.("Claude Runner: no MCP server configured; the SDK session has only its built-in tools");
+    }
+    if (mcp.dropped.length > 0) {
+      ctx.logger?.error?.(
+        `Claude Runner: ignored ${mcp.dropped.length} unusable mcpServers entr(y|ies): ${mcp.dropped.join(", ")} -- each must be an object`,
+      );
+    }
+    if (mcp.withSecretsRisk.length > 0) {
+      // The SDK serialises the whole map onto the `claude` process command
+      // line as --mcp-config, so anything in it is readable in ps and
+      // /proc/<pid>/cmdline. Names only here; never the values.
+      ctx.logger?.error?.(
+        `Claude Runner: mcpServers entr(y|ies) ${mcp.withSecretsRisk.join(", ")} carry headers or env -- the SDK puts that on the command line of its subprocess, so it MUST NOT hold a credential`,
+      );
+    }
   } catch (err) {
     const details = err instanceof Error ? err.message : String(err);
     ctx.logger?.error?.(`Failed to start Claude Runner bridge: ${details}`);
@@ -147,24 +149,10 @@ const claudeRunnerPlugin = {
 
   register(api: OpenClawPluginApi) {
     const extConfig = loadExtensionConfig();
-    const port = (extConfig.port as number) ?? DEFAULT_PORT;
-    const skipPermissions = (extConfig.skipPermissions as boolean) ?? true;
+    const bridgeOpts: BridgeOpts = buildBridgeOptions(extConfig);
+    const port = bridgeOpts.port;
+    const skipPermissions = bridgeOpts.skipPermissions;
     const defaultModel = (extConfig.defaultModel as string) ?? "claude-opus-4-6";
-    const maxTurns = (extConfig.maxTurns as number) ?? 30;
-
-    const bridgeOpts: BridgeOpts = {
-      port,
-      skipPermissions,
-      maxTurns,
-      queueMinDelayMs: extConfig.queueMinDelayMs as number | undefined,
-      queueMaxDelayMs: extConfig.queueMaxDelayMs as number | undefined,
-      queueMaxConcurrency: extConfig.queueMaxConcurrency as number | undefined,
-      sessionTtlMs: extConfig.sessionTtlMs as number | undefined,
-      tools: extConfig.tools as string[] | undefined,
-      mcpServers: readMcpServers(extConfig.mcpServers),
-      effort: extConfig.effort as BridgeOpts["effort"] | undefined,
-      maxBudgetUsd: extConfig.maxBudgetUsd as number | undefined,
-    };
 
     api.registerService({
       id: "claude-runner-bridge",

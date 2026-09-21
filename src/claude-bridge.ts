@@ -20,7 +20,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { buildQueryOptions } from "./bridge-config.js";
 import type { BridgeConfig } from "./bridge-config.js";
 
-export type { BridgeConfig, McpServerConfig } from "./bridge-config.js";
+export type { BridgeConfig, McpServerEntry } from "./bridge-config.js";
 const MAX_RETRIES = 2;
 const RETRY_DELAYS = [1000, 2000];
 

@@ -81,7 +81,8 @@ Extension settings are in `~/.openclaw/extensions/claude-runner/config.json`:
 | `effort` | `"medium"` | Effort level: low, medium, high, max |
 | `maxBudgetUsd` | — | Cost cap per request (optional) |
 | `tools` | — | Restrict available tools (optional) |
-| `mcpServers` | — | MCP servers handed to the SDK session as `mcpServers` in the query options. Keyed by server name; each value is a transport object the Agent SDK understands. A workspace `.mcp.json` is not read by the SDK session the bridge starts, so this is the only way in. |
+| `mcpServers` | — | MCP servers handed to the SDK session as `mcpServers` in the query options. Keyed by server name; each value is a transport object the Agent SDK understands, e.g. `{"booqi": {"type": "http", "url": "http://127.0.0.1:3010/mcp"}}`. Tool names derive from the key (`mcp__<name>__<tool>`). **This value MUST NOT carry a credential:** the SDK serialises the whole map onto the `claude` subprocess command line as `--mcp-config`, where it is readable in `ps` and `/proc/<pid>/cmdline`. |
+| `strictMcpConfig` | `true` | Use only the servers in `mcpServers`, ignoring MCP configuration the SDK would otherwise discover on the filesystem (a `.mcp.json` in the working directory, user-level MCP settings). Set it to `false` for the SDK's own default. This is a change from earlier versions of this fork, which left the SDK to discover whatever it found. |
 
 To set as default model (optional):
 
@@ -217,3 +218,12 @@ Verify the bridge has session data: `curl http://127.0.0.1:7779/v1/sessions`
 ## License
 
 MIT
+
+## Relationship to upstream
+
+This is a patch fork of [`siimvene/openclaw-claude-runner`](https://github.com/siimvene/openclaw-claude-runner). The fork point is `6286a07`; every commit up to and including it is upstream's.
+
+Files that are Booqi-only, and therefore the ones a rebase onto upstream will have to carry rather than merge:
+
+- `src/bridge-config.ts` — `BridgeConfig`, `buildBridgeOptions()`, `readMcpServers()` and `buildQueryOptions()`. **`buildQueryOptions()` was moved out of `src/claude-bridge.ts`**, so an upstream change to it will land as a conflict in a file that no longer contains it. That is the known cost of making the SDK query options testable without the SDK installed.
+- `test/` and `.github/workflows/ci.yml` — neither exists upstream.

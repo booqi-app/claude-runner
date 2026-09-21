@@ -56,6 +56,10 @@
         "items": { "type": "string" },
         "description": "Allowed tools list (default: all claude_code tools)"
       },
+      "strictMcpConfig": {
+        "type": "boolean",
+        "description": "When true (the default), the SDK session uses only the MCP servers given in mcpServers and ignores MCP configuration it would otherwise discover on the filesystem. Set it to false to restore the SDK's own default."
+      },
       "mcpServers": {
         "type": "object",
         "additionalProperties": { "type": "object" },

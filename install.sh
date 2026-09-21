@@ -7,7 +7,11 @@ echo "Installing openclaw-claude-runner to $EXT_DIR ..."
 mkdir -p "$EXT_DIR/src"
 
 cp index.ts "$EXT_DIR/"
-cp src/claude-bridge.ts "$EXT_DIR/src/"
+# Every module under src/, not a hand-maintained list of them. A named list
+# silently ships a half extension the moment a module is split out: the copy
+# succeeds, the install reports success, and OpenClaw then fails to load the
+# extension on a missing import.
+cp src/*.ts "$EXT_DIR/src/"
 cp openclaw.plugin.json "$EXT_DIR/"
 cp package.json "$EXT_DIR/"
 
