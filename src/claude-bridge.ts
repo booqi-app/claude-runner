@@ -17,23 +17,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID, createHash } from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
+import { buildQueryOptions } from "./bridge-config.js";
+import type { BridgeConfig } from "./bridge-config.js";
 
-export interface BridgeConfig {
-  port: number;
-  workDir: string;
-  skipPermissions: boolean;
-  maxTurns?: number;
-  maxRetries?: number;
-  queueMinDelayMs?: number;
-  queueMaxDelayMs?: number;
-  queueMaxConcurrency?: number;
-  sessionTtlMs?: number;
-  tools?: string[];
-  effort?: "low" | "medium" | "high" | "max";
-  maxBudgetUsd?: number;
-}
-
-const DEFAULT_MAX_TURNS = 30;
+export type { BridgeConfig, McpServerConfig } from "./bridge-config.js";
 const MAX_RETRIES = 2;
 const RETRY_DELAYS = [1000, 2000];
 
@@ -453,54 +440,6 @@ async function executeWithRetries(
     res.writeHead(502, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: lastError || "SDK query failed after retries", type: "server_error" } }));
   }
-}
-
-// ── Build SDK options ───────────────────────────────────────────────
-
-function buildQueryOptions(
-  model: string,
-  systemPrompt: string | undefined,
-  resumeSessionId: string | undefined,
-  newSessionId: string | undefined,
-  config: BridgeConfig,
-  abortController: AbortController,
-): Record<string, any> {
-  const opts: Record<string, any> = {
-    model,
-    cwd: config.workDir,
-    maxTurns: config.maxTurns ?? DEFAULT_MAX_TURNS,
-    includePartialMessages: true,
-    abortController,
-  };
-
-  if (config.skipPermissions) {
-    opts.permissionMode = "bypassPermissions";
-    opts.allowDangerouslySkipPermissions = true;
-  }
-
-  if (resumeSessionId) {
-    opts.resume = resumeSessionId;
-  } else if (newSessionId) {
-    opts.sessionId = newSessionId;
-  }
-
-  if (systemPrompt) {
-    opts.appendSystemPrompt = systemPrompt;
-  }
-
-  if (config.tools) {
-    opts.tools = config.tools;
-  }
-
-  if (config.effort) {
-    opts.effort = config.effort;
-  }
-
-  if (config.maxBudgetUsd) {
-    opts.maxBudgetUsd = config.maxBudgetUsd;
-  }
-
-  return opts;
 }
 
 // ── Streaming response ──────────────────────────────────────────────

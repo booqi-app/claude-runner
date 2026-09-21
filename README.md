@@ -81,6 +81,7 @@ Extension settings are in `~/.openclaw/extensions/claude-runner/config.json`:
 | `effort` | `"medium"` | Effort level: low, medium, high, max |
 | `maxBudgetUsd` | — | Cost cap per request (optional) |
 | `tools` | — | Restrict available tools (optional) |
+| `mcpServers` | — | MCP servers handed to the SDK session as `mcpServers` in the query options. Keyed by server name; each value is a transport object the Agent SDK understands. A workspace `.mcp.json` is not read by the SDK session the bridge starts, so this is the only way in. |
 
 To set as default model (optional):
 

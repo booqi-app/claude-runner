@@ -1,0 +1,46 @@
+# CI for the Booqi patch fork of claude-runner.
+#
+# This repository had no workflow at all: nothing here was ever proved by a
+# machine. The unit suite is hermetic -- `src/bridge-config.ts` imports nothing,
+# so the job needs no `npm install`, no Agent SDK and no network beyond the
+# checkout. Node's own type stripping runs the TypeScript sources directly,
+# which is also how OpenClaw loads this extension, so the suite exercises the
+# same files the runtime does rather than a compiled copy of them.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # No `npm ci`: there is no lockfile and the suite has no dependencies.
+      # If that ever stops being true this step is where it breaks, loudly.
+      - name: unit tests
+        run: npm test
+
+      - name: the JSON files parse
+        run: |
+          set -euo pipefail
+          for f in package.json openclaw.plugin.json config.example.json; do
+            node -e "JSON.parse(require('node:fs').readFileSync('$f','utf8'))" \
+              && echo "ok  $f"
+          done

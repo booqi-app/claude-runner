@@ -8,5 +8,8 @@
   "queueMaxDelayMs": 4000,
   "queueMaxConcurrency": 1,
   "sessionTtlMs": 3600000,
-  "effort": "medium"
+  "effort": "medium",
+  "mcpServers": {
+    "booqi": { "type": "http", "url": "http://127.0.0.1:3010/mcp" }
+  }
 }

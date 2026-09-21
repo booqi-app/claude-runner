@@ -55,6 +55,11 @@
         "type": "array",
         "items": { "type": "string" },
         "description": "Allowed tools list (default: all claude_code tools)"
+      },
+      "mcpServers": {
+        "type": "object",
+        "additionalProperties": { "type": "object" },
+        "description": "MCP servers passed into the SDK query options as mcpServers. Keyed by server name; each value is a transport object the Agent SDK understands, e.g. { \"type\": \"http\", \"url\": \"http://127.0.0.1:3010/mcp\" }."
       }
     }
   }

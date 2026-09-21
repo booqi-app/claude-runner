@@ -22,6 +22,8 @@ import type {
   ProviderDiscoveryContext,
 } from "openclaw/plugin-sdk/core";
 import { startBridgeServer, stopBridgeServer } from "./src/claude-bridge.js";
+import { readMcpServers } from "./src/bridge-config.js";
+import type { McpServerConfig } from "./src/bridge-config.js";
 
 const PROVIDER_ID = "claude-runner";
 const DEFAULT_PORT = 7779;
@@ -96,6 +98,7 @@ interface BridgeOpts {
   queueMaxConcurrency?: number;
   sessionTtlMs?: number;
   tools?: string[];
+  mcpServers?: Record<string, McpServerConfig>;
   effort?: "low" | "medium" | "high" | "max";
   maxBudgetUsd?: number;
 }
@@ -125,6 +128,7 @@ async function ensureBridgeRunning(
       queueMaxConcurrency: config.queueMaxConcurrency,
       sessionTtlMs: config.sessionTtlMs,
       tools: config.tools,
+      mcpServers: config.mcpServers,
       effort: config.effort,
       maxBudgetUsd: config.maxBudgetUsd,
     });
@@ -157,6 +161,7 @@ const claudeRunnerPlugin = {
       queueMaxConcurrency: extConfig.queueMaxConcurrency as number | undefined,
       sessionTtlMs: extConfig.sessionTtlMs as number | undefined,
       tools: extConfig.tools as string[] | undefined,
+      mcpServers: readMcpServers(extConfig.mcpServers),
       effort: extConfig.effort as BridgeOpts["effort"] | undefined,
       maxBudgetUsd: extConfig.maxBudgetUsd as number | undefined,
     };
