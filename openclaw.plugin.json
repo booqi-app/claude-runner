@@ -64,6 +64,11 @@
         "type": "boolean",
         "description": "When true (the default), the SDK session uses only the MCP servers given in mcpServers and ignores MCP configuration it would otherwise discover on the filesystem. Set it to false to restore the SDK's own default."
       },
+      "systemPromptMode": {
+        "type": "string",
+        "enum": ["append", "replace"],
+        "description": "How the system prompt the caller sends is combined with the Claude Code preset prompt. \"append\" (the default) keeps the preset -- CLAUDE.md/memory loading, the environment block including today's date, and tool guidance -- and puts the caller's prompt after it. \"replace\" sends the caller's prompt alone, so the session has none of those. See booqi-app/infra#202."
+      },
       "mcpServers": {
         "type": "object",
         "additionalProperties": { "type": "object" },

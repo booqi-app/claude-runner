@@ -17,7 +17,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID, createHash } from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { buildQueryOptions } from "./bridge-config.js";
+import { buildQueryOptions, resolveSystemPrompt } from "./bridge-config.js";
 import type { BridgeConfig } from "./bridge-config.js";
 
 export type { BridgeConfig, McpServerEntry } from "./bridge-config.js";
@@ -392,53 +392,75 @@ async function executeWithRetries(
   } else {
     newSessionId = randomUUID();
   }
-  // Consume any pending compact summary for the new session
+  // Consume any pending compact summary. It is put back below if no attempt
+  // ever delivered it: consumption happens here, outside the retry loop, so
+  // without the restore a request that then fails non-transiently would clear
+  // the summary from the store and lose the rotated-away conversation for
+  // good. See booqi-app/infra#202.
   const compactSummary = sessionStore.consumeCompactSummary(conversationId);
+  let summaryDelivered = false;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (attempt > 0) {
-      const delay = RETRY_DELAYS[attempt - 1] ?? 2000;
-      await new Promise((r) => setTimeout(r, delay));
+  try {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (attempt > 0) {
+        const delay = RETRY_DELAYS[attempt - 1] ?? 2000;
+        await new Promise((r) => setTimeout(r, delay));
+      }
+
+      try {
+        // The system prompt goes out on EVERY turn, resumed or not. The CLI
+        // rebuilds it from the current query options each time; `--resume`
+        // replays the transcript, not the prompt. Omitting it on a resumed
+        // turn therefore does not inherit it, it sends an empty one, and the
+        // agent's persona flips silently after turn 1. The rule lives in
+        // resolveSystemPrompt so that it is testable without the SDK -- this
+        // module imports the SDK at the top level and the hermetic unit suite
+        // cannot load it. booqi-app/infra#202.
+        const effectiveSystemPrompt = resolveSystemPrompt(systemPrompt, compactSummary, resumeSessionId);
+
+        if (stream) {
+          await handleStreamingResponse(prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
+        } else {
+          await handleNonStreamingResponse(prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
+        }
+        summaryDelivered = true;
+        return;
+      } catch (err: any) {
+        lastError = err.message ?? String(err);
+
+        if (res.headersSent) return;
+
+        // Stale session — retry with fresh
+        if (resumeSessionId && /no conversation found|session/i.test(lastError)) {
+          resumeSessionId = undefined;
+          newSessionId = randomUUID();
+          sessionStore.record(conversationId, newSessionId);
+          continue;
+        }
+
+        if (!isTransientError(lastError)) {
+          break;
+        }
+      }
     }
 
-    try {
-      // Only send system prompt on first turn — resumed sessions already have it.
-      // Sending it again causes duplicate instructions and can trigger repeated responses.
-      let effectiveSystemPrompt: string | undefined;
-      if (!resumeSessionId) {
-        effectiveSystemPrompt = compactSummary
-          ? [systemPrompt, `\n\n## Previous conversation summary\n${compactSummary}`].filter(Boolean).join('')
-          : systemPrompt;
-      }
-
-      if (stream) {
-        await handleStreamingResponse(prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
-      } else {
-        await handleNonStreamingResponse(prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
-      }
-      return;
-    } catch (err: any) {
-      lastError = err.message ?? String(err);
-
-      if (res.headersSent) return;
-
-      // Stale session — retry with fresh
-      if (resumeSessionId && /no conversation found|session/i.test(lastError)) {
-        resumeSessionId = undefined;
-        newSessionId = randomUUID();
-        sessionStore.record(conversationId, newSessionId);
-        continue;
-      }
-
-      if (!isTransientError(lastError)) {
-        break;
-      }
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: lastError || "SDK query failed after retries", type: "server_error" } }));
     }
-  }
-
-  if (!res.headersSent) {
-    res.writeHead(502, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: lastError || "SDK query failed after retries", type: "server_error" } }));
+  } finally {
+    // Put the summary back unless it was delivered. `consumeCompactSummary`
+    // clears it from the store before the first attempt, so without this a
+    // request that then fails non-transiently -- one `break` away, below --
+    // would drop the only record of the rotated-away conversation. Retries
+    // are unaffected: they reuse the local `compactSummary`.
+    //
+    // `res.headersSent` counts as delivered: output already reached the
+    // client, so the SDK query did run with this summary in its prompt and
+    // replaying it on the next turn would duplicate it.
+    if (compactSummary && !summaryDelivered && !res.headersSent) {
+      sessionStore.setCompactSummary(conversationId, compactSummary);
+    }
   }
 }
 
