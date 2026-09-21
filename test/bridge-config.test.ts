@@ -21,9 +21,14 @@ import {
   buildBridgeOptions,
   buildQueryOptions,
   droppedMcpServersMessage,
+  COMPACT_SUMMARY_HEADING,
+  DEFAULT_SYSTEM_PROMPT_MODE,
+  isUnknownSystemPromptMode,
+  normaliseSystemPromptMode,
   KNOWN_NON_SDK_OPTIONS,
   KNOWN_NON_SDK_OPTION_NAMES,
   readMcpServers,
+  resolveSystemPrompt,
   SDK_OPTION_NAMES,
   summariseMcpServers,
   type BridgeConfig,
@@ -305,7 +310,7 @@ test("buildBridgeOptions carries every other configured value", () => {
   const opts = buildBridgeOptions(
     JSON.parse('{"port":1,"skipPermissions":false,"maxTurns":2,"queueMinDelayMs":3,'
       + '"queueMaxDelayMs":4,"queueMaxConcurrency":5,"sessionTtlMs":6,"maxRetries":8,"tools":["T"],'
-      + '"strictMcpConfig":false,"effort":"high","maxBudgetUsd":7}'),
+      + '"strictMcpConfig":false,"effort":"high","maxBudgetUsd":7,"systemPromptMode":"replace"}'),
   );
 
   assert.deepEqual(opts, {
@@ -322,6 +327,7 @@ test("buildBridgeOptions carries every other configured value", () => {
     strictMcpConfig: false,
     effort: "high",
     maxBudgetUsd: 7,
+    systemPromptMode: "replace",
   });
 });
 
@@ -372,11 +378,14 @@ test("every query() call in the bridge is given buildQueryOptions output", () =>
   // the options in a spread that drops a key, with every test above green.
   const bridge = sourceOf("src", "claude-bridge.ts");
 
-  const calls = bridge.match(/\bquery\s*\(/g) ?? [];
-  const wellFormed = bridge.match(/\bquery\s*\(\s*\{\s*prompt\s*,\s*options\s*,?\s*\}\s*,?\s*\)/g) ?? [];
+  // The SDK's query() is resolved lazily now (booqi-app/infra#202 made this
+  // module importable by the hermetic suite), so the call reads
+  // `(await getQuery())({ prompt, options })`.
+  const calls = bridge.match(/\(\s*await\s+getQuery\(\)\s*\)\s*\(/g) ?? [];
+  const wellFormed = bridge.match(/\(\s*await\s+getQuery\(\)\s*\)\(\s*\{\s*prompt\s*,\s*options\s*,?\s*\}\s*,?\s*\)/g) ?? [];
   const built = bridge.match(/=\s*buildQueryOptions\s*\(/g) ?? [];
 
-  assert.ok(calls.length > 0, "found no query() call in claude-bridge.ts");
+  assert.ok(calls.length > 0, "found no SDK query call in claude-bridge.ts");
   assert.equal(
     wellFormed.length, calls.length,
     `a query() call does not receive exactly { prompt, options } (${wellFormed.length} of ${calls.length})`,
@@ -530,52 +539,232 @@ test("both fixtures together reach every declared option name", () => {
   );
 });
 
-test("the system prompt is still set under the known-broken name", () => {
-  // Pins the defect rather than the fix: `appendSystemPrompt` is not an SDK
-  // Options key, so the prompt does not reach the model. Changing this is a
-  // behaviour change with a product decision in it and is tracked in
-  // booqi-app/infra#202, outside the scope of infra#166 AC-3. This test exists
-  // so the change is deliberate when it happens, and so the key stays inside a
-  // declared list in the meantime.
+// ── booqi-app/infra#202: the system prompt reaches the model ────────
+//
+// These are the tests that must fail if the fix is unwired. Before #202 the
+// bridge set `appendSystemPrompt`, which is not an SDK `Options` key at all,
+// so the prompt was discarded and the SDK sent `systemPrompt: ""` -- which on
+// the stream-json path suppresses the preset prompt too, leaving the session
+// with no system prompt whatsoever. The runtime capture is on the pull
+// request; what is assertable here is the option the bridge builds.
+
+test("the caller's system prompt reaches the SDK under the real option name", () => {
   const opts = buildQueryOptions(
     "claude-opus-4-6", "you are a bookkeeper", undefined, "session-1", baseConfig(), new AbortController(),
   );
 
-  assert.equal(opts.appendSystemPrompt, "you are a bookkeeper");
-  assert.equal(KNOWN_NON_SDK_OPTIONS.appendSystemPrompt, "booqi-app/infra#202");
+  // Default mode is "replace", so the prompt goes out as a plain string.
+  assert.equal(opts.systemPrompt, "you are a bookkeeper");
+  // The name that did nothing must be gone, not merely joined by the new one:
+  // the SDK ignores it, so leaving it would only mislead the next reader.
+  assert.equal("appendSystemPrompt" in opts, false);
+  assert.ok(SDK_OPTION_NAMES.includes("systemPrompt" as never));
 });
 
-test("the known-non-SDK list holds exactly the defects we know about", () => {
+test("systemPromptMode defaults to replace -- the agent's prompt, not the coding preset", () => {
+  // The default was "append" in the first round of booqi-app/infra#202, on two
+  // stated reasons that a measurement falsified: that the preset was the only
+  // source of today's date, and the only way CLAUDE.md/memory got loaded.
+  // Measured against the real cli.js at 0.2.92 with settingSources omitted, as
+  // this bridge leaves it, BOTH arrive in the first user message in BOTH modes:
+  //
+  //   replace -> 158 chars of system prompt, CLAUDE.md loaded, date present
+  //   append  -> 26,811 chars,               CLAUDE.md loaded, date present
+  //
+  // So "append" buys only ~26.6 KB of coding-agent instructions, which a
+  // bookkeeping cell must not act on -- its built-in tools are required to be
+  // disabled. Hence "replace".
+  assert.equal(DEFAULT_SYSTEM_PROMPT_MODE, "replace");
+
+  for (const config of [baseConfig(), baseConfig({ systemPromptMode: "replace" })]) {
+    const opts = buildQueryOptions(
+      "claude-opus-4-6", "P", undefined, "session-1", config, new AbortController(),
+    );
+    assert.equal(opts.systemPrompt, "P");
+  }
+});
+
+test("systemPromptMode append is still available and sends the preset form", () => {
+  const opts = buildQueryOptions(
+    "claude-opus-4-6", "P", undefined, "session-1",
+    baseConfig({ systemPromptMode: "append" }), new AbortController(),
+  );
+
+  assert.deepEqual(opts.systemPrompt, { type: "preset", preset: "claude_code", append: "P" });
+});
+
+test("an unrecognised systemPromptMode falls back to the default, and is reported", () => {
+  // The `enum` in openclaw.plugin.json does NOT police this: OpenClaw validates
+  // the config block of openclaw.json, while index.ts reads the extension's own
+  // config.json directly. So a typo reaches buildQueryOptions unchecked.
+  for (const bad of ["Replace", "plain", "none", "", true, 0, null, {}]) {
+    assert.equal(normaliseSystemPromptMode(bad), "replace", `normalise(${JSON.stringify(bad)})`);
+    assert.equal(isUnknownSystemPromptMode(bad), true, `isUnknown(${JSON.stringify(bad)})`);
+
+    const opts = buildQueryOptions(
+      "claude-opus-4-6", "P", undefined, "session-1",
+      baseConfig({ systemPromptMode: bad as any }), new AbortController(),
+    );
+    // Falls back to the default rather than to the 26 KB coding preset.
+    assert.equal(opts.systemPrompt, "P");
+  }
+
+  assert.equal(normaliseSystemPromptMode(undefined), "replace");
+  assert.equal(isUnknownSystemPromptMode(undefined), false, "absent is not 'unknown'");
+  assert.equal(normaliseSystemPromptMode("append"), "append");
+  assert.equal(isUnknownSystemPromptMode("append"), false);
+});
+
+test("buildBridgeOptions carries systemPromptMode from a parsed config.json", () => {
+  assert.equal(buildBridgeOptions({ systemPromptMode: "replace" }).systemPromptMode, "replace");
+  // Absent means absent, not "append" baked in twice: the default lives in
+  // buildQueryOptions alone, so there is one place to change it.
+  assert.equal(buildBridgeOptions({}).systemPromptMode, undefined);
+});
+
+// ── booqi-app/infra#202: the prompt goes out on EVERY turn ──────────
+
+test("a resumed turn gets the same system prompt as the first turn", () => {
+  // THE resume-path regression test. `--resume` replays the transcript, not
+  // the system prompt -- the CLI rebuilds that from the current query options
+  // on every query. The bridge used to send a prompt only when there was no
+  // resume id, so turn 2 onwards would have run with an empty prompt and the
+  // agent's persona would have flipped mid-conversation. Re-introducing that
+  // guard inside resolveSystemPrompt fails here.
+  assert.equal(resolveSystemPrompt("you are a bookkeeper", undefined, undefined), "you are a bookkeeper");
+  assert.equal(resolveSystemPrompt("you are a bookkeeper", undefined, "resume-9"), "you are a bookkeeper");
+  assert.equal(
+    resolveSystemPrompt("you are a bookkeeper", undefined, "resume-9"),
+    resolveSystemPrompt("you are a bookkeeper", undefined, undefined),
+  );
+});
+
+test("a resumed turn with a compaction summary carries prompt and summary both", () => {
+  const first = resolveSystemPrompt("P", "S", undefined);
+  const resumed = resolveSystemPrompt("P", "S", "resume-9");
+
+  assert.equal(resumed, first);
+  assert.ok(resumed!.startsWith("P"));
+  assert.ok(resumed!.includes("S"));
+  assert.ok(resumed!.includes(COMPACT_SUMMARY_HEADING));
+});
+
+test("a compaction summary with no caller prompt is sent as the heading plus the summary", () => {
+  assert.equal(resolveSystemPrompt(undefined, "S", undefined), `${COMPACT_SUMMARY_HEADING}S`);
+  assert.equal(resolveSystemPrompt("", "S", "resume-9"), `${COMPACT_SUMMARY_HEADING}S`);
+});
+
+test("the compaction-summary heading is pinned", () => {
+  // It was extracted and exported to be one named thing; nothing asserted its
+  // text, so changing it was a surviving mutant.
+  assert.equal(COMPACT_SUMMARY_HEADING, "\n\n## Previous conversation summary\n");
+});
+
+test("an empty-string caller prompt stays an empty string, and sets no option", () => {
+  // `""` is the dangerous value: to the SDK it is a present-and-empty prompt
+  // that suppresses the preset. resolveSystemPrompt passes it through, and
+  // buildQueryOptions' truthy guard is what stops it reaching the SDK. That
+  // coupling is load-bearing -- tightening the guard to `!== undefined` would
+  // reintroduce the defect -- so both halves are pinned here.
+  assert.equal(resolveSystemPrompt("", undefined, undefined), "");
+  assert.equal(resolveSystemPrompt("", undefined, "resume-9"), "");
+  assert.equal(resolveSystemPrompt("P", "", undefined), "P");
+
+  const opts = buildQueryOptions(
+    "claude-opus-4-6", "", undefined, "session-1", baseConfig(), new AbortController(),
+  );
+  assert.equal("systemPrompt" in opts, false);
+});
+
+test("no prompt and no summary stays undefined rather than becoming an empty string", () => {
+  // `""` is not equivalent to omitting the option: the SDK sends it as a
+  // real, empty system prompt and the preset is then suppressed.
+  assert.equal(resolveSystemPrompt(undefined, undefined, undefined), undefined);
+  assert.equal(resolveSystemPrompt(undefined, undefined, "resume-9"), undefined);
+});
+
+test("the bridge takes its per-turn system prompt from resolveSystemPrompt, unconditionally", () => {
+  // resolveSystemPrompt is assertable in isolation; claude-bridge.ts is not --
+  // it imports the Agent SDK at the top level, so the hermetic suite cannot
+  // load it. This keeps the transport routed through the tested rule, the
+  // same way the buildQueryOptions test above does. Comments are stripped
+  // first, so a commented-out call does not satisfy it.
+  const bridge = sourceOf("src", "claude-bridge.ts");
+
+  assert.match(bridge, /=\s*resolveSystemPrompt\s*\(/);
+
+  // The exact shape of the reverted bug: a system prompt gated on there being
+  // no resume id.
+  assert.equal(
+    /if\s*\(\s*!\s*resumeSessionId\s*\)/.test(bridge), false,
+    "claude-bridge.ts gates something on `!resumeSessionId` again -- if that is the system prompt, "
+      + "every resumed turn runs with an empty one (booqi-app/infra#202)",
+  );
+  assert.equal(
+    /\bappendSystemPrompt\b/.test(bridge), false,
+    "claude-bridge.ts names appendSystemPrompt, which is not an SDK option",
+  );
+});
+
+test("a compaction summary survives a request that fails without reaching the client", () => {
+  // The real loss window: consumeCompactSummary() runs once, before the retry
+  // loop, so a non-transient failure used to clear the summary from the store
+  // and lose the rotated-away conversation for good. The restore lives in a
+  // `finally`; this pins it, since the store itself is inside the SDK-importing
+  // module and cannot be driven from here.
+  const bridge = sourceOf("src", "claude-bridge.ts");
+
+  assert.match(bridge, /\}\s*finally\s*\{/, "the retry loop has no finally block to restore the summary");
+  assert.match(
+    bridge, /sessionStore\.setCompactSummary\s*\(/,
+    "nothing puts a consumed compaction summary back, so a failed request loses it",
+  );
+});
+
+test("the known-non-SDK escape hatch is empty, and every entry names a tracking issue", () => {
   // The list is an escape hatch from the compile-time option-name guard: a
   // name added here is certified by both guards as "correctly not an SDK
-  // option". Pinning the contents makes widening it a visible, deliberate act
-  // rather than a two-line edit that turns the guard green again.
-  assert.deepEqual(Object.keys(KNOWN_NON_SDK_OPTIONS), ["appendSystemPrompt"]);
-  assert.deepEqual([...KNOWN_NON_SDK_OPTION_NAMES], ["appendSystemPrompt"]);
+  // option". Empty is the intended steady state -- its one entry,
+  // appendSystemPrompt, was removed by booqi-app/infra#202. Pinning the
+  // contents makes widening it a visible, deliberate act rather than a
+  // two-line edit that turns the guard green again.
+  assert.deepEqual(Object.keys(KNOWN_NON_SDK_OPTIONS), []);
+  assert.deepEqual([...KNOWN_NON_SDK_OPTION_NAMES], []);
 
-  for (const [name, issue] of Object.entries(KNOWN_NON_SDK_OPTIONS)) {
+  // Typed explicitly: the object is empty today, so Object.entries infers
+  // `unknown` for the value and the loop would not compile. It still has to
+  // hold the day a name is added back.
+  const entries = Object.entries(KNOWN_NON_SDK_OPTIONS) as [string, string][];
+  for (const [name, issue] of entries) {
     assert.match(issue, /^booqi-app\/infra#\d+$/, `${name} names no tracking issue`);
   }
 });
 
-test("the README records the defect an operator would otherwise not see", () => {
-  // The system prompt a caller sends does not reach the model. That lives in
-  // source comments, a tracking issue and a test name -- none of which an
-  // operator configuring a cell reads. Without a line in the README, deferring
-  // the fix is only defensible to reviewers.
+test("the README documents what the agent's prompt does and does not include", () => {
+  // AC-3 of booqi-app/infra#202. The choice between append and replace is a
+  // product decision, and the thing an operator most needs from the README is
+  // what the modes do NOT differ on: CLAUDE.md/memory loading and today's date
+  // are injected from `cwd` in BOTH modes. An earlier revision claimed the
+  // opposite and used it to pick the default. That must live somewhere an
+  // operator reads, not only in a source comment.
   const readme = readFileSync(join(repoRoot, "README.md"), "utf-8");
 
-  for (const issue of Object.values(KNOWN_NON_SDK_OPTIONS)) {
-    assert.ok(
-      readme.includes(issue),
-      `README does not mention ${issue}, the issue tracking a defect this code ships with`,
-    );
-  }
+  assert.match(readme, /systemPromptMode/);
+  assert.match(readme, /## The system prompt/);
+  // Restored: the rewrite in the first round dropped this without replacing it.
   assert.match(readme, /## Known limitations/);
+  // Every defect still shipped must be findable from the README.
+  for (const issue of Object.values(KNOWN_NON_SDK_OPTIONS) as string[]) {
+    assert.ok(readme.includes(issue), `README does not mention ${issue}`);
+  }
 });
 
 test("no system prompt leaves the key off entirely", () => {
-  assert.equal("appendSystemPrompt" in optionsFor(baseConfig()), false);
+  // Not `systemPrompt: ""` -- that is a real, empty prompt to the SDK and
+  // suppresses the preset, which is the defect booqi-app/infra#202 fixed.
+  const opts = optionsFor(baseConfig());
+  assert.equal("systemPrompt" in opts, false);
+  assert.equal("appendSystemPrompt" in opts, false);
 });
 
 // ── The dropped-entries log line ────────────────────────────────────

@@ -84,6 +84,7 @@ Extension settings are in `~/.openclaw/extensions/claude-runner/config.json`:
 | `tools` | — | Restrict available tools (optional) |
 | `mcpServers` | — | MCP servers handed to the SDK session as `mcpServers` in the query options. Keyed by server name; each value is a transport object the Agent SDK understands, e.g. `{"booqi": {"type": "http", "url": "http://127.0.0.1:3010/mcp"}}`. Tool names derive from the key (`mcp__<name>__<tool>`). **This value MUST NOT carry a credential:** the SDK serialises the whole map onto the `claude` subprocess command line as `--mcp-config`, where it is readable in `ps` and `/proc/<pid>/cmdline`. |
 | `strictMcpConfig` | `true` | Use only the servers in `mcpServers`, ignoring MCP configuration the SDK would otherwise discover on the filesystem (a `.mcp.json` in the working directory, user-level MCP settings). Set it to `false` for the SDK's own default. **This is a change from earlier versions of this fork**, which left the SDK to discover whatever it found. Two things to know before leaving it on: with no `mcpServers` configured the session then has no MCP server at all, and on a host carrying an **enterprise-managed MCP configuration** the `claude` subprocess refuses to start while this is enabled — set it to `false` there. |
+| `systemPromptMode` | `"replace"` | How the agent's prompt is combined with the Claude Code preset prompt. See [The system prompt](#the-system-prompt). `"replace"` (default) sends the agent's prompt alone; `"append"` prepends the ~26.6 KB Claude Code preset. **CLAUDE.md/memory loading and today's date are injected from `cwd` in both modes** and are not affected by this setting. |
 
 To set as default model (optional):
 
@@ -91,6 +92,49 @@ To set as default model (optional):
 openclaw config set agents.defaults.model.primary "claude-runner/claude-opus-4-6"
 openclaw config set agents.defaults.model.fallbacks '["anthropic/claude-opus-4-5"]'
 ```
+
+## The system prompt
+
+The system prompt OpenClaw builds for an agent is handed to the SDK as the `systemPrompt` query option, on **every** turn of a conversation.
+
+Both halves of that sentence were broken until [booqi-app/infra#202](https://github.com/booqi-app/infra/issues/202):
+
+- The bridge set `appendSystemPrompt`, which is **not** a key of the SDK's `Options` type — it exists only on the SDK's internal control-protocol `initialize` message, which the SDK derives from `systemPrompt`. The key was discarded and `systemPrompt` went out as `""`. On the SDK's stream-json path an empty string is not the same as an omitted one: it is stored and used, and the preset prompt is then never built. So a session ran with **essentially no system prompt** — an 83-character billing header and a 62-character SDK identity line — not, as was long assumed, on the Claude Code default.
+- The prompt was sent only on the first turn, on the premise that "resumed sessions already have it". They do not. `--resume` replays the *transcript*; the CLI rebuilds the system prompt from the *current* query options on every query. Left alone, that would have made the agent's persona flip after turn 1 once the first defect was fixed, which is why the two changes landed together.
+
+### Which form, and why
+
+`systemPromptMode` chooses, and defaults to `"replace"`:
+
+| Mode | Query option | The session's system prompt |
+|---|---|---|
+| `"replace"` (default) | `systemPrompt: <prompt>` | The agent's own prompt, and nothing else. |
+| `"append"` | `systemPrompt: { type: "preset", preset: "claude_code", append: <prompt> }` | The Claude Code preset, then the agent's prompt. |
+
+**What the two modes do NOT differ on.** Measured against `@anthropic-ai/claude-agent-sdk@0.2.92`, driving the real bundled `cli.js` at a local mock Messages API, with `settingSources` omitted exactly as this bridge leaves it:
+
+| mode | system prompt | CLAUDE.md loaded | today's date present |
+|---|---|---|---|
+| `"replace"` | 158 chars | yes | yes |
+| `"append"` | 26,811 chars | yes | yes |
+
+CLAUDE.md/memory loading and the environment block that carries today's date are **not** part of the preset. The CLI injects both into the first user message, driven by `cwd`, in both modes.
+
+> An earlier revision of this file claimed the opposite — that `"append"` was the only mode that loaded memory and the only one that gave the session today's date — and used that to justify defaulting to `"append"`. Both claims were false. The table above is the measurement that replaced them.
+>
+> Note that `settingSources` **omitted** is not the same as `settingSources: []`. With an explicit empty array the CLAUDE.md is genuinely not loaded. This bridge omits the key, and so gets project memory. Do not "tidy" that into an empty array.
+
+So the only real difference is ~26.6 KB of Claude Code preset: a coding-agent identity and instructions to use the built-in `Bash`, `Read`, `Write` and `Edit` tools.
+
+**`"replace"` is the default** because the consumer this fork exists for is a bookkeeping cell, which is required to have those built-in tools disabled. The preset would tell it to use tools it does not have, give it an identity that contradicts its own before its own prompt is read, and cost roughly 6.7k tokens on every request of every turn against a shared rate limit — in exchange for nothing the session did not already have.
+
+`"append"` stays available for an installation that genuinely wants the coding-agent prompt: an operational OpenClaw instance doing software work rather than a tenant cell.
+
+### Compaction summaries
+
+When a session rotates at 75% context fill, the summary is prepended into the next request's system prompt. It is consumed from the session store once, before the retry loop, and **put back if no attempt delivered it** — otherwise a request that failed non-transiently would take the only record of the rotated-away conversation with it. Delivery is tracked by an explicit flag, not by `res.headersSent`: the 502 is written before the restore runs and would mask it.
+
+Caveat, honestly recorded: on the **streaming** path (the default) a mid-stream SDK error is turned into an SSE `Error: …` chunk rather than rethrown, so the turn counts as delivered and the summary is not restored. That is pre-existing behaviour, not a regression — the summary was lost there before this change too — but it means the restore is effective for `stream: false` and for failures that occur before any output.
 
 ## Available models
 
@@ -222,7 +266,8 @@ MIT
 
 ## Known limitations
 
-- **The system prompt a caller sends does not reach the model.** The bridge passes it to the Agent SDK as `appendSystemPrompt`, which is not an SDK query option — it exists only on the SDK's internal control-protocol message, which the SDK derives from `systemPrompt`. Measured against `@anthropic-ai/claude-agent-sdk@0.2.92`: the key is discarded, `systemPrompt` is then sent as `""`, and the CLI treats that as falsy and falls back to its own default prompt. So a session runs on the Claude Code default system prompt, not on the one the agent was configured with. This predates the Booqi fork. Fixing it carries a product decision — whether to keep the Claude Code default and append to it, or to replace it — and a second change to the resume path, which only sends a system prompt on the first turn. Tracked in [booqi-app/infra#202](https://github.com/booqi-app/infra/issues/202); the name is listed in `KNOWN_NON_SDK_OPTIONS` in `src/bridge-config.ts`, and a compile-time check will fail if the SDK ever starts accepting it.
+- **A request with no system prompt gets no preset either, and `""` is the same as omitting it.** When the caller sends no prompt the bridge sets no `systemPrompt` option; the SDK turns both that and an explicit `""` into the same present-and-empty prompt, so the Claude Code preset is not built in either case. `systemPromptMode` only takes effect when there is a prompt to combine with. In OpenClaw's own use there always is one; a caller that wants the bare preset has no way to ask for it today.
+- `src/bridge-config.ts` keeps a `KNOWN_NON_SDK_OPTIONS` escape hatch for query-option names the SDK does not accept. **It is currently empty, which is the intended state.** An entry there is a shipped defect with a tracking issue, certified by `typecheck/sdk-options.ts` in both directions: a name the bridge sets that is not an `Options` key fails the build unless it is listed, and a listed name the SDK *does* accept also fails the build, so an entry cannot outlive its fix.
 
 ## Relationship to upstream
 
@@ -231,6 +276,8 @@ This is a patch fork of [`siimvene/openclaw-claude-runner`](https://github.com/s
 Files that are Booqi-only, and therefore the ones a rebase onto upstream will have to carry rather than merge:
 
 - `src/bridge-config.ts` — `BridgeConfig`, `buildBridgeOptions()`, `readMcpServers()` and `buildQueryOptions()`. **`buildQueryOptions()` was moved out of `src/claude-bridge.ts`**, so an upstream change to it will land as a conflict in a file that no longer contains it. That is the known cost of making the SDK query options testable without the SDK installed.
+- `src/claude-bridge.ts` — **`executeWithRetries()` was restructured** into a `try { … } finally { … }` and its SDK import made lazy (`getQuery()`), so an upstream change to that function, or to the module's import block, conflicts across nearly every line of it. That is the cost of making the transport importable by a test at all; see `test/claude-bridge.test.ts` for why it was worth paying.
+- `README.md`, `openclaw.plugin.json` and `config.example.json` — these are upstream files that now carry the Booqi-only `systemPromptMode` key and its documentation.
 - `test/`, `typecheck/`, `tsconfig.json` and `.github/workflows/ci.yml` — none of them exist upstream.
 
 ### Running the checks locally

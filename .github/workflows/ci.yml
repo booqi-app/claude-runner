@@ -78,9 +78,10 @@ jobs:
       # asserts that every option name the bridge sets exists on the SDK's
       # `Options` type, which is the only check that can catch an invented
       # option name -- the query options are a Record<string, any>, so the SDK
-      # silently discards a key it does not know. `appendSystemPrompt` is
-      # exactly that, and the bridge still sets it -- see
-      # KNOWN_NON_SDK_OPTIONS and booqi-app/infra#202. The unit suite stays
+      # silently discards a key it does not know. `appendSystemPrompt` was
+      # exactly that until booqi-app/infra#202 replaced it with the real
+      # `systemPrompt` option; KNOWN_NON_SDK_OPTIONS is empty now and this job
+      # is what would catch the next such name. The unit suite stays
       # dependency-free; this job pays the install cost instead.
       # Installed into a scratch directory and symlinked in, rather than with a
       # plain `npm install` here, so that the SDK is present for this job only

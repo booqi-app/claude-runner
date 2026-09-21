@@ -63,7 +63,64 @@ export interface BridgeConfig {
   strictMcpConfig?: boolean;
   effort?: "low" | "medium" | "high" | "max";
   maxBudgetUsd?: number;
+  /**
+   * How the system prompt the caller sends is combined with the Claude Code
+   * preset prompt. Defaults to `"replace"`.
+   *
+   * - `"replace"` (default) -- `systemPrompt: <the caller's prompt>` as a
+   *   plain string. The session's system prompt is the agent's own prompt and
+   *   nothing else.
+   * - `"append"` -- `systemPrompt: { type: "preset", preset: "claude_code",
+   *   append: <the caller's prompt> }`. The Claude Code preset comes first,
+   *   the caller's prompt after it.
+   *
+   * ## What the choice actually costs, measured
+   *
+   * Measured against `@anthropic-ai/claude-agent-sdk@0.2.92` by driving the
+   * real bundled `cli.js` at a local mock Messages API, with `settingSources`
+   * omitted exactly as this bridge leaves it:
+   *
+   * | mode | system prompt | CLAUDE.md loaded | today's date present |
+   * |---|---|---|---|
+   * | `"replace"` | 158 chars | yes | yes |
+   * | `"append"` | 26,811 chars | yes | yes |
+   *
+   * **CLAUDE.md/memory loading and the environment block (today's date) are
+   * NOT carried by the preset.** The CLI injects both into the first user
+   * message, driven by `cwd`, in both modes. An earlier revision of this file
+   * claimed the opposite and used it to justify defaulting to `"append"`;
+   * that claim was false and the measurement above is what replaced it.
+   *
+   * Note `settingSources` omitted is NOT the same as `settingSources: []`.
+   * With `[]` the CLAUDE.md is genuinely not loaded; the bridge omits the key
+   * and so gets project memory. Do not "tidy" that into an empty array.
+   *
+   * So the only difference between the modes is ~26.6 KB of Claude Code
+   * preset: coding-agent identity and instructions to use `Bash`, `Read`,
+   * `Write`, `Edit` and friends. `"replace"` is the default because a
+   * bookkeeping cell is required to have those very tools disabled, so the
+   * preset tells it to use tools it does not have, contradicts its `boekhouder`
+   * identity before its own prompt is read, and costs ~6.7k tokens on every
+   * request of a shared rate limit -- in exchange for nothing the session did
+   * not already have.
+   *
+   * `"append"` remains available for an installation that genuinely wants the
+   * coding-agent prompt, e.g. an operational OpenClaw instance doing software
+   * work rather than a tenant cell.
+   *
+   * See booqi-app/infra#202. Before that issue neither mode happened: the
+   * prompt was passed under `appendSystemPrompt`, which is not an SDK option,
+   * so the SDK sent `systemPrompt: ""` and the session ran with essentially no
+   * system prompt -- an 83-char billing header plus a 62-char SDK identity
+   * line, NOT, as was long assumed, the Claude Code default. An empty string
+   * is not an absent one to this SDK: it is stored and used, and it suppresses
+   * the preset.
+   */
+  systemPromptMode?: SystemPromptMode;
 }
+
+/** @see BridgeConfig.systemPromptMode */
+export type SystemPromptMode = "append" | "replace";
 
 /**
  * Every key `buildQueryOptions` sets that IS a real SDK `Options` key.
@@ -89,6 +146,7 @@ export const SDK_OPTION_NAMES = [
   "resume",
   "sessionId",
   "strictMcpConfig",
+  "systemPrompt",
   "tools",
 ] as const;
 
@@ -103,22 +161,18 @@ export const SDK_OPTION_NAMES = [
  * entry cannot be left behind once it is fixed. Adding a name here to silence
  * the guard is a visible, reviewable act, not a two-line edit.
  *
- * - `appendSystemPrompt`: not an `Options` key. It exists only on the SDK's
- *   internal control-protocol initialize message, which the SDK derives from
- *   `systemPrompt: { type: "preset", append }`. Measured against 0.2.92: the
- *   key is dropped, `systemPrompt` is then sent as `""`, and the CLI treats
- *   that as falsy and falls back to its own default system prompt. So the
- *   prompt OpenClaw builds never reaches the model and the Claude Code default
- *   is used instead. Predates this fork's first Booqi commit. Fixing it is a
- *   behaviour change with a product decision in it -- whether a cell's agent
- *   should keep the Claude Code default prompt at all -- and the resume path
- *   in `claude-bridge.ts` only sends a system prompt on the first turn, which
- *   becomes live the moment this is fixed. Tracked in booqi-app/infra#202; not
- *   in the scope of infra#166 AC-3.
+ * It is currently EMPTY, and that is the intended steady state. Its one entry,
+ * `appendSystemPrompt`, was removed by booqi-app/infra#202: the bridge now
+ * sets the real `systemPrompt` option instead. The machinery is kept rather
+ * than deleted because the failure mode it guards -- `buildQueryOptions`
+ * returns `Record<string, any>`, so an invented option name compiles, passes
+ * every behavioural test and is silently discarded by the SDK -- has not gone
+ * away.
  */
-export const KNOWN_NON_SDK_OPTIONS = {
-  appendSystemPrompt: "booqi-app/infra#202",
-} as const satisfies Record<string, `booqi-app/infra#${number}`>;
+export const KNOWN_NON_SDK_OPTIONS = {} as const satisfies Record<
+  string,
+  `booqi-app/infra#${number}`
+>;
 
 export const KNOWN_NON_SDK_OPTION_NAMES = Object.keys(
   KNOWN_NON_SDK_OPTIONS,
@@ -126,6 +180,78 @@ export const KNOWN_NON_SDK_OPTION_NAMES = Object.keys(
 
 export const DEFAULT_MAX_TURNS = 30;
 export const DEFAULT_PORT = 7779;
+export const DEFAULT_SYSTEM_PROMPT_MODE: SystemPromptMode = "replace";
+
+/**
+ * Narrow a configured `systemPromptMode` to a value the bridge understands.
+ *
+ * `config.json` is read with `JSON.parse` and handed over as
+ * `Record<string, unknown>`; the `enum` in `openclaw.plugin.json` does NOT
+ * police it, because OpenClaw validates the `config` block of `openclaw.json`
+ * and this extension reads its own `config.json` directly. So a typo would
+ * otherwise fail open.
+ *
+ * It fails open deliberately -- an unusable config must not stop a cell from
+ * starting -- but it returns the recognised value so the caller can say so.
+ * `"Replace"` is a typo, not a request for the coding-agent preset, and
+ * silently giving it 26 KB of the opposite of what was asked for is the
+ * failure this exists to make visible.
+ */
+export function normaliseSystemPromptMode(
+  value: unknown,
+): SystemPromptMode {
+  if (value === "append" || value === "replace") return value;
+  return DEFAULT_SYSTEM_PROMPT_MODE;
+}
+
+/** True when a configured value was present but not a mode the bridge knows. */
+export function isUnknownSystemPromptMode(value: unknown): boolean {
+  return value !== undefined && value !== "append" && value !== "replace";
+}
+
+/** The heading the compaction summary is filed under inside the system prompt. */
+export const COMPACT_SUMMARY_HEADING = "\n\n## Previous conversation summary\n";
+
+/**
+ * The system prompt for ONE turn of a conversation.
+ *
+ * Extracted out of `claude-bridge.ts` so that it is assertable without the
+ * Agent SDK installed: that module imports the SDK at the top level, so the
+ * hermetic unit suite cannot import it, and before booqi-app/infra#202 the
+ * rule below was an inline `if` inside a retry loop that no test could reach.
+ *
+ * ## `resumeSessionId` is accepted and deliberately ignored
+ *
+ * That is the fix, and the parameter is here so the fix has somewhere to be
+ * tested. Until booqi-app/infra#202 the bridge sent a system prompt only on
+ * the first turn, on the stated premise that "resumed sessions already have
+ * it". That premise is false for this SDK: `--resume` replays the TRANSCRIPT,
+ * and the CLI rebuilds the system prompt from the CURRENT query options on
+ * every query. So an omitted prompt on turn 2 is not an inherited prompt, it
+ * is an empty one, and the agent's persona would silently flip after turn 1.
+ *
+ * Taking the id as an argument and ignoring it keeps that decision in one
+ * place, expressed as code, where re-introducing the guard is a one-line
+ * change inside a function the suite covers -- rather than an untestable
+ * branch in the transport.
+ *
+ * @param systemPrompt    the prompt the caller sent, if any
+ * @param compactSummary  a summary of the rotated-away conversation, if any
+ * @param resumeSessionId the SDK session being resumed, if any -- ignored
+ */
+export function resolveSystemPrompt(
+  systemPrompt: string | undefined,
+  compactSummary: string | undefined,
+  resumeSessionId: string | undefined,
+): string | undefined {
+  void resumeSessionId;
+
+  if (!compactSummary) return systemPrompt;
+
+  return [systemPrompt, `${COMPACT_SUMMARY_HEADING}${compactSummary}`]
+    .filter(Boolean)
+    .join("");
+}
 
 /**
  * Server names that cannot survive being written into a plain object.
@@ -256,6 +382,7 @@ export function buildBridgeOptions(extConfig: Record<string, unknown>): Extensio
     strictMcpConfig: extConfig.strictMcpConfig as boolean | undefined,
     effort: extConfig.effort as BridgeConfig["effort"],
     maxBudgetUsd: extConfig.maxBudgetUsd as number | undefined,
+    systemPromptMode: extConfig.systemPromptMode as SystemPromptMode | undefined,
   };
 }
 
@@ -290,12 +417,20 @@ export function buildQueryOptions(
   }
 
   if (systemPrompt) {
-    // KNOWN DEFECT, deliberately left as it is: `appendSystemPrompt` is not an
-    // SDK `Options` key, so this prompt does not reach the model. See
-    // KNOWN_NON_SDK_OPTION_NAMES and booqi-app/infra#202. Left unchanged here
-    // because fixing it is a behaviour change carrying a product decision, and
-    // this pull request is scoped to infra#166 AC-3.
-    opts.appendSystemPrompt = systemPrompt;
+    // `systemPrompt`, NOT `appendSystemPrompt`. The latter is not a key of the
+    // SDK's `Options` type at all -- it exists only on the SDK's internal
+    // control-protocol `initialize` message, which the SDK derives from this
+    // option. Setting it did nothing except make the SDK send `systemPrompt`
+    // as `""`, which on the stream-json path is stored as-is and suppresses
+    // the preset prompt entirely. See booqi-app/infra#202 for the capture.
+    //
+    // Which of the two forms is used is configuration, not a constant; see
+    // `BridgeConfig.systemPromptMode` for the decision and the measurement
+    // behind it.
+    opts.systemPrompt =
+      normaliseSystemPromptMode(config.systemPromptMode) === "append"
+        ? { type: "preset", preset: "claude_code", append: systemPrompt }
+        : systemPrompt;
   }
 
   if (config.tools) {

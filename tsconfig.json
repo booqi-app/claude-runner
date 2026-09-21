@@ -1,5 +1,5 @@
 {
-  "//": "Typecheck only. Covers the Booqi-only modules, their tests and typecheck/sdk-options.ts -- src/claude-bridge.ts and index.ts are excluded because they import the Agent SDK and openclaw/plugin-sdk/core, neither of which is installed in CI, and both carry type holes that predate this fork's first Booqi commit.",
+  "//": "Typecheck only. Covers the Booqi-only modules, their tests and typecheck/sdk-options.ts. src/claude-bridge.ts is included since booqi-app/infra#202: its SDK import is now `import type` plus a lazy `await import(...)`, so it typechecks cleanly against the installed SDK and test/claude-bridge.test.ts imports it for real behavioural assertions. index.ts stays excluded because it imports openclaw/plugin-sdk/core, which is not installed in CI.",
   "compilerOptions": {
     "target": "ES2022",
     "module": "nodenext",
@@ -8,7 +8,14 @@
     "noEmit": true,
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src/bridge-config.ts", "test/**/*.ts", "typecheck/**/*.ts"]
+  "include": [
+    "src/bridge-config.ts",
+    "src/claude-bridge.ts",
+    "test/**/*.ts",
+    "typecheck/**/*.ts"
+  ]
 }

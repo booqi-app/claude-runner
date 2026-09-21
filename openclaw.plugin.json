@@ -64,6 +64,11 @@
         "type": "boolean",
         "description": "When true (the default), the SDK session uses only the MCP servers given in mcpServers and ignores MCP configuration it would otherwise discover on the filesystem. Set it to false to restore the SDK's own default."
       },
+      "systemPromptMode": {
+        "type": "string",
+        "enum": ["append", "replace"],
+        "description": "How the system prompt the caller sends is combined with the Claude Code preset prompt. \"replace\" (the default) sends the agent's prompt alone. \"append\" prepends the ~26.6 KB Claude Code preset, i.e. coding-agent identity and instructions to use built-in Bash/Read/Write tools. CLAUDE.md/memory loading and the environment block (today's date) are injected from cwd in BOTH modes and are not affected by this setting. See booqi-app/infra#202."
+      },
       "mcpServers": {
         "type": "object",
         "additionalProperties": { "type": "object" },
