@@ -250,10 +250,48 @@ test("a summary is not restored when the turn succeeded but res.end() then faile
   });
 
   assert.equal(res.headersSent, true, "precondition: headers were sent before the failure");
+  // `headersSent` alone is also true on the happy path, so it cannot tell the
+  // two apart. `writableEnded` stays false only when end() threw, which pins
+  // that this test really took the EPIPE path -- without it, neutering the
+  // fake's throw silently turns this into a duplicate of the success test.
+  assert.equal(res.writableEnded, false, "precondition: res.end() threw, so this is the EPIPE path");
   assert.equal(
     sessionStore.get(conversationId)?.compactSummary, undefined,
     "the summary was restored although the SDK query had already consumed it -- "
       + "it will be duplicated in the next turn's system prompt",
+  );
+});
+
+test("a newer summary written during the request is not clobbered by the restore", async () => {
+  // KILLS the mutant that drops `&& !sessionStore.get(cid)?.compactSummary`
+  // from the restore condition. `scheduleCompaction` runs synchronously inside
+  // both handlers and `rotateSession` writes a FRESH summary into the store
+  // during the very request whose finally then runs, so restoring the stale
+  // one unconditionally silently reverts the compaction.
+  const { sessionStore } = __testing.initialiseStores(config);
+  const conversationId = "conv-clobber";
+  sessionStore.record(conversationId, "");
+  sessionStore.setCompactSummary(conversationId, "OLD-SUMMARY");
+
+  __testing.setQuery((() => (async function* () {
+    // Stand in for scheduleCompaction()/rotateSession() firing mid-request.
+    sessionStore.setCompactSummary(conversationId, "NEWER-SUMMARY");
+    throw new Error("invalid request: model refused");
+  })()) as unknown as QueryFn);
+
+  const res = fakeRes();
+  try {
+    await executeWithRetries(
+      "hello", "claude-opus-4-6", "P", conversationId, false, res, "req-3", config,
+    );
+  } finally {
+    __testing.setQuery(undefined);
+  }
+
+  assert.equal(res.statusCode, 502, "precondition: the request failed without reaching the client");
+  assert.equal(
+    sessionStore.get(conversationId)?.compactSummary, "NEWER-SUMMARY",
+    "the restore clobbered a newer summary with the stale one, reverting the compaction",
   );
 });
 
