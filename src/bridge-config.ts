@@ -68,8 +68,19 @@ export interface BridgeConfig {
 export const DEFAULT_MAX_TURNS = 30;
 export const DEFAULT_PORT = 7779;
 
-/** Keys that, assigned with `obj[key] = v`, do something other than add a key. */
-const UNSAFE_ASSIGNMENT_KEYS = new Set(["__proto__"]);
+/**
+ * Server names that cannot survive being written into a plain object.
+ *
+ * `out["__proto__"] = value` replaces the prototype of `out` instead of adding
+ * a key, and `JSON.parse` really does produce such an own key. Defining it
+ * safely here does not help: the Agent SDK rebuilds the map with exactly that
+ * assignment before serialising it, so the entry disappears inside the SDK and
+ * its contents land on the prototype of the object the SDK sends. A name like
+ * this is also unusable -- the tool prefix would be `mcp____proto____`. So it
+ * is dropped, and reported as dropped, rather than kept in a form that only
+ * looks like it survived.
+ */
+const UNUSABLE_SERVER_NAMES = new Set(["__proto__"]);
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -87,6 +98,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  *
  * Server names are preserved verbatim -- the SDK derives tool names from them
  * (`mcp__<name>__<tool>`), so rewriting a name silently breaks every tool call.
+ * The one exception is `__proto__`; see `UNUSABLE_SERVER_NAMES`.
  */
 export function readMcpServers(raw: unknown): Record<string, McpServerEntry> | undefined {
   if (!isPlainObject(raw)) return undefined;
@@ -94,19 +106,7 @@ export function readMcpServers(raw: unknown): Record<string, McpServerEntry> | u
   const out: Record<string, McpServerEntry> = {};
   for (const [name, value] of Object.entries(raw)) {
     if (!isPlainObject(value)) continue;
-    if (UNSAFE_ASSIGNMENT_KEYS.has(name)) {
-      // `out[name] = value` for "__proto__" replaces the prototype of `out`
-      // instead of adding a key: the server would vanish from the map while
-      // its contents leaked onto the object handed to the SDK. JSON.parse
-      // does produce such an own key, so this is reachable from a config file.
-      Object.defineProperty(out, name, {
-        value,
-        enumerable: true,
-        writable: true,
-        configurable: true,
-      });
-      continue;
-    }
+    if (UNUSABLE_SERVER_NAMES.has(name)) continue;
     out[name] = value;
   }
 
@@ -137,7 +137,7 @@ export function summariseMcpServers(raw: unknown): {
   const withSecretsRisk: string[] = [];
 
   for (const [name, value] of Object.entries(raw)) {
-    if (!isPlainObject(value)) {
+    if (!isPlainObject(value) || UNUSABLE_SERVER_NAMES.has(name)) {
       dropped.push(name);
       continue;
     }
@@ -168,6 +168,7 @@ export function buildBridgeOptions(extConfig: Record<string, unknown>): Extensio
     queueMaxDelayMs: extConfig.queueMaxDelayMs as number | undefined,
     queueMaxConcurrency: extConfig.queueMaxConcurrency as number | undefined,
     sessionTtlMs: extConfig.sessionTtlMs as number | undefined,
+    maxRetries: extConfig.maxRetries as number | undefined,
     tools: extConfig.tools as string[] | undefined,
     mcpServers: extConfig.mcpServers,
     strictMcpConfig: extConfig.strictMcpConfig as boolean | undefined,
@@ -221,6 +222,19 @@ export function buildQueryOptions(
 
   // Set unconditionally, including when no server is configured -- that is the
   // case where an unnoticed MCP configuration on the filesystem matters most.
+  //
+  // Verified against @anthropic-ai/claude-agent-sdk 0.2.92: the SDK's own type
+  // declaration calls this "strict validation of MCP server configurations",
+  // which is NOT what it does. It drives the CLI's `--strict-mcp-config`, whose
+  // documented meaning is "only use MCP servers from --mcp-config, ignoring all
+  // other MCP configurations". That is the behaviour relied on here. Recorded
+  // because the stale docstring makes this line look like a misreading.
+  //
+  // Two consequences, both intended. The SDK emits `--mcp-config` only when the
+  // map is non-empty, so with no configured server the session has no MCP
+  // server at all. And on a host carrying an enterprise-managed MCP config the
+  // CLI refuses to start at all with this flag set; such a host must configure
+  // strictMcpConfig: false.
   opts.strictMcpConfig = config.strictMcpConfig ?? true;
 
   if (config.effort) {

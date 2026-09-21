@@ -4,3 +4,7 @@ config.json
 .DS_Store
 *.js.map
 *.d.ts.map
+
+# A symlink named node_modules -- "node_modules/" does not match one, and the
+# typecheck job creates exactly that.
+node_modules

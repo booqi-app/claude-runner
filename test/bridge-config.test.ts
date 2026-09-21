@@ -178,20 +178,58 @@ test("readMcpServers returns undefined when every entry is unusable", () => {
   assert.equal(readMcpServers({ broken: "nope", alsoBroken: 1 }), undefined);
 });
 
-test("a server named __proto__ becomes an own key and hijacks no prototype", () => {
+test("a server named __proto__ is dropped, not kept in a form the SDK loses", () => {
   // JSON.parse produces an own "__proto__" key, so this is reachable from a
-  // config file. A plain out[name] = value would replace the prototype of the
-  // returned map instead of adding a key: the server would vanish and its
-  // contents would be inherited by the object handed to the SDK.
+  // config file, and `out[name] = value` for it replaces the prototype of the
+  // map instead of adding a key. Defining it safely here is not enough: the
+  // Agent SDK rebuilds the map with exactly that assignment before serialising
+  // it, so the entry would vanish inside the SDK and its contents would land
+  // on the prototype of the object the SDK sends -- while this bridge logged
+  // the server as accepted. The name is unusable anyway (the tool prefix would
+  // be `mcp____proto____`), so it is dropped and reported as dropped.
   const raw = JSON.parse(
-    '{"__proto__":{"type":"http","url":"http://127.0.0.1:3010/mcp"},"ok":{"type":"http"}}',
+    '{"__proto__":{"type":"http","url":"http://evil/mcp"},"ok":{"type":"http"}}',
   );
   const read = readMcpServers(raw)!;
 
-  assert.deepEqual(Object.keys(read).sort(), ["__proto__", "ok"]);
+  assert.deepEqual(Object.keys(read), ["ok"]);
   assert.equal(Object.getPrototypeOf(read), Object.prototype);
   assert.equal((read as any).url, undefined);
   assert.equal(({} as any).url, undefined, "Object.prototype was polluted");
+
+  // It must not be reported as accepted: that log line is the only signal a
+  // cell gives that it came up with the servers it was configured with.
+  const summary = summariseMcpServers(raw);
+  assert.deepEqual(summary.accepted, ["ok"]);
+  assert.deepEqual(summary.dropped, ["__proto__"]);
+});
+
+test("a config naming only __proto__ yields no mcpServers key at all", () => {
+  const raw = JSON.parse('{"__proto__":{"type":"http","url":"http://evil/mcp"}}');
+
+  assert.equal(readMcpServers(raw), undefined);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(optionsFor(baseConfig({ mcpServers: raw })), "mcpServers"),
+    false,
+  );
+});
+
+test("the options map survives being rebuilt entry by entry, as the SDK does", () => {
+  // The SDK rebuilds the map with obj[key] = value before serialising it to
+  // --mcp-config. Anything that only looks intact here has to survive that.
+  const raw = JSON.parse(
+    '{"__proto__":{"type":"http","url":"http://evil/mcp"},"booqi":{"type":"http","url":"http://127.0.0.1:3010/mcp"}}',
+  );
+  const opts = optionsFor(baseConfig({ mcpServers: raw }));
+
+  const rebuilt: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(opts.mcpServers)) rebuilt[k] = v;
+
+  assert.deepEqual(Object.keys(rebuilt), ["booqi"]);
+  assert.equal(Object.getPrototypeOf(rebuilt), Object.prototype);
+  assert.deepEqual(JSON.parse(JSON.stringify({ mcpServers: opts.mcpServers })), {
+    mcpServers: CELL_MCP_SERVERS,
+  });
 });
 
 test("readMcpServers reads a value parsed from a config.json", () => {
@@ -262,7 +300,7 @@ test("buildBridgeOptions applies the documented defaults", () => {
 test("buildBridgeOptions carries every other configured value", () => {
   const opts = buildBridgeOptions(
     JSON.parse('{"port":1,"skipPermissions":false,"maxTurns":2,"queueMinDelayMs":3,'
-      + '"queueMaxDelayMs":4,"queueMaxConcurrency":5,"sessionTtlMs":6,"tools":["T"],'
+      + '"queueMaxDelayMs":4,"queueMaxConcurrency":5,"sessionTtlMs":6,"maxRetries":8,"tools":["T"],'
       + '"strictMcpConfig":false,"effort":"high","maxBudgetUsd":7}'),
   );
 
@@ -274,6 +312,7 @@ test("buildBridgeOptions carries every other configured value", () => {
     queueMaxDelayMs: 4,
     queueMaxConcurrency: 5,
     sessionTtlMs: 6,
+    maxRetries: 8,
     tools: ["T"],
     mcpServers: undefined,
     strictMcpConfig: false,
@@ -358,6 +397,11 @@ test("index.ts builds its bridge options with buildBridgeOptions and spreads the
   assert.match(entry, /=\s*buildBridgeOptions\s*\(\s*extConfig\s*\)/);
   assert.match(entry, /startBridgeServer\s*\(\s*\{\s*\.\.\.config\s*,\s*workDir\s*,?\s*\}\s*\)/);
   assert.doesNotMatch(entry, /mcpServers:\s*(undefined|null)/);
+
+  // Server names come from a config file, so they are quoted into a log line
+  // rather than interpolated bare -- a newline in a name would forge one.
+  assert.match(entry, /\.map\(\(n\) => JSON\.stringify\(n\)\)/);
+  assert.doesNotMatch(entry, /\$\{mcp\.(accepted|dropped|withSecretsRisk)\.join/);
 });
 
 // ── The shipped configuration surface ───────────────────────────────
@@ -413,5 +457,63 @@ test("install.sh ships every module under src/", () => {
         `install.sh copies src/ file-by-file but never copies src/${mod}`,
       );
     }
+  }
+});
+
+// ── The configuration surface has no unreachable corners ────────────
+
+test("buildBridgeOptions reads every key the config schema declares", () => {
+  // buildBridgeOptions is a hand-written mapping, which is the shape of bug
+  // install.sh just stopped having. A key the schema accepts but the mapping
+  // never reads is configuration that silently does nothing.
+  const schema = JSON.parse(readFileSync(join(repoRoot, "openclaw.plugin.json"), "utf-8")).configSchema;
+  // workDir comes from the OpenClaw workspace and defaultModel is a provider
+  // setting that never reaches the bridge. Both say so in their description.
+  const notBridgeOptions = new Set(["workDir", "defaultModel"]);
+
+  const declared = Object.keys(schema.properties).filter((k) => !notBridgeOptions.has(k));
+  const read = new Set(Object.keys(buildBridgeOptions({})));
+
+  const unreachable = declared.filter((k) => !read.has(k));
+  assert.deepEqual(unreachable, [], `config keys the bridge never reads: ${unreachable}`);
+});
+
+test("the SDK option names are spelled as the SDK spells them", () => {
+  // buildQueryOptions returns Record<string, any>, so a typo compiles, passes
+  // any test that reads the key back, and is ignored by the SDK. Pinning the
+  // exact key set is the cheapest guard against that.
+  const opts = optionsFor(
+    baseConfig({ mcpServers: CELL_MCP_SERVERS, tools: [], effort: "medium", maxBudgetUsd: 1 }),
+  );
+
+  assert.deepEqual(Object.keys(opts).sort(), [
+    "abortController",
+    "allowDangerouslySkipPermissions",
+    "cwd",
+    "effort",
+    "includePartialMessages",
+    "maxBudgetUsd",
+    "maxTurns",
+    "mcpServers",
+    "model",
+    "permissionMode",
+    "sessionId",
+    "strictMcpConfig",
+    "tools",
+  ]);
+});
+
+test("tsconfig typechecks every module under src/", () => {
+  // Same failure mode as install.sh's named copy list: split another module
+  // out and nothing typechecks it, with CI green.
+  const tsconfig = JSON.parse(readFileSync(join(repoRoot, "tsconfig.json"), "utf-8"));
+  const covered = JSON.stringify(tsconfig.include) + String(tsconfig["//"]);
+  const modules = readdirSync(join(repoRoot, "src")).filter((f) => f.endsWith(".ts"));
+
+  for (const mod of modules) {
+    assert.ok(
+      covered.includes(`src/${mod}`),
+      `src/${mod} is neither in tsconfig "include" nor named in the exclusion rationale`,
+    );
   }
 });

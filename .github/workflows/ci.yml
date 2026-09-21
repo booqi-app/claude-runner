@@ -86,6 +86,10 @@ jobs:
           npm --prefix "$scratch" init -y >/dev/null
           npm --prefix "$scratch" install --silent --no-audit --no-fund \
             typescript@5 @types/node@24
-          ln -s "$scratch/node_modules" node_modules
+          # -sfn, and removed on any exit: a plain `ln -s` onto an existing
+          # node_modules directory creates node_modules/node_modules and the
+          # failure shows up as a baffling TS2688, and `set -e` would otherwise
+          # skip the cleanup on a tsc failure and leave the tree dirty.
+          trap 'rm -f node_modules' EXIT
+          ln -sfn "$scratch/node_modules" node_modules
           "$scratch/node_modules/.bin/tsc" --noEmit -p tsconfig.json
-          rm node_modules

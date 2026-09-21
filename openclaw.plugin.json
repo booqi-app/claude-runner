@@ -13,7 +13,7 @@
       },
       "workDir": {
         "type": "string",
-        "description": "Working directory for the SDK (default: ~/.openclaw/workspace)"
+        "description": "Ignored: the bridge takes its working directory from the OpenClaw workspace it is started in. Kept so an existing config.json carrying it is not refused."
       },
       "skipPermissions": {
         "type": "boolean",
@@ -38,6 +38,10 @@
       "queueMaxConcurrency": {
         "type": "number",
         "description": "Max concurrent SDK queries (default: 1)"
+      },
+      "maxRetries": {
+        "type": "number",
+        "description": "How many times a transient SDK failure is retried before the request fails (default: 2)."
       },
       "sessionTtlMs": {
         "type": "number",

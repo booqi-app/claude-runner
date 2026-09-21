@@ -88,6 +88,10 @@ const MODELS = [
 
 let bridgeServer: Awaited<ReturnType<typeof startBridgeServer>> | null = null;
 
+function plural(n: number, one: string, many: string): string {
+  return n === 1 ? one : many;
+}
+
 // The shape comes from src/bridge-config.ts, which is where it can be tested.
 // A second declaration here would just be a copy that drifts.
 type BridgeOpts = ExtensionBridgeOptions;
@@ -117,22 +121,31 @@ async function ensureBridgeRunning(
     // entry means a session with no tools, which is indistinguishable from a
     // working one until someone asks it to do something.
     const mcp = summariseMcpServers(config.mcpServers);
+    // Names are quoted, never interpolated bare: a server name comes from a
+    // config file and a newline in one would otherwise forge a log line.
+    const names = (list: string[]) => list.map((n) => JSON.stringify(n)).join(", ");
+
     if (mcp.accepted.length > 0) {
-      ctx.logger?.info?.(`Claude Runner MCP servers for the SDK session: ${mcp.accepted.join(", ")}`);
+      ctx.logger?.info?.(`Claude Runner MCP servers for the SDK session: ${names(mcp.accepted)}`);
     } else {
       ctx.logger?.info?.("Claude Runner: no MCP server configured; the SDK session has only its built-in tools");
     }
     if (mcp.dropped.length > 0) {
+      // A dropped entry is a real misconfiguration: the cell loses a server it
+      // was told to have. That is an error.
       ctx.logger?.error?.(
-        `Claude Runner: ignored ${mcp.dropped.length} unusable mcpServers entr(y|ies): ${mcp.dropped.join(", ")} -- each must be an object`,
+        `Claude Runner: ignored ${mcp.dropped.length} unusable mcpServers ${plural(mcp.dropped.length, "entry", "entries")}: ${names(mcp.dropped)} -- each must be an object, and "__proto__" is not a usable server name`,
       );
     }
     if (mcp.withSecretsRisk.length > 0) {
-      // The SDK serialises the whole map onto the `claude` process command
-      // line as --mcp-config, so anything in it is readable in ps and
-      // /proc/<pid>/cmdline. Names only here; never the values.
-      ctx.logger?.error?.(
-        `Claude Runner: mcpServers entr(y|ies) ${mcp.withSecretsRisk.join(", ")} carry headers or env -- the SDK puts that on the command line of its subprocess, so it MUST NOT hold a credential`,
+      // Advisory, not an error: `env` is the normal way to configure a stdio
+      // MCP server, so this fires on correct configurations too and must not
+      // train anyone to ignore the error channel. The SDK serialises the whole
+      // map onto the `claude` process command line as --mcp-config, so anything
+      // in it is readable in ps and /proc/<pid>/cmdline. Names only; never
+      // the values.
+      ctx.logger?.info?.(
+        `Claude Runner WARNING: mcpServers ${plural(mcp.withSecretsRisk.length, "entry", "entries")} ${names(mcp.withSecretsRisk)} carry headers or env -- the SDK puts that on the command line of its subprocess, so it MUST NOT hold a credential`,
       );
     }
   } catch (err) {
@@ -151,7 +164,6 @@ const claudeRunnerPlugin = {
     const extConfig = loadExtensionConfig();
     const bridgeOpts: BridgeOpts = buildBridgeOptions(extConfig);
     const port = bridgeOpts.port;
-    const skipPermissions = bridgeOpts.skipPermissions;
     const defaultModel = (extConfig.defaultModel as string) ?? "claude-opus-4-6";
 
     api.registerService({
