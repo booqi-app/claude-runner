@@ -13,7 +13,7 @@
       },
       "workDir": {
         "type": "string",
-        "description": "Working directory for the SDK (default: ~/.openclaw/workspace)"
+        "description": "Ignored: the bridge takes its working directory from the OpenClaw workspace it is started in. Kept so an existing config.json carrying it is not refused."
       },
       "skipPermissions": {
         "type": "boolean",
@@ -39,6 +39,10 @@
         "type": "number",
         "description": "Max concurrent SDK queries (default: 1)"
       },
+      "maxRetries": {
+        "type": "number",
+        "description": "How many times a transient SDK failure is retried before the request fails (default: 2)."
+      },
       "sessionTtlMs": {
         "type": "number",
         "description": "Session cache TTL in ms (default: 3600000)"
@@ -55,6 +59,15 @@
         "type": "array",
         "items": { "type": "string" },
         "description": "Allowed tools list (default: all claude_code tools)"
+      },
+      "strictMcpConfig": {
+        "type": "boolean",
+        "description": "When true (the default), the SDK session uses only the MCP servers given in mcpServers and ignores MCP configuration it would otherwise discover on the filesystem. Set it to false to restore the SDK's own default."
+      },
+      "mcpServers": {
+        "type": "object",
+        "additionalProperties": { "type": "object" },
+        "description": "MCP servers passed into the SDK query options as mcpServers. Keyed by server name; each value is a transport object the Agent SDK understands, e.g. { \"type\": \"http\", \"url\": \"http://127.0.0.1:3010/mcp\" }."
       }
     }
   }

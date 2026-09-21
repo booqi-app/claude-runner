@@ -22,9 +22,15 @@ import type {
   ProviderDiscoveryContext,
 } from "openclaw/plugin-sdk/core";
 import { startBridgeServer, stopBridgeServer } from "./src/claude-bridge.js";
+import {
+  buildBridgeOptions,
+  droppedMcpServersMessage,
+  plural,
+  summariseMcpServers,
+} from "./src/bridge-config.js";
+import type { ExtensionBridgeOptions } from "./src/bridge-config.js";
 
 const PROVIDER_ID = "claude-runner";
-const DEFAULT_PORT = 7779;
 const DEFAULT_WORK_DIR = "~/.openclaw/workspace";
 
 function loadExtensionConfig(): Record<string, unknown> {
@@ -87,18 +93,9 @@ const MODELS = [
 
 let bridgeServer: Awaited<ReturnType<typeof startBridgeServer>> | null = null;
 
-interface BridgeOpts {
-  port: number;
-  skipPermissions: boolean;
-  maxTurns: number;
-  queueMinDelayMs?: number;
-  queueMaxDelayMs?: number;
-  queueMaxConcurrency?: number;
-  sessionTtlMs?: number;
-  tools?: string[];
-  effort?: "low" | "medium" | "high" | "max";
-  maxBudgetUsd?: number;
-}
+// The shape comes from src/bridge-config.ts, which is where it can be tested.
+// A second declaration here would just be a copy that drifts.
+type BridgeOpts = ExtensionBridgeOptions;
 
 async function ensureBridgeRunning(
   ctx: {
@@ -115,20 +112,41 @@ async function ensureBridgeRunning(
   try {
     const rawWorkDir = ctx.workspaceDir ?? DEFAULT_WORK_DIR;
     const workDir = rawWorkDir.startsWith("~") ? rawWorkDir.replace("~", homedir()) : rawWorkDir;
-    bridgeServer = await startBridgeServer({
-      port: config.port,
-      skipPermissions: config.skipPermissions,
-      workDir,
-      maxTurns: config.maxTurns,
-      queueMinDelayMs: config.queueMinDelayMs,
-      queueMaxDelayMs: config.queueMaxDelayMs,
-      queueMaxConcurrency: config.queueMaxConcurrency,
-      sessionTtlMs: config.sessionTtlMs,
-      tools: config.tools,
-      effort: config.effort,
-      maxBudgetUsd: config.maxBudgetUsd,
-    });
+    // Spread, not a hand-copied field list: a list has to be extended by hand
+    // for every new option and silently drops the ones someone forgot.
+    bridgeServer = await startBridgeServer({ ...config, workDir });
     ctx.logger?.info?.(`Claude Runner bridge listening on 127.0.0.1:${config.port}`);
+
+    // The SDK session's MCP servers decide whether this bridge can reach any
+    // tool at all. With the built-in tools restricted, a silently dropped
+    // entry means a session with no tools, which is indistinguishable from a
+    // working one until someone asks it to do something.
+    const mcp = summariseMcpServers(config.mcpServers);
+    // Names are quoted, never interpolated bare: a server name comes from a
+    // config file and a newline in one would otherwise forge a log line.
+    const names = (list: string[]) => list.map((n) => JSON.stringify(n)).join(", ");
+
+    if (mcp.accepted.length > 0) {
+      ctx.logger?.info?.(`Claude Runner MCP servers for the SDK session: ${names(mcp.accepted)}`);
+    } else {
+      ctx.logger?.info?.("Claude Runner: no MCP server configured; the SDK session has only its built-in tools");
+    }
+    if (mcp.dropped.length > 0) {
+      // A dropped entry is a real misconfiguration: the cell loses a server it
+      // was told to have. That is an error.
+      ctx.logger?.error?.(droppedMcpServersMessage(mcp.dropped));
+    }
+    if (mcp.withSecretsRisk.length > 0) {
+      // Advisory, not an error: `env` is the normal way to configure a stdio
+      // MCP server, so this fires on correct configurations too and must not
+      // train anyone to ignore the error channel. The SDK serialises the whole
+      // map onto the `claude` process command line as --mcp-config, so anything
+      // in it is readable in ps and /proc/<pid>/cmdline. Names only; never
+      // the values.
+      ctx.logger?.info?.(
+        `Claude Runner WARNING: mcpServers ${plural(mcp.withSecretsRisk.length, "entry", "entries")} ${names(mcp.withSecretsRisk)} ${plural(mcp.withSecretsRisk.length, "carries", "carry")} headers or env -- the SDK puts that on the command line of its subprocess, so it MUST NOT hold a credential`,
+      );
+    }
   } catch (err) {
     const details = err instanceof Error ? err.message : String(err);
     ctx.logger?.error?.(`Failed to start Claude Runner bridge: ${details}`);
@@ -143,23 +161,9 @@ const claudeRunnerPlugin = {
 
   register(api: OpenClawPluginApi) {
     const extConfig = loadExtensionConfig();
-    const port = (extConfig.port as number) ?? DEFAULT_PORT;
-    const skipPermissions = (extConfig.skipPermissions as boolean) ?? true;
+    const bridgeOpts: BridgeOpts = buildBridgeOptions(extConfig);
+    const port = bridgeOpts.port;
     const defaultModel = (extConfig.defaultModel as string) ?? "claude-opus-4-6";
-    const maxTurns = (extConfig.maxTurns as number) ?? 30;
-
-    const bridgeOpts: BridgeOpts = {
-      port,
-      skipPermissions,
-      maxTurns,
-      queueMinDelayMs: extConfig.queueMinDelayMs as number | undefined,
-      queueMaxDelayMs: extConfig.queueMaxDelayMs as number | undefined,
-      queueMaxConcurrency: extConfig.queueMaxConcurrency as number | undefined,
-      sessionTtlMs: extConfig.sessionTtlMs as number | undefined,
-      tools: extConfig.tools as string[] | undefined,
-      effort: extConfig.effort as BridgeOpts["effort"] | undefined,
-      maxBudgetUsd: extConfig.maxBudgetUsd as number | undefined,
-    };
 
     api.registerService({
       id: "claude-runner-bridge",

@@ -1,0 +1,107 @@
+# CI for the Booqi patch fork of claude-runner.
+#
+# This repository had no workflow at all: nothing here was ever proved by a
+# machine. The unit suite is hermetic -- `src/bridge-config.ts` imports nothing,
+# so the job needs no `npm install`, no Agent SDK and no network beyond the
+# checkout. Node's own type stripping runs the TypeScript sources directly,
+# which is also how OpenClaw loads this extension, so the suite exercises the
+# same files the runtime does rather than a compiled copy of them.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # No `npm ci`: there is no lockfile and the suite has no dependencies.
+      # If that ever stops being true this step is where it breaks, loudly.
+      - name: unit tests
+        run: npm test
+
+      - name: the JSON files parse
+        run: |
+          set -euo pipefail
+          for f in package.json openclaw.plugin.json config.example.json tsconfig.json; do
+            node -e "JSON.parse(require('node:fs').readFileSync('$f','utf8'))" \
+              && echo "ok  $f"
+          done
+
+      # `npm test` globs test/**/*.test.ts. A file under test/ that does not
+      # match is simply never run, and the job stays green over it -- which is
+      # the one failure mode a test suite must not have.
+      - name: every file under test/ is picked up by the glob
+        run: |
+          set -euo pipefail
+          stray=$(find test -type f ! -name '*.test.ts')
+          if [ -n "$stray" ]; then
+            echo "not run by npm test:"; echo "$stray"; exit 1
+          fi
+          echo "ok  every file under test/ matches test/**/*.test.ts"
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Node's type stripping erases types without checking them, so the unit
+      # job cannot catch a type-level mistake: dropping a field from an
+      # interface is invisible to it. This job is the only thing that reads
+      # them. Scope is tsconfig.json -- the Booqi-only modules and their tests,
+      # plus typecheck/sdk-options.ts.
+      #
+      # The Agent SDK is installed HERE and nowhere else. typecheck/sdk-options.ts
+      # asserts that every option name the bridge sets exists on the SDK's
+      # `Options` type, which is the only check that can catch an invented
+      # option name -- the query options are a Record<string, any>, so the SDK
+      # silently discards a key it does not know. `appendSystemPrompt` is
+      # exactly that, and the bridge still sets it -- see
+      # KNOWN_NON_SDK_OPTIONS and booqi-app/infra#202. The unit suite stays
+      # dependency-free; this job pays the install cost instead.
+      # Installed into a scratch directory and symlinked in, rather than with a
+      # plain `npm install` here, so that the SDK is present for this job only
+      # and the repository keeps no node_modules of its own. `npx --package` is
+      # not an option: it resolves the packages in its own temp prefix, so tsc
+      # cannot find @types/node from this directory (`error TS2688: Cannot find
+      # type definition file for 'node'`).
+      - name: tsc --noEmit
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d)"
+          # No `npm init` here: `npm --prefix DIR init` ignores --prefix and
+          # rewrites the package.json of the CURRENT directory, i.e. this
+          # repository's own manifest. The install below creates the scratch
+          # manifest by itself.
+          npm --prefix "$scratch" install --silent --no-audit --no-fund \
+            typescript@5 @types/node@24 @anthropic-ai/claude-agent-sdk@0.2.92
+          # -sfn, and removed on any exit: a plain `ln -s` onto an existing
+          # node_modules directory creates node_modules/node_modules and the
+          # failure shows up as a baffling TS2688, and `set -e` would otherwise
+          # skip the cleanup on a tsc failure and leave the tree dirty.
+          trap 'rm -f node_modules' EXIT
+          ln -sfn "$scratch/node_modules" node_modules
+          "$scratch/node_modules/.bin/tsc" --noEmit -p tsconfig.json

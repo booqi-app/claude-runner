@@ -73,14 +73,17 @@ Extension settings are in `~/.openclaw/extensions/claude-runner/config.json`:
 | `skipPermissions` | `true` | Use `bypassPermissions` mode |
 | `maxTurns` | `30` | Max agentic turns per request |
 | `defaultModel` | `"claude-opus-4-6"` | Default model when none specified |
-| `workDir` | `"~/.openclaw/workspace"` | Working directory for the SDK |
+| `workDir` | — | **Ignored.** The bridge takes its working directory from the OpenClaw workspace it is started in. The key is still accepted so that an existing `config.json` carrying it is not refused. |
 | `queueMinDelayMs` | `1000` | Min delay between SDK queries (ms) |
 | `queueMaxDelayMs` | `4000` | Max delay between SDK queries (ms) |
 | `queueMaxConcurrency` | `1` | Max concurrent SDK queries |
 | `sessionTtlMs` | `3600000` | Session cache TTL (ms) |
+| `maxRetries` | `2` | How many times a transient SDK failure is retried before the request fails |
 | `effort` | `"medium"` | Effort level: low, medium, high, max |
 | `maxBudgetUsd` | — | Cost cap per request (optional) |
 | `tools` | — | Restrict available tools (optional) |
+| `mcpServers` | — | MCP servers handed to the SDK session as `mcpServers` in the query options. Keyed by server name; each value is a transport object the Agent SDK understands, e.g. `{"booqi": {"type": "http", "url": "http://127.0.0.1:3010/mcp"}}`. Tool names derive from the key (`mcp__<name>__<tool>`). **This value MUST NOT carry a credential:** the SDK serialises the whole map onto the `claude` subprocess command line as `--mcp-config`, where it is readable in `ps` and `/proc/<pid>/cmdline`. |
+| `strictMcpConfig` | `true` | Use only the servers in `mcpServers`, ignoring MCP configuration the SDK would otherwise discover on the filesystem (a `.mcp.json` in the working directory, user-level MCP settings). Set it to `false` for the SDK's own default. **This is a change from earlier versions of this fork**, which left the SDK to discover whatever it found. Two things to know before leaving it on: with no `mcpServers` configured the session then has no MCP server at all, and on a host carrying an **enterprise-managed MCP configuration** the `claude` subprocess refuses to start while this is enabled — set it to `false` there. |
 
 To set as default model (optional):
 
@@ -216,3 +219,29 @@ Verify the bridge has session data: `curl http://127.0.0.1:7779/v1/sessions`
 ## License
 
 MIT
+
+## Known limitations
+
+- **The system prompt a caller sends does not reach the model.** The bridge passes it to the Agent SDK as `appendSystemPrompt`, which is not an SDK query option — it exists only on the SDK's internal control-protocol message, which the SDK derives from `systemPrompt`. Measured against `@anthropic-ai/claude-agent-sdk@0.2.92`: the key is discarded, `systemPrompt` is then sent as `""`, and the CLI treats that as falsy and falls back to its own default prompt. So a session runs on the Claude Code default system prompt, not on the one the agent was configured with. This predates the Booqi fork. Fixing it carries a product decision — whether to keep the Claude Code default and append to it, or to replace it — and a second change to the resume path, which only sends a system prompt on the first turn. Tracked in [booqi-app/infra#202](https://github.com/booqi-app/infra/issues/202); the name is listed in `KNOWN_NON_SDK_OPTIONS` in `src/bridge-config.ts`, and a compile-time check will fail if the SDK ever starts accepting it.
+
+## Relationship to upstream
+
+This is a patch fork of [`siimvene/openclaw-claude-runner`](https://github.com/siimvene/openclaw-claude-runner). The fork point is `6286a07`; every commit up to and including it is upstream's.
+
+Files that are Booqi-only, and therefore the ones a rebase onto upstream will have to carry rather than merge:
+
+- `src/bridge-config.ts` — `BridgeConfig`, `buildBridgeOptions()`, `readMcpServers()` and `buildQueryOptions()`. **`buildQueryOptions()` was moved out of `src/claude-bridge.ts`**, so an upstream change to it will land as a conflict in a file that no longer contains it. That is the known cost of making the SDK query options testable without the SDK installed.
+- `test/`, `typecheck/`, `tsconfig.json` and `.github/workflows/ci.yml` — none of them exist upstream.
+
+### Running the checks locally
+
+`npm test` needs nothing installed: the suite imports only `src/bridge-config.ts`, which imports nothing, and Node strips the types as it runs.
+
+The option-name check is the exception. `typecheck/sdk-options.ts` asserts that every option name the bridge hands to the SDK is a real key of the SDK's `Options` type, so it needs the SDK present and runs only under the typecheck job:
+
+```
+npm install --no-save typescript@5 @types/node@24 @anthropic-ai/claude-agent-sdk@0.2.92
+npx tsc --noEmit -p tsconfig.json
+```
+
+A wrong option name is therefore invisible to `npm test` and fails in CI.
