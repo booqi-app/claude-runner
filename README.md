@@ -227,4 +227,17 @@ This is a patch fork of [`siimvene/openclaw-claude-runner`](https://github.com/s
 Files that are Booqi-only, and therefore the ones a rebase onto upstream will have to carry rather than merge:
 
 - `src/bridge-config.ts` — `BridgeConfig`, `buildBridgeOptions()`, `readMcpServers()` and `buildQueryOptions()`. **`buildQueryOptions()` was moved out of `src/claude-bridge.ts`**, so an upstream change to it will land as a conflict in a file that no longer contains it. That is the known cost of making the SDK query options testable without the SDK installed.
-- `test/` and `.github/workflows/ci.yml` — neither exists upstream.
+- `test/`, `typecheck/`, `tsconfig.json` and `.github/workflows/ci.yml` — none of them exist upstream.
+
+### Running the checks locally
+
+`npm test` needs nothing installed: the suite imports only `src/bridge-config.ts`, which imports nothing, and Node strips the types as it runs.
+
+The option-name check is the exception. `typecheck/sdk-options.ts` asserts that every option name the bridge hands to the SDK is a real key of the SDK's `Options` type, so it needs the SDK present and runs only under the typecheck job:
+
+```
+npm install --no-save typescript@5 @types/node@24 @anthropic-ai/claude-agent-sdk@0.2.92
+npx tsc --noEmit -p tsconfig.json
+```
+
+A wrong option name is therefore invisible to `npm test` and fails in CI.

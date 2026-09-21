@@ -91,7 +91,10 @@ jobs:
         run: |
           set -euo pipefail
           scratch="$(mktemp -d)"
-          npm --prefix "$scratch" init -y >/dev/null
+          # No `npm init` here: `npm --prefix DIR init` ignores --prefix and
+          # rewrites the package.json of the CURRENT directory, i.e. this
+          # repository's own manifest. The install below creates the scratch
+          # manifest by itself.
           npm --prefix "$scratch" install --silent --no-audit --no-fund \
             typescript@5 @types/node@24 @anthropic-ai/claude-agent-sdk@0.2.92
           # -sfn, and removed on any exit: a plain `ln -s` onto an existing

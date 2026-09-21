@@ -8,23 +8,37 @@
  * `Record<string, any>`, so without this a misspelt or invented option name
  * compiles, passes every behavioural test, and is discarded by the SDK.
  *
- * That is not hypothetical: `appendSystemPrompt` lived here for the life of
- * the fork and is not an `Options` key at all.
+ * That is not hypothetical: `appendSystemPrompt` has been set here for the
+ * life of the fork and is not an `Options` key at all. It is listed in
+ * KNOWN_NON_SDK_OPTION_NAMES, which the second assertion below keeps honest --
+ * an entry there that the SDK *does* accept is also a compile error, so the
+ * list cannot outlive the defect it records.
+ *
+ * Note the scope: this checks option NAMES, never value types. The options
+ * object is a `Record<string, any>`, so nothing here verifies that e.g.
+ * `tools` is given a `string[]`.
  */
 
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 
-import { SDK_OPTION_NAMES } from "../src/bridge-config.ts";
-
-type SetOptionName = (typeof SDK_OPTION_NAMES)[number];
+import { KNOWN_NON_SDK_OPTION_NAMES, SDK_OPTION_NAMES } from "../src/bridge-config.ts";
 
 /**
- * Resolves to `never` for any name that is not an `Options` key, so the
- * assignment below fails to compile and names the offending key.
+ * `true` when every name in SDK_OPTION_NAMES is an `Options` key. Otherwise a
+ * tuple, so the compile error names the offending key instead of saying
+ * "not assignable to never".
  */
-type NotAnSdkOption = Exclude<SetOptionName, keyof Options>;
+type EveryNameIsAnSdkOption =
+  Exclude<(typeof SDK_OPTION_NAMES)[number], keyof Options> extends never
+    ? true
+    : ["not an SDK Options key:", Exclude<(typeof SDK_OPTION_NAMES)[number], keyof Options>];
 
-const everyNameIsAnSdkOption: NotAnSdkOption[] = [];
+/** The reverse: a known-broken name that the SDK turns out to accept. */
+type EveryKnownDefectIsStillADefect =
+  Extract<(typeof KNOWN_NON_SDK_OPTION_NAMES)[number], keyof Options> extends never
+    ? true
+    : ["this IS an SDK Options key; move it to SDK_OPTION_NAMES:", Extract<(typeof KNOWN_NON_SDK_OPTION_NAMES)[number], keyof Options>];
 
-// Referenced so the binding is not unused; the check is the type above.
-export const sdkOptionNameCheck: readonly never[] = everyNameIsAnSdkOption;
+// These two lines are the check. Deleting either disables it.
+export const everyNameIsAnSdkOption: EveryNameIsAnSdkOption = true;
+export const everyKnownDefectIsStillADefect: EveryKnownDefectIsStillADefect = true;

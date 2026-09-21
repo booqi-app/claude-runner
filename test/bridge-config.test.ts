@@ -20,6 +20,8 @@ import { dirname, join } from "node:path";
 import {
   buildBridgeOptions,
   buildQueryOptions,
+  droppedMcpServersMessage,
+  KNOWN_NON_SDK_OPTION_NAMES,
   readMcpServers,
   SDK_OPTION_NAMES,
   summariseMcpServers,
@@ -401,7 +403,7 @@ test("index.ts builds its bridge options with buildBridgeOptions and spreads the
 
   // Server names come from a config file, so they are quoted into a log line
   // rather than interpolated bare -- a newline in a name would forge one.
-  assert.match(entry, /\.map\(\s*\(?\s*n\s*\)?\s*=>\s*JSON\.stringify\(n\)\s*\)/);
+  assert.match(entry, /\.map\(\s*\(?n\)?\s*=>\s*JSON\.stringify\(n\)\s*\)/);
   assert.doesNotMatch(entry, /\$\{mcp\.(accepted|dropped|withSecretsRisk)\.join/);
 });
 
@@ -480,14 +482,11 @@ test("buildBridgeOptions reads every key the config schema declares", () => {
   assert.deepEqual(unreachable, [], `config keys the bridge never reads: ${unreachable}`);
 });
 
-test("the query options carry no key outside SDK_OPTION_NAMES", () => {
-  // This is a pin, not a check against the SDK -- a hand-written list cannot
-  // know what the SDK accepts. `typecheck/sdk-options.ts` is what proves every
-  // name in SDK_OPTION_NAMES is a real `Options` key, compiled against the
-  // installed SDK in CI. This test only makes sure nothing escapes that list.
-  // Every optional branch is exercised, including the two the old version of
-  // this test never reached: systemPrompt and resume.
-  const withEverything = buildQueryOptions(
+const ALL_OPTION_NAMES: readonly string[] = [...SDK_OPTION_NAMES, ...KNOWN_NON_SDK_OPTION_NAMES];
+
+/** Options with every conditional branch taken. */
+function optionsWithEveryBranch(): Record<string, any> {
+  return buildQueryOptions(
     "claude-opus-4-6",
     "you are a bookkeeper",
     "resume-9",
@@ -495,37 +494,77 @@ test("the query options carry no key outside SDK_OPTION_NAMES", () => {
     baseConfig({ mcpServers: CELL_MCP_SERVERS, tools: [], effort: "medium", maxBudgetUsd: 1 }),
     new AbortController(),
   );
-  const withNewSession = optionsFor(baseConfig());
+}
 
-  for (const opts of [withEverything, withNewSession]) {
-    const unknown = Object.keys(opts).filter((k) => !(SDK_OPTION_NAMES as readonly string[]).includes(k));
+test("the query options carry no key outside the two declared name lists", () => {
+  // This is a pin, not a check against the SDK -- a hand-written list cannot
+  // know what the SDK accepts. `typecheck/sdk-options.ts` is what proves every
+  // name in SDK_OPTION_NAMES is a real `Options` key and that every name in
+  // KNOWN_NON_SDK_OPTION_NAMES still is not, compiled against the installed
+  // SDK in CI. This test only makes sure nothing escapes those lists.
+  for (const opts of [optionsWithEveryBranch(), optionsFor(baseConfig())]) {
+    const unknown = Object.keys(opts).filter((k) => !ALL_OPTION_NAMES.includes(k));
     assert.deepEqual(
       unknown, [],
-      `option name(s) not in SDK_OPTION_NAMES: ${unknown}. Add them there only after confirming they exist on the SDK's Options type -- typecheck/sdk-options.ts enforces that.`,
+      `option name(s) in neither SDK_OPTION_NAMES nor KNOWN_NON_SDK_OPTION_NAMES: ${unknown}. `
+        + "Add to the first only after confirming the name exists on the SDK's Options type -- "
+        + "typecheck/sdk-options.ts enforces that.",
     );
   }
-
-  // Together the two fixtures must reach every name on the list, or the list
-  // has grown a name nothing sets and the compile-time check guards nothing.
-  const reached = new Set([...Object.keys(withEverything), ...Object.keys(withNewSession)]);
-  const unreached = SDK_OPTION_NAMES.filter((k) => !reached.has(k));
-  assert.deepEqual(unreached, [], `names in SDK_OPTION_NAMES that nothing sets: ${unreached}`);
 });
 
-test("a system prompt is passed as systemPrompt, not appendSystemPrompt", () => {
-  // appendSystemPrompt is not an SDK query option -- it is an internal
-  // control-protocol field the SDK derives from systemPrompt. Setting it, as
-  // this bridge did, meant the prompt never reached the model.
+test("both fixtures together reach every declared option name", () => {
+  // Anti-rot only: a name nothing here sets means the compile-time guard is
+  // guarding a key no fixture exercises.
+  const reached = new Set([
+    ...Object.keys(optionsWithEveryBranch()),
+    ...Object.keys(optionsFor(baseConfig())),
+  ]);
+  const unreached = ALL_OPTION_NAMES.filter((k) => !reached.has(k));
+
+  assert.deepEqual(
+    unreached, [],
+    `names no fixture in this test reaches: ${unreached}. Either nothing sets them, `
+      + "or this test needs a fixture that does.",
+  );
+});
+
+test("the system prompt is still set under the known-broken name", () => {
+  // Pins the defect rather than the fix: `appendSystemPrompt` is not an SDK
+  // Options key, so the prompt does not reach the model. Changing this is a
+  // behaviour change with a product decision in it and is tracked in
+  // booqi-app/infra#202, outside the scope of infra#166 AC-3. This test exists
+  // so the change is deliberate when it happens, and so the key stays inside a
+  // declared list in the meantime.
   const opts = buildQueryOptions(
     "claude-opus-4-6", "you are a bookkeeper", undefined, "session-1", baseConfig(), new AbortController(),
   );
 
-  assert.equal(opts.systemPrompt, "you are a bookkeeper");
-  assert.equal("appendSystemPrompt" in opts, false);
+  assert.equal(opts.appendSystemPrompt, "you are a bookkeeper");
+  assert.ok(KNOWN_NON_SDK_OPTION_NAMES.includes("appendSystemPrompt" as never));
 });
 
 test("no system prompt leaves the key off entirely", () => {
-  assert.equal("systemPrompt" in optionsFor(baseConfig()), false);
+  assert.equal("appendSystemPrompt" in optionsFor(baseConfig()), false);
+});
+
+// ── The dropped-entries log line ────────────────────────────────────
+
+test("the dropped-entries message names __proto__ only when it was dropped", () => {
+  assert.equal(
+    droppedMcpServersMessage(["broken"]),
+    'Claude Runner: ignored 1 unusable mcpServers entry: "broken" -- each must be an object',
+  );
+  assert.match(
+    droppedMcpServersMessage(["broken", "__proto__"]),
+    /ignored 2 unusable mcpServers entries: "broken", "__proto__" -- each must be an object, and "__proto__" is not a usable server name$/,
+  );
+});
+
+test("the dropped-entries message quotes names rather than interpolating them", () => {
+  // A server name comes from a config file; a newline in one would forge a
+  // log line.
+  assert.match(droppedMcpServersMessage(["a\nFAKE LOG LINE"]), /"a\\nFAKE LOG LINE"/);
 });
 
 test("tsconfig typechecks every module under src/", () => {
@@ -543,16 +582,30 @@ test("tsconfig typechecks every module under src/", () => {
   }
 });
 
-test("the README settings table documents every configurable key", () => {
+test("the README settings table and the config schema declare the same keys", () => {
   // config.example.json is bound to the schema and the schema is bound to
   // buildBridgeOptions, but nothing bound the README -- so a key could be
   // added, wired up and shipped while the one document an operator reads never
-  // mentioned it. That already happened to maxRetries.
+  // mentioned it. That already happened to maxRetries. Parsed rather than
+  // substring-matched: a whitespace change in the table is not a defect, and a
+  // key documented in one of the README's other tables is not documentation of
+  // a config key.
   const schema = JSON.parse(readFileSync(join(repoRoot, "openclaw.plugin.json"), "utf-8")).configSchema;
   const readme = readFileSync(join(repoRoot, "README.md"), "utf-8");
 
-  const undocumented = Object.keys(schema.properties).filter(
-    (k) => !readme.includes(`| \`${k}\` |`),
-  );
+  const header = readme.indexOf("| Option | Default | Description |");
+  assert.notEqual(header, -1, "the README config table header moved or changed");
+
+  const documented = new Set<string>();
+  for (const line of readme.slice(header).split("\n").slice(2)) {
+    if (!line.startsWith("|")) break;
+    const cell = line.split("|")[1]?.trim().replace(/^`|`$/g, "");
+    if (cell) documented.add(cell);
+  }
+
+  const undocumented = Object.keys(schema.properties).filter((k) => !documented.has(k));
   assert.deepEqual(undocumented, [], `config keys with no README row: ${undocumented}`);
+
+  const orphaned = [...documented].filter((k) => !(k in schema.properties));
+  assert.deepEqual(orphaned, [], `README rows for keys the schema does not declare: ${orphaned}`);
 });

@@ -22,7 +22,11 @@ import type {
   ProviderDiscoveryContext,
 } from "openclaw/plugin-sdk/core";
 import { startBridgeServer, stopBridgeServer } from "./src/claude-bridge.js";
-import { buildBridgeOptions, summariseMcpServers } from "./src/bridge-config.js";
+import {
+  buildBridgeOptions,
+  droppedMcpServersMessage,
+  summariseMcpServers,
+} from "./src/bridge-config.js";
 import type { ExtensionBridgeOptions } from "./src/bridge-config.js";
 
 const PROVIDER_ID = "claude-runner";
@@ -133,10 +137,7 @@ async function ensureBridgeRunning(
     if (mcp.dropped.length > 0) {
       // A dropped entry is a real misconfiguration: the cell loses a server it
       // was told to have. That is an error.
-      ctx.logger?.error?.(
-        `Claude Runner: ignored ${mcp.dropped.length} unusable mcpServers ${plural(mcp.dropped.length, "entry", "entries")}: ${names(mcp.dropped)} -- each must be an object`
-          + (mcp.dropped.includes("__proto__") ? ', and "__proto__" is not a usable server name' : ""),
-      );
+      ctx.logger?.error?.(droppedMcpServersMessage(mcp.dropped));
     }
     if (mcp.withSecretsRisk.length > 0) {
       // Advisory, not an error: `env` is the normal way to configure a stdio

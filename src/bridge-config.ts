@@ -66,17 +66,13 @@ export interface BridgeConfig {
 }
 
 /**
- * Every key `buildQueryOptions` may put on the object handed to the SDK.
+ * Every key `buildQueryOptions` sets that IS a real SDK `Options` key.
  *
  * `buildQueryOptions` returns `Record<string, any>`, so a misspelt option
  * compiles, passes any test that reads the key back, and is silently ignored by
- * the SDK -- which is how `appendSystemPrompt` survived here: it is not an
- * `Options` key at all, only an internal control-protocol field, so every
- * system prompt this bridge built was dropped on the floor.
- *
- * `typecheck/sdk-options.ts` asserts this list is a subset of the SDK's
- * `Options` keys. That file is compiled by CI against the real SDK and is the
- * only thing here that can catch a name the SDK does not accept; this module
+ * the SDK. `typecheck/sdk-options.ts` asserts this list is a subset of the
+ * SDK's `Options` keys; it is compiled by CI against the real SDK and is the
+ * only thing here that can catch a name the SDK does not accept. This module
  * stays dependency-free so the unit suite needs no install.
  */
 export const SDK_OPTION_NAMES = [
@@ -93,9 +89,32 @@ export const SDK_OPTION_NAMES = [
   "resume",
   "sessionId",
   "strictMcpConfig",
-  "systemPrompt",
   "tools",
 ] as const;
+
+/**
+ * Keys `buildQueryOptions` sets that the SDK does NOT accept.
+ *
+ * Every entry is a known defect with a tracking issue, listed here so the guard
+ * in `typecheck/sdk-options.ts` documents it instead of a future reader
+ * discovering it the hard way. `typecheck/sdk-options.ts` also asserts the
+ * reverse -- that nothing in this list IS an `Options` key -- so an entry
+ * cannot be left behind once it is fixed.
+ *
+ * - `appendSystemPrompt`: not an `Options` key. It exists only on the SDK's
+ *   internal control-protocol initialize message, which the SDK derives from
+ *   `systemPrompt: { type: "preset", append }`. Measured against 0.2.92: the
+ *   key is dropped, `systemPrompt` is then sent as `""`, and the CLI treats
+ *   that as falsy and falls back to its own default system prompt. So the
+ *   prompt OpenClaw builds never reaches the model and the Claude Code default
+ *   is used instead. Predates this fork's first Booqi commit. Fixing it is a
+ *   behaviour change with a product decision in it -- whether a cell's agent
+ *   should keep the Claude Code default prompt at all -- and the resume path
+ *   in `claude-bridge.ts` only sends a system prompt on the first turn, which
+ *   becomes live the moment this is fixed. Tracked in booqi-app/infra#202; not
+ *   in the scope of infra#166 AC-3.
+ */
+export const KNOWN_NON_SDK_OPTION_NAMES = ["appendSystemPrompt"] as const;
 
 export const DEFAULT_MAX_TURNS = 30;
 export const DEFAULT_PORT = 7779;
@@ -180,6 +199,24 @@ export function summariseMcpServers(raw: unknown): {
   return { accepted, dropped, withSecretsRisk };
 }
 
+/**
+ * The log line for entries `readMcpServers` threw away.
+ *
+ * Lives here rather than inline in `index.ts` so it can be asserted: the
+ * `__proto__` clause is conditional, and an unconditional one points the reader
+ * at a name that is nowhere in the message.
+ */
+export function droppedMcpServersMessage(dropped: string[]): string {
+  const names = dropped.map((n) => JSON.stringify(n)).join(", ");
+  const noun = dropped.length === 1 ? "entry" : "entries";
+  const protoNote = dropped.includes("__proto__")
+    ? ', and "__proto__" is not a usable server name'
+    : "";
+
+  return `Claude Runner: ignored ${dropped.length} unusable mcpServers ${noun}: ${names}`
+    + ` -- each must be an object${protoNote}`;
+}
+
 /** The subset of `BridgeConfig` that comes from the extension's `config.json`. */
 export type ExtensionBridgeOptions = Omit<BridgeConfig, "workDir">;
 
@@ -240,17 +277,12 @@ export function buildQueryOptions(
   }
 
   if (systemPrompt) {
-    // `appendSystemPrompt` is NOT an SDK query option -- it exists only on the
-    // SDK's internal control-protocol initialize message, and the SDK derives
-    // it from `systemPrompt: { type: "preset", append }`. Setting it directly,
-    // as this bridge did since before the fork, meant the prompt never reached
-    // the model and every session ran with an empty system prompt.
-    //
-    // Passed as a plain string rather than as `{ type: "preset", preset:
-    // "claude_code", append }`: the preset form would additionally switch on
-    // the whole Claude Code system prompt, which no caller here has ever had.
-    // A plain string keeps what was intended -- this prompt and nothing else.
-    opts.systemPrompt = systemPrompt;
+    // KNOWN DEFECT, deliberately left as it is: `appendSystemPrompt` is not an
+    // SDK `Options` key, so this prompt does not reach the model. See
+    // KNOWN_NON_SDK_OPTION_NAMES and booqi-app/infra#202. Left unchanged here
+    // because fixing it is a behaviour change carrying a product decision, and
+    // this pull request is scoped to infra#166 AC-3.
+    opts.appendSystemPrompt = systemPrompt;
   }
 
   if (config.tools) {
