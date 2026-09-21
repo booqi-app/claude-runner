@@ -21,6 +21,7 @@ import {
   buildBridgeOptions,
   buildQueryOptions,
   readMcpServers,
+  SDK_OPTION_NAMES,
   summariseMcpServers,
   type BridgeConfig,
 } from "../src/bridge-config.ts";
@@ -400,7 +401,7 @@ test("index.ts builds its bridge options with buildBridgeOptions and spreads the
 
   // Server names come from a config file, so they are quoted into a log line
   // rather than interpolated bare -- a newline in a name would forge one.
-  assert.match(entry, /\.map\(\(n\) => JSON\.stringify\(n\)\)/);
+  assert.match(entry, /\.map\(\s*\(?\s*n\s*\)?\s*=>\s*JSON\.stringify\(n\)\s*\)/);
   assert.doesNotMatch(entry, /\$\{mcp\.(accepted|dropped|withSecretsRisk)\.join/);
 });
 
@@ -467,8 +468,9 @@ test("buildBridgeOptions reads every key the config schema declares", () => {
   // install.sh just stopped having. A key the schema accepts but the mapping
   // never reads is configuration that silently does nothing.
   const schema = JSON.parse(readFileSync(join(repoRoot, "openclaw.plugin.json"), "utf-8")).configSchema;
-  // workDir comes from the OpenClaw workspace and defaultModel is a provider
-  // setting that never reaches the bridge. Both say so in their description.
+  // workDir comes from the OpenClaw workspace; its schema description says so.
+  // defaultModel is a provider setting read in index.ts for model registration
+  // and never reaches the bridge.
   const notBridgeOptions = new Set(["workDir", "defaultModel"]);
 
   const declared = Object.keys(schema.properties).filter((k) => !notBridgeOptions.has(k));
@@ -478,29 +480,52 @@ test("buildBridgeOptions reads every key the config schema declares", () => {
   assert.deepEqual(unreachable, [], `config keys the bridge never reads: ${unreachable}`);
 });
 
-test("the SDK option names are spelled as the SDK spells them", () => {
-  // buildQueryOptions returns Record<string, any>, so a typo compiles, passes
-  // any test that reads the key back, and is ignored by the SDK. Pinning the
-  // exact key set is the cheapest guard against that.
-  const opts = optionsFor(
+test("the query options carry no key outside SDK_OPTION_NAMES", () => {
+  // This is a pin, not a check against the SDK -- a hand-written list cannot
+  // know what the SDK accepts. `typecheck/sdk-options.ts` is what proves every
+  // name in SDK_OPTION_NAMES is a real `Options` key, compiled against the
+  // installed SDK in CI. This test only makes sure nothing escapes that list.
+  // Every optional branch is exercised, including the two the old version of
+  // this test never reached: systemPrompt and resume.
+  const withEverything = buildQueryOptions(
+    "claude-opus-4-6",
+    "you are a bookkeeper",
+    "resume-9",
+    undefined,
     baseConfig({ mcpServers: CELL_MCP_SERVERS, tools: [], effort: "medium", maxBudgetUsd: 1 }),
+    new AbortController(),
+  );
+  const withNewSession = optionsFor(baseConfig());
+
+  for (const opts of [withEverything, withNewSession]) {
+    const unknown = Object.keys(opts).filter((k) => !(SDK_OPTION_NAMES as readonly string[]).includes(k));
+    assert.deepEqual(
+      unknown, [],
+      `option name(s) not in SDK_OPTION_NAMES: ${unknown}. Add them there only after confirming they exist on the SDK's Options type -- typecheck/sdk-options.ts enforces that.`,
+    );
+  }
+
+  // Together the two fixtures must reach every name on the list, or the list
+  // has grown a name nothing sets and the compile-time check guards nothing.
+  const reached = new Set([...Object.keys(withEverything), ...Object.keys(withNewSession)]);
+  const unreached = SDK_OPTION_NAMES.filter((k) => !reached.has(k));
+  assert.deepEqual(unreached, [], `names in SDK_OPTION_NAMES that nothing sets: ${unreached}`);
+});
+
+test("a system prompt is passed as systemPrompt, not appendSystemPrompt", () => {
+  // appendSystemPrompt is not an SDK query option -- it is an internal
+  // control-protocol field the SDK derives from systemPrompt. Setting it, as
+  // this bridge did, meant the prompt never reached the model.
+  const opts = buildQueryOptions(
+    "claude-opus-4-6", "you are a bookkeeper", undefined, "session-1", baseConfig(), new AbortController(),
   );
 
-  assert.deepEqual(Object.keys(opts).sort(), [
-    "abortController",
-    "allowDangerouslySkipPermissions",
-    "cwd",
-    "effort",
-    "includePartialMessages",
-    "maxBudgetUsd",
-    "maxTurns",
-    "mcpServers",
-    "model",
-    "permissionMode",
-    "sessionId",
-    "strictMcpConfig",
-    "tools",
-  ]);
+  assert.equal(opts.systemPrompt, "you are a bookkeeper");
+  assert.equal("appendSystemPrompt" in opts, false);
+});
+
+test("no system prompt leaves the key off entirely", () => {
+  assert.equal("systemPrompt" in optionsFor(baseConfig()), false);
 });
 
 test("tsconfig typechecks every module under src/", () => {
@@ -516,4 +541,18 @@ test("tsconfig typechecks every module under src/", () => {
       `src/${mod} is neither in tsconfig "include" nor named in the exclusion rationale`,
     );
   }
+});
+
+test("the README settings table documents every configurable key", () => {
+  // config.example.json is bound to the schema and the schema is bound to
+  // buildBridgeOptions, but nothing bound the README -- so a key could be
+  // added, wired up and shipped while the one document an operator reads never
+  // mentioned it. That already happened to maxRetries.
+  const schema = JSON.parse(readFileSync(join(repoRoot, "openclaw.plugin.json"), "utf-8")).configSchema;
+  const readme = readFileSync(join(repoRoot, "README.md"), "utf-8");
+
+  const undocumented = Object.keys(schema.properties).filter(
+    (k) => !readme.includes(`| \`${k}\` |`),
+  );
+  assert.deepEqual(undocumented, [], `config keys with no README row: ${undocumented}`);
 });

@@ -65,6 +65,38 @@ export interface BridgeConfig {
   maxBudgetUsd?: number;
 }
 
+/**
+ * Every key `buildQueryOptions` may put on the object handed to the SDK.
+ *
+ * `buildQueryOptions` returns `Record<string, any>`, so a misspelt option
+ * compiles, passes any test that reads the key back, and is silently ignored by
+ * the SDK -- which is how `appendSystemPrompt` survived here: it is not an
+ * `Options` key at all, only an internal control-protocol field, so every
+ * system prompt this bridge built was dropped on the floor.
+ *
+ * `typecheck/sdk-options.ts` asserts this list is a subset of the SDK's
+ * `Options` keys. That file is compiled by CI against the real SDK and is the
+ * only thing here that can catch a name the SDK does not accept; this module
+ * stays dependency-free so the unit suite needs no install.
+ */
+export const SDK_OPTION_NAMES = [
+  "abortController",
+  "allowDangerouslySkipPermissions",
+  "cwd",
+  "effort",
+  "includePartialMessages",
+  "maxBudgetUsd",
+  "maxTurns",
+  "mcpServers",
+  "model",
+  "permissionMode",
+  "resume",
+  "sessionId",
+  "strictMcpConfig",
+  "systemPrompt",
+  "tools",
+] as const;
+
 export const DEFAULT_MAX_TURNS = 30;
 export const DEFAULT_PORT = 7779;
 
@@ -208,7 +240,17 @@ export function buildQueryOptions(
   }
 
   if (systemPrompt) {
-    opts.appendSystemPrompt = systemPrompt;
+    // `appendSystemPrompt` is NOT an SDK query option -- it exists only on the
+    // SDK's internal control-protocol initialize message, and the SDK derives
+    // it from `systemPrompt: { type: "preset", append }`. Setting it directly,
+    // as this bridge did since before the fork, meant the prompt never reached
+    // the model and every session ran with an empty system prompt.
+    //
+    // Passed as a plain string rather than as `{ type: "preset", preset:
+    // "claude_code", append }`: the preset form would additionally switch on
+    // the whole Claude Code system prompt, which no caller here has ever had.
+    // A plain string keeps what was intended -- this prompt and nothing else.
+    opts.systemPrompt = systemPrompt;
   }
 
   if (config.tools) {

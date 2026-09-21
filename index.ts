@@ -134,7 +134,8 @@ async function ensureBridgeRunning(
       // A dropped entry is a real misconfiguration: the cell loses a server it
       // was told to have. That is an error.
       ctx.logger?.error?.(
-        `Claude Runner: ignored ${mcp.dropped.length} unusable mcpServers ${plural(mcp.dropped.length, "entry", "entries")}: ${names(mcp.dropped)} -- each must be an object, and "__proto__" is not a usable server name`,
+        `Claude Runner: ignored ${mcp.dropped.length} unusable mcpServers ${plural(mcp.dropped.length, "entry", "entries")}: ${names(mcp.dropped)} -- each must be an object`
+          + (mcp.dropped.includes("__proto__") ? ', and "__proto__" is not a usable server name' : ""),
       );
     }
     if (mcp.withSecretsRisk.length > 0) {
@@ -145,7 +146,7 @@ async function ensureBridgeRunning(
       // in it is readable in ps and /proc/<pid>/cmdline. Names only; never
       // the values.
       ctx.logger?.info?.(
-        `Claude Runner WARNING: mcpServers ${plural(mcp.withSecretsRisk.length, "entry", "entries")} ${names(mcp.withSecretsRisk)} carry headers or env -- the SDK puts that on the command line of its subprocess, so it MUST NOT hold a credential`,
+        `Claude Runner WARNING: mcpServers ${plural(mcp.withSecretsRisk.length, "entry", "entries")} ${names(mcp.withSecretsRisk)} ${plural(mcp.withSecretsRisk.length, "carries", "carry")} headers or env -- the SDK puts that on the command line of its subprocess, so it MUST NOT hold a credential`,
       );
     }
   } catch (err) {

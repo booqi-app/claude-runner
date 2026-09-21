@@ -73,11 +73,12 @@ Extension settings are in `~/.openclaw/extensions/claude-runner/config.json`:
 | `skipPermissions` | `true` | Use `bypassPermissions` mode |
 | `maxTurns` | `30` | Max agentic turns per request |
 | `defaultModel` | `"claude-opus-4-6"` | Default model when none specified |
-| `workDir` | `"~/.openclaw/workspace"` | Working directory for the SDK |
+| `workDir` | — | **Ignored.** The bridge takes its working directory from the OpenClaw workspace it is started in. The key is still accepted so that an existing `config.json` carrying it is not refused. |
 | `queueMinDelayMs` | `1000` | Min delay between SDK queries (ms) |
 | `queueMaxDelayMs` | `4000` | Max delay between SDK queries (ms) |
 | `queueMaxConcurrency` | `1` | Max concurrent SDK queries |
 | `sessionTtlMs` | `3600000` | Session cache TTL (ms) |
+| `maxRetries` | `2` | How many times a transient SDK failure is retried before the request fails |
 | `effort` | `"medium"` | Effort level: low, medium, high, max |
 | `maxBudgetUsd` | — | Cost cap per request (optional) |
 | `tools` | — | Restrict available tools (optional) |

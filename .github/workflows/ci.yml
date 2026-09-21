@@ -71,21 +71,29 @@ jobs:
       # Node's type stripping erases types without checking them, so the unit
       # job cannot catch a type-level mistake: dropping a field from an
       # interface is invisible to it. This job is the only thing that reads
-      # them. Scope is tsconfig.json -- the Booqi-only modules and their tests.
-      # Installed into a scratch directory and symlinked in, rather than with
-      # `npm install` here: this package declares @anthropic-ai/claude-agent-sdk
-      # as a dependency, and a plain install would pull the whole Agent SDK
-      # down for a typecheck that does not read a line of it. `npx --package`
-      # is not an option either -- it resolves the packages in its own temp
-      # prefix, so tsc cannot find @types/node from this directory
-      # (`error TS2688: Cannot find type definition file for 'node'`).
+      # them. Scope is tsconfig.json -- the Booqi-only modules and their tests,
+      # plus typecheck/sdk-options.ts.
+      #
+      # The Agent SDK is installed HERE and nowhere else. typecheck/sdk-options.ts
+      # asserts that every option name the bridge sets exists on the SDK's
+      # `Options` type, which is the only check that can catch an invented
+      # option name -- the query options are a Record<string, any>, so the SDK
+      # silently discards a key it does not know. `appendSystemPrompt` was
+      # exactly that, for the life of this fork. The unit suite stays
+      # dependency-free; this job pays the install cost instead.
+      # Installed into a scratch directory and symlinked in, rather than with a
+      # plain `npm install` here, so that the SDK is present for this job only
+      # and the repository keeps no node_modules of its own. `npx --package` is
+      # not an option: it resolves the packages in its own temp prefix, so tsc
+      # cannot find @types/node from this directory (`error TS2688: Cannot find
+      # type definition file for 'node'`).
       - name: tsc --noEmit
         run: |
           set -euo pipefail
           scratch="$(mktemp -d)"
           npm --prefix "$scratch" init -y >/dev/null
           npm --prefix "$scratch" install --silent --no-audit --no-fund \
-            typescript@5 @types/node@24
+            typescript@5 @types/node@24 @anthropic-ai/claude-agent-sdk@0.2.92
           # -sfn, and removed on any exit: a plain `ln -s` onto an existing
           # node_modules directory creates node_modules/node_modules and the
           # failure shows up as a baffling TS2688, and `set -e` would otherwise
