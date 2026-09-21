@@ -55,10 +55,23 @@ function fakeQuery(captured: Captured[], behaviour: "success" | "fail"): QueryFn
   }) as unknown as QueryFn;
 }
 
-/** Minimal ServerResponse stand-in: only what the handlers touch. */
-function fakeRes() {
+/**
+ * Minimal ServerResponse stand-in: only what the handlers touch.
+ *
+ * `headersSent` flips synchronously in `writeHead`, as node:http does -- that
+ * fidelity is the whole point, since the bug this file exists to catch was a
+ * restore condition that re-read `headersSent` after the 502 had set it.
+ * `writableEnded` is modelled too: the streaming handler branches on it three
+ * times, and an `undefined` there would make those branches pass by luck.
+ *
+ * `failEndAfterHeaders` simulates the client disconnecting between
+ * `writeHead` and `end` (EPIPE), which is the only way to reach the catch
+ * block's `res.headersSent` arm.
+ */
+function fakeRes(opts: { failEndAfterHeaders?: boolean } = {}) {
   return {
     headersSent: false,
+    writableEnded: false,
     statusCode: 0,
     body: "",
     setHeader() {},
@@ -72,8 +85,10 @@ function fakeRes() {
       return true;
     },
     end(chunk?: string) {
+      if (opts.failEndAfterHeaders) throw new Error("EPIPE: client went away");
       if (chunk) this.body += chunk;
       this.headersSent = true;
+      this.writableEnded = true;
     },
   } as any;
 }
@@ -83,6 +98,16 @@ async function run(opts: {
   resumeSessionId?: string;
   compactSummary?: string;
   behaviour: "success" | "fail";
+  /**
+   * `true` exercises `handleStreamingResponse`. This matters more than it
+   * looks: `claude-bridge.ts` computes `const stream = body.stream !== false`,
+   * so STREAMING IS THE PRODUCTION DEFAULT. A round of these tests that only
+   * drove `stream: false` left the streaming `buildQueryOptions` call site
+   * pinned by nothing, and severing the prompt there alone kept the suite
+   * green. Every assertion about what the SDK receives runs for both.
+   */
+  stream?: boolean;
+  failEndAfterHeaders?: boolean;
 }) {
   const { sessionStore } = __testing.initialiseStores(config);
   const conversationId = "conv-1";
@@ -95,12 +120,12 @@ async function run(opts: {
 
   const captured: Captured[] = [];
   __testing.setQuery(fakeQuery(captured, opts.behaviour));
-  const res = fakeRes();
+  const res = fakeRes({ failEndAfterHeaders: opts.failEndAfterHeaders });
 
   try {
     await executeWithRetries(
       "hello", "claude-opus-4-6", opts.systemPrompt, conversationId,
-      false, res, "req-1", config,
+      opts.stream ?? false, res, "req-1", config,
     );
   } finally {
     __testing.setQuery(undefined);
@@ -111,35 +136,70 @@ async function run(opts: {
 
 // ── AC-1: the prompt actually leaves the transport ──────────────────
 
-test("the caller's system prompt reaches the SDK query options", async () => {
-  // KILLS the mutant that severs the prompt at the buildQueryOptions call
-  // sites: `buildQueryOptions(model, undefined, ...)`. Nothing in the old
-  // suite observed the value that actually left executeWithRetries.
-  const { captured } = await run({ systemPrompt: "you are a bookkeeper", behaviour: "success" });
+// Both transports, every time. `handleStreamingResponse` and
+// `handleNonStreamingResponse` each build their own options with their own
+// `buildQueryOptions(...)` call, so a test that drives only one of them pins
+// only one of them -- and streaming is the production default.
+for (const stream of [false, true]) {
+  const via = stream ? "streaming" : "non-streaming";
 
-  assert.equal(captured.length, 1);
-  assert.equal(captured[0].options.systemPrompt, "you are a bookkeeper");
-});
+  test(`the caller's system prompt reaches the SDK query options (${via})`, async () => {
+    // KILLS the mutant that severs the prompt at a buildQueryOptions call
+    // site: `buildQueryOptions(model, undefined, ...)`. Nothing observed the
+    // value that actually left executeWithRetries before this.
+    const { captured } = await run({ systemPrompt: "you are a bookkeeper", behaviour: "success", stream });
 
-// ── AC-2: every turn, resumed or not ────────────────────────────────
-
-test("a RESUMED turn still carries the system prompt into the SDK options", async () => {
-  // THE regression test for the coupled defect. KILLS every spelling of the
-  // resume gate -- `if (!resumeSessionId)`, `resumeSessionId ? undefined : p`,
-  // `resumeSessionId === undefined ? p : undefined` -- because it asserts the
-  // value the SDK receives, not the shape of the source.
-  const { captured } = await run({
-    systemPrompt: "you are a bookkeeper",
-    resumeSessionId: "sdk-session-9",
-    behaviour: "success",
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].options.systemPrompt, "you are a bookkeeper");
   });
 
-  assert.equal(captured[0].options.resume, "sdk-session-9", "precondition: this is a resumed turn");
-  assert.equal(
-    captured[0].options.systemPrompt, "you are a bookkeeper",
-    "a resumed turn went out with no system prompt -- the persona flips after turn 1 (booqi-app/infra#202)",
-  );
-});
+  test(`a RESUMED turn still carries the system prompt into the SDK options (${via})`, async () => {
+    const { captured } = await run({
+      systemPrompt: "you are a bookkeeper",
+      resumeSessionId: "sdk-session-9",
+      behaviour: "success",
+      stream,
+    });
+
+    assert.equal(captured[0].options.resume, "sdk-session-9", "precondition: this is a resumed turn");
+    assert.equal(
+      captured[0].options.systemPrompt, "you are a bookkeeper",
+      "a resumed turn went out with no system prompt -- the persona flips after turn 1 (booqi-app/infra#202)",
+    );
+  });
+
+  test(`a compaction summary reaches the SDK prompt (${via})`, async () => {
+    const { captured } = await run({
+      systemPrompt: "P", compactSummary: "SUMMARY-TEXT", behaviour: "success", stream,
+    });
+
+    assert.ok(
+      String(captured[0].options.systemPrompt).includes("SUMMARY-TEXT"),
+      "the summary never reached the model",
+    );
+  });
+
+  test(`systemPromptMode append sends the preset form through the transport (${via})`, async () => {
+    __testing.initialiseStores(config);
+    const captured: Captured[] = [];
+    __testing.setQuery(fakeQuery(captured, "success"));
+
+    try {
+      await executeWithRetries(
+        "hello", "claude-opus-4-6", "P", `conv-append-${via}`, stream, fakeRes(), "req-2",
+        { ...config, systemPromptMode: "append" },
+      );
+    } finally {
+      __testing.setQuery(undefined);
+    }
+
+    assert.deepEqual(captured[0].options.systemPrompt, {
+      type: "preset", preset: "claude_code", append: "P",
+    });
+  });
+}
+
+// ── AC-2: every turn, resumed or not ────────────────────────────────
 
 test("the first turn and a resumed turn send an identical system prompt", async () => {
   const first = await run({ systemPrompt: "P", behaviour: "success" });
@@ -167,18 +227,33 @@ test("a compaction summary is restored when the request fails without reaching t
   );
 });
 
-test("a compaction summary reaches the SDK prompt and is NOT restored after success", async () => {
-  const { captured, sessionStore, conversationId } = await run({
+test("a delivered compaction summary is NOT restored after success", async () => {
+  const { sessionStore, conversationId } = await run({
     systemPrompt: "P", compactSummary: "SUMMARY-TEXT", behaviour: "success",
   });
 
-  assert.ok(
-    String(captured[0].options.systemPrompt).includes("SUMMARY-TEXT"),
-    "the summary never reached the model",
-  );
   assert.equal(
     sessionStore.get(conversationId)?.compactSummary, undefined,
     "the summary was replayed into the next turn although this one delivered it",
+  );
+});
+
+test("a summary is not restored when the turn succeeded but res.end() then failed", async () => {
+  // The delivery point that nothing held: the catch block's
+  // `if (res.headersSent)` arm. The SDK query succeeded, so the summary DID
+  // reach the model; the client then went away during res.end(). Without
+  // `summaryDelivered = true` on that arm the finally puts the summary back
+  // and the next turn's system prompt carries it a second time.
+  const { res, sessionStore, conversationId } = await run({
+    systemPrompt: "P", compactSummary: "SUMMARY-TEXT",
+    behaviour: "success", failEndAfterHeaders: true,
+  });
+
+  assert.equal(res.headersSent, true, "precondition: headers were sent before the failure");
+  assert.equal(
+    sessionStore.get(conversationId)?.compactSummary, undefined,
+    "the summary was restored although the SDK query had already consumed it -- "
+      + "it will be duplicated in the next turn's system prompt",
   );
 });
 
@@ -195,22 +270,3 @@ test("a resumed turn also carries the compaction summary", async () => {
 
 // ── the mode actually reaches the wire ──────────────────────────────
 
-test("systemPromptMode append sends the preset form through the transport", async () => {
-  const { sessionStore } = __testing.initialiseStores(config);
-  void sessionStore;
-  const captured: Captured[] = [];
-  __testing.setQuery(fakeQuery(captured, "success"));
-
-  try {
-    await executeWithRetries(
-      "hello", "claude-opus-4-6", "P", "conv-append", false, fakeRes(), "req-2",
-      { ...config, systemPromptMode: "append" },
-    );
-  } finally {
-    __testing.setQuery(undefined);
-  }
-
-  assert.deepEqual(captured[0].options.systemPrompt, {
-    type: "preset", preset: "claude_code", append: "P",
-  });
-});
