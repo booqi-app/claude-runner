@@ -8,5 +8,5 @@
   "queueMaxConcurrency": 1,
   "sessionTtlMs": 3600000,
   "effort": "medium",
-  "systemPromptMode": "append"
+  "systemPromptMode": "replace"
 }

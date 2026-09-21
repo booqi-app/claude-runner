@@ -8,11 +8,13 @@
  * `Record<string, any>`, so without this a misspelt or invented option name
  * compiles, passes every behavioural test, and is discarded by the SDK.
  *
- * That is not hypothetical: `appendSystemPrompt` IS still set by the bridge
- * today and is not an `Options` key at all. It is listed in
- * KNOWN_NON_SDK_OPTION_NAMES, which the second assertion below keeps honest --
- * an entry there that the SDK *does* accept is also a compile error, so the
- * list cannot outlive the defect it records.
+ * That is not hypothetical: the bridge used to set `appendSystemPrompt`, which
+ * is not an `Options` key at all, and the prompt was silently discarded for as
+ * long as it did. booqi-app/infra#202 replaced it with the real `systemPrompt`
+ * option, so KNOWN_NON_SDK_OPTION_NAMES is now EMPTY -- the intended state.
+ * The second assertion below is what keeps it honest: an entry there that the
+ * SDK *does* accept is a compile error, so a listed name cannot outlive the
+ * defect it records.
  *
  * Note the scope: this checks option NAMES, never value types. The options
  * object is a `Record<string, any>`, so nothing here verifies that e.g.

@@ -26,6 +26,8 @@ import {
   buildBridgeOptions,
   droppedMcpServersMessage,
   plural,
+  isUnknownSystemPromptMode,
+  normaliseSystemPromptMode,
   summariseMcpServers,
 } from "./src/bridge-config.js";
 import type { ExtensionBridgeOptions } from "./src/bridge-config.js";
@@ -121,6 +123,18 @@ async function ensureBridgeRunning(
     // tool at all. With the built-in tools restricted, a silently dropped
     // entry means a session with no tools, which is indistinguishable from a
     // working one until someone asks it to do something.
+    // An unrecognised systemPromptMode falls back to the default rather than
+    // refusing to start, but it must not do so silently: "replace" is chosen
+    // deliberately to keep coding-agent instructions out of a cell, so a typo
+    // that quietly yields the opposite is the failure worth a log line.
+    if (isUnknownSystemPromptMode(config.systemPromptMode)) {
+      ctx.logger?.error?.(
+        `Claude Runner: unknown systemPromptMode ${JSON.stringify(config.systemPromptMode)};`
+        + ` using ${JSON.stringify(normaliseSystemPromptMode(config.systemPromptMode))}.`
+        + ` Valid values are "append" and "replace".`,
+      );
+    }
+
     const mcp = summariseMcpServers(config.mcpServers);
     // Names are quoted, never interpolated bare: a server name comes from a
     // config file and a newline in one would otherwise forge a log line.

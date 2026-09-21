@@ -16,11 +16,39 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID, createHash } from "node:crypto";
-import { query } from "@anthropic-ai/claude-agent-sdk";
-import { buildQueryOptions, resolveSystemPrompt } from "./bridge-config.js";
-import type { BridgeConfig } from "./bridge-config.js";
+import type { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
+// `.ts`, not `.js`. install.sh ships the TypeScript sources uncompiled, so a
+// `./bridge-config.js` specifier resolves only under a loader that rewrites
+// the extension. A `.ts` specifier resolves under that loader AND under plain
+// `node --test` type stripping, which is what lets test/claude-bridge.test.ts
+// import this module at all. booqi-app/infra#202.
+import { buildQueryOptions, resolveSystemPrompt } from "./bridge-config.ts";
+import type { BridgeConfig } from "./bridge-config.ts";
 
-export type { BridgeConfig, McpServerEntry } from "./bridge-config.js";
+export type { BridgeConfig, McpServerEntry } from "./bridge-config.ts";
+
+/**
+ * The Agent SDK's `query()`, resolved lazily.
+ *
+ * The import above is `import type`, which Node's type stripping erases, so
+ * this module no longer pulls the SDK in at load time. That is what lets the
+ * hermetic unit suite import it and drive `executeWithRetries` against a fake
+ * `query`. It matters: before booqi-app/infra#202's fix round, everything in
+ * this file was provable only by regex over its own source text, and three
+ * separate reviewers each re-introduced the defect this module exists to fix
+ * in a spelling those regexes did not recognise, with the suite green.
+ *
+ * The production path is unchanged -- the same `query` from the same package,
+ * just resolved on first use instead of at import.
+ */
+export type QueryFn = typeof sdkQuery;
+
+let queryOverride: QueryFn | undefined;
+
+async function getQuery(): Promise<QueryFn> {
+  if (queryOverride) return queryOverride;
+  return (await import("@anthropic-ai/claude-agent-sdk")).query;
+}
 const MAX_RETRIES = 2;
 const RETRY_DELAYS = [1000, 2000];
 
@@ -369,7 +397,7 @@ async function handleCompletions(
   }
 }
 
-async function executeWithRetries(
+export async function executeWithRetries(
   prompt: string,
   model: string,
   systemPrompt: string | undefined,
@@ -428,7 +456,12 @@ async function executeWithRetries(
       } catch (err: any) {
         lastError = err.message ?? String(err);
 
-        if (res.headersSent) return;
+        if (res.headersSent) {
+          // Output already reached the client, so the SDK query ran with this
+          // summary in its prompt. Replaying it next turn would duplicate it.
+          summaryDelivered = true;
+          return;
+        }
 
         // Stale session — retry with fresh
         if (resumeSessionId && /no conversation found|session/i.test(lastError)) {
@@ -455,10 +488,17 @@ async function executeWithRetries(
     // would drop the only record of the rotated-away conversation. Retries
     // are unaffected: they reuse the local `compactSummary`.
     //
-    // `res.headersSent` counts as delivered: output already reached the
-    // client, so the SDK query did run with this summary in its prompt and
-    // replaying it on the next turn would duplicate it.
-    if (compactSummary && !summaryDelivered && !res.headersSent) {
+    // This condition deliberately does NOT read `res.headersSent`. The 502
+    // above is written INSIDE the try, and `writeHead` flips `headersSent`
+    // synchronously, so by the time this runs it is already `true` on exactly
+    // the failure path the restore exists for -- which made the first version
+    // of this block dead code. `summaryDelivered` is set at each point where
+    // the summary actually reached the SDK, and nowhere else.
+    //
+    // Only restore when the store has no summary: a compaction that ran during
+    // this request may have written a newer one, which must not be clobbered.
+    if (compactSummary && !summaryDelivered
+        && !sessionStore.get(conversationId)?.compactSummary) {
       sessionStore.setCompactSummary(conversationId, compactSummary);
     }
   }
@@ -480,7 +520,7 @@ async function handleStreamingResponse(
   const abortController = new AbortController();
   const options = buildQueryOptions(model, systemPrompt, resumeSessionId, newSessionId, config, abortController);
 
-  const q = query({ prompt, options });
+  const q = (await getQuery())({ prompt, options });
   activeQueries.set(requestId, abortController);
 
   res.writeHead(200, {
@@ -637,7 +677,7 @@ async function handleNonStreamingResponse(
   const abortController = new AbortController();
   const options = buildQueryOptions(model, systemPrompt, resumeSessionId, newSessionId, config, abortController);
 
-  const q = query({ prompt, options });
+  const q = (await getQuery())({ prompt, options });
   activeQueries.set(requestId, abortController);
 
   let resultText = "";
@@ -796,6 +836,29 @@ function scheduleCompaction(conversationId: string, lastResult: string): void {
 }
 
 // ── Server lifecycle ────────────────────────────────────────────────
+
+/**
+ * Test seam. Not used by the runtime.
+ *
+ * `sessionStore` and `requestQueue` are module-level and are normally created
+ * by `startBridgeServer`, which also binds a socket. A unit test wants neither
+ * a socket nor the SDK, so this exposes exactly the two things it needs: a way
+ * to create the module instances, and a way to replace `query`.
+ */
+export const __testing = {
+  initialiseStores(config: BridgeConfig): { sessionStore: SessionStore } {
+    sessionStore = new SessionStore(config.sessionTtlMs);
+    requestQueue = new RequestQueue(
+      config.queueMaxConcurrency ?? 1,
+      config.queueMinDelayMs ?? 1000,
+      config.queueMaxDelayMs ?? 4000,
+    );
+    return { sessionStore };
+  },
+  setQuery(fn: QueryFn | undefined): void {
+    queryOverride = fn;
+  },
+};
 
 export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<typeof createServer>> {
   sessionStore = new SessionStore(config.sessionTtlMs);

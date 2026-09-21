@@ -65,30 +65,56 @@ export interface BridgeConfig {
   maxBudgetUsd?: number;
   /**
    * How the system prompt the caller sends is combined with the Claude Code
-   * preset prompt. Defaults to `"append"`.
+   * preset prompt. Defaults to `"replace"`.
    *
+   * - `"replace"` (default) -- `systemPrompt: <the caller's prompt>` as a
+   *   plain string. The session's system prompt is the agent's own prompt and
+   *   nothing else.
    * - `"append"` -- `systemPrompt: { type: "preset", preset: "claude_code",
-   *   append: <the caller's prompt> }`. The session gets the Claude Code
-   *   preset (CLAUDE.md/memory loading, the environment block including
-   *   today's date, tool-usage guidance) and the caller's prompt after it.
-   * - `"replace"` -- `systemPrompt: <the caller's prompt>` as a plain string.
-   *   The preset is not used at all, so a session carries no memory loading,
-   *   no date and no tool guidance beyond what the caller's own prompt says.
+   *   append: <the caller's prompt> }`. The Claude Code preset comes first,
+   *   the caller's prompt after it.
    *
-   * `"append"` is the default because the README promises "tool use, file
-   * editing, MCP, memory", and because a bookkeeping cell needs today's date
-   * to reason about VAT periods and deadlines -- the preset is the only thing
-   * that supplies it. `"replace"` exists for an installation that deliberately
-   * wants no coding-agent instructions in its session; it must then put
-   * everything it needs, date included, into its own prompt.
+   * ## What the choice actually costs, measured
    *
-   * See booqi-app/infra#202. Before that issue, neither happened: the prompt
-   * was passed under `appendSystemPrompt`, which is not an SDK option, so the
-   * SDK sent `systemPrompt: ""` and the session ran with essentially no
-   * system prompt -- a 62-character SDK identity line and nothing else, NOT,
-   * as was long assumed, the Claude Code default. An empty string is not an
-   * absent one to this SDK: it is stored and used, and it suppresses the
-   * preset.
+   * Measured against `@anthropic-ai/claude-agent-sdk@0.2.92` by driving the
+   * real bundled `cli.js` at a local mock Messages API, with `settingSources`
+   * omitted exactly as this bridge leaves it:
+   *
+   * | mode | system prompt | CLAUDE.md loaded | today's date present |
+   * |---|---|---|---|
+   * | `"replace"` | 158 chars | yes | yes |
+   * | `"append"` | 26,811 chars | yes | yes |
+   *
+   * **CLAUDE.md/memory loading and the environment block (today's date) are
+   * NOT carried by the preset.** The CLI injects both into the first user
+   * message, driven by `cwd`, in both modes. An earlier revision of this file
+   * claimed the opposite and used it to justify defaulting to `"append"`;
+   * that claim was false and the measurement above is what replaced it.
+   *
+   * Note `settingSources` omitted is NOT the same as `settingSources: []`.
+   * With `[]` the CLAUDE.md is genuinely not loaded; the bridge omits the key
+   * and so gets project memory. Do not "tidy" that into an empty array.
+   *
+   * So the only difference between the modes is ~26.6 KB of Claude Code
+   * preset: coding-agent identity and instructions to use `Bash`, `Read`,
+   * `Write`, `Edit` and friends. `"replace"` is the default because a
+   * bookkeeping cell is required to have those very tools disabled, so the
+   * preset tells it to use tools it does not have, contradicts its `boekhouder`
+   * identity before its own prompt is read, and costs ~6.7k tokens on every
+   * request of a shared rate limit -- in exchange for nothing the session did
+   * not already have.
+   *
+   * `"append"` remains available for an installation that genuinely wants the
+   * coding-agent prompt, e.g. an operational OpenClaw instance doing software
+   * work rather than a tenant cell.
+   *
+   * See booqi-app/infra#202. Before that issue neither mode happened: the
+   * prompt was passed under `appendSystemPrompt`, which is not an SDK option,
+   * so the SDK sent `systemPrompt: ""` and the session ran with essentially no
+   * system prompt -- an 83-char billing header plus a 62-char SDK identity
+   * line, NOT, as was long assumed, the Claude Code default. An empty string
+   * is not an absent one to this SDK: it is stored and used, and it suppresses
+   * the preset.
    */
   systemPromptMode?: SystemPromptMode;
 }
@@ -154,7 +180,34 @@ export const KNOWN_NON_SDK_OPTION_NAMES = Object.keys(
 
 export const DEFAULT_MAX_TURNS = 30;
 export const DEFAULT_PORT = 7779;
-export const DEFAULT_SYSTEM_PROMPT_MODE: SystemPromptMode = "append";
+export const DEFAULT_SYSTEM_PROMPT_MODE: SystemPromptMode = "replace";
+
+/**
+ * Narrow a configured `systemPromptMode` to a value the bridge understands.
+ *
+ * `config.json` is read with `JSON.parse` and handed over as
+ * `Record<string, unknown>`; the `enum` in `openclaw.plugin.json` does NOT
+ * police it, because OpenClaw validates the `config` block of `openclaw.json`
+ * and this extension reads its own `config.json` directly. So a typo would
+ * otherwise fail open.
+ *
+ * It fails open deliberately -- an unusable config must not stop a cell from
+ * starting -- but it returns the recognised value so the caller can say so.
+ * `"Replace"` is a typo, not a request for the coding-agent preset, and
+ * silently giving it 26 KB of the opposite of what was asked for is the
+ * failure this exists to make visible.
+ */
+export function normaliseSystemPromptMode(
+  value: unknown,
+): SystemPromptMode {
+  if (value === "append" || value === "replace") return value;
+  return DEFAULT_SYSTEM_PROMPT_MODE;
+}
+
+/** True when a configured value was present but not a mode the bridge knows. */
+export function isUnknownSystemPromptMode(value: unknown): boolean {
+  return value !== undefined && value !== "append" && value !== "replace";
+}
 
 /** The heading the compaction summary is filed under inside the system prompt. */
 export const COMPACT_SUMMARY_HEADING = "\n\n## Previous conversation summary\n";
@@ -372,11 +425,12 @@ export function buildQueryOptions(
     // the preset prompt entirely. See booqi-app/infra#202 for the capture.
     //
     // Which of the two forms is used is configuration, not a constant; see
-    // `BridgeConfig.systemPromptMode` for the decision and its reason.
+    // `BridgeConfig.systemPromptMode` for the decision and the measurement
+    // behind it.
     opts.systemPrompt =
-      (config.systemPromptMode ?? DEFAULT_SYSTEM_PROMPT_MODE) === "replace"
-        ? systemPrompt
-        : { type: "preset", preset: "claude_code", append: systemPrompt };
+      normaliseSystemPromptMode(config.systemPromptMode) === "append"
+        ? { type: "preset", preset: "claude_code", append: systemPrompt }
+        : systemPrompt;
   }
 
   if (config.tools) {
