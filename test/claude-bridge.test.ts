@@ -460,3 +460,62 @@ test("a derived id reaches the SDK as no hint at all, end to end", async () => {
   assert.equal(url.includes(derived.conversationId), false);
   assert.equal(logs.length, 1);
 });
+
+/**
+ * A fake `query()` whose first call fails with a stale-session error and whose
+ * later calls succeed, so the retry loop of `executeWithRetries` is really
+ * entered. Records one entry per call, like `fakeQuery`.
+ */
+function fakeQueryFailingOnce(captured: Captured[]): QueryFn {
+  let calls = 0;
+  return (({ options }: any) => {
+    captured.push({ options });
+    calls += 1;
+    const failThis = calls === 1;
+    return (async function* () {
+      if (failThis) throw new Error("no conversation found for session");
+      yield {
+        type: "result", subtype: "success", result: "ok", session_id: "sdk-session-2",
+      } as any;
+    })();
+  }) as unknown as QueryFn;
+}
+
+test("AC-C2: a retried request logs the missing hint ONCE, not once per attempt", async () => {
+  // `once` has to mean once per REQUEST. Each retry builds its own options
+  // with its own `buildQueryOptions(...)` call, so the naive wiring emits one
+  // line per SDK attempt -- and a count that moves with the retry policy
+  // cannot be used to tell "the hint is missing" from "the hint is missing a
+  // lot". The logged fact is a property of the request, not of the attempt.
+  const retrying: BridgeConfig = { ...configWithMcp, maxRetries: 2 };
+  const { sessionStore } = __testing.initialiseStores(retrying);
+  sessionStore.record("conv-1", "stale-sdk-session");
+
+  const captured: Captured[] = [];
+  const logs: string[] = [];
+  __testing.setQuery(fakeQueryFailingOnce(captured));
+  __testing.setLog((message) => logs.push(message));
+  const res = fakeRes();
+
+  try {
+    await executeWithRetries(
+      // The NON-streaming transport: `handleStreamingResponse` writes its 200
+      // header before it iterates the query, so a failure there sets
+      // `res.headersSent` and the retry loop returns instead of retrying.
+      // Driving the retry at all requires the transport that fails before any
+      // header is written.
+      "hello", "claude-opus-4-6", "you are a bookkeeper", "conv-1",
+      false, res, "req-1", retrying, undefined,
+    );
+  } finally {
+    __testing.setQuery(undefined);
+    __testing.setLog(undefined);
+  }
+
+  // The retry really happened -- otherwise this test proves nothing.
+  assert.ok(captured.length >= 2, `expected a retry, saw ${captured.length} SDK call(s)`);
+  for (const call of captured) {
+    assert.equal(call.options.mcpServers.booqi.url, MCP_URL);
+  }
+  assert.equal(logs.length, 1, `expected one line across ${captured.length} attempts, got ${logs.length}: ${logs}`);
+});

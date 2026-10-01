@@ -65,6 +65,25 @@ function bridgeLog(message: string): void {
   (logOverride ?? console.warn)(message);
 }
 
+/**
+ * A sink that forwards at most one message.
+ *
+ * The session hint emits one line per `buildQueryOptions` call, which is the
+ * right contract for that function -- but a request may call it several times,
+ * because each retry attempt builds its own options. "Logged once" has to mean
+ * once per REQUEST: a count that moves with the retry policy cannot be used to
+ * tell "this request had no chat session" from "this request had no chat
+ * session and the SDK was flaky".
+ */
+function onceOnly(sink: (message: string) => void): (message: string) => void {
+  let used = false;
+  return (message) => {
+    if (used) return;
+    used = true;
+    sink(message);
+  };
+}
+
 async function getQuery(): Promise<QueryFn> {
   if (queryOverride) return queryOverride;
   return (await import("@anthropic-ai/claude-agent-sdk")).query;
@@ -491,6 +510,9 @@ export async function executeWithRetries(
   const maxRetries = config.maxRetries ?? MAX_RETRIES;
   let lastError = "";
 
+  // One line per request about the session hint, across every attempt.
+  const hintLog = onceOnly(bridgeLog);
+
   // Resolve session — derive stable ID if gateway doesn't send one
   let resumeSessionId: string | undefined;
   let newSessionId: string | undefined;
@@ -530,12 +552,12 @@ export async function executeWithRetries(
         if (stream) {
           await handleStreamingResponse(
             prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
-            res, requestId, config, chatSessionId,
+            res, requestId, config, chatSessionId, hintLog,
           );
         } else {
           await handleNonStreamingResponse(
             prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
-            res, requestId, config, chatSessionId,
+            res, requestId, config, chatSessionId, hintLog,
           );
         }
         summaryDelivered = true;
@@ -604,11 +626,12 @@ async function handleStreamingResponse(
   requestId: string,
   config: BridgeConfig,
   chatSessionId: string | undefined,
+  hintLog: (message: string) => void,
 ): Promise<void> {
   const abortController = new AbortController();
   const options = buildQueryOptions(
     model, systemPrompt, resumeSessionId, newSessionId, config, abortController,
-    { chatSessionId, log: bridgeLog },
+    { chatSessionId, log: hintLog },
   );
 
   const q = (await getQuery())({ prompt, options });
@@ -765,11 +788,12 @@ async function handleNonStreamingResponse(
   requestId: string,
   config: BridgeConfig,
   chatSessionId: string | undefined,
+  hintLog: (message: string) => void,
 ): Promise<void> {
   const abortController = new AbortController();
   const options = buildQueryOptions(
     model, systemPrompt, resumeSessionId, newSessionId, config, abortController,
-    { chatSessionId, log: bridgeLog },
+    { chatSessionId, log: hintLog },
   );
 
   const q = (await getQuery())({ prompt, options });
