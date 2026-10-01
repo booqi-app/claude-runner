@@ -27,7 +27,7 @@ import {
   resolveConversation,
   type QueryFn,
 } from "../src/claude-bridge.ts";
-import type { BridgeConfig } from "../src/bridge-config.ts";
+import { buildQueryOptions, type BridgeConfig } from "../src/bridge-config.ts";
 
 const config: BridgeConfig = {
   port: 7779,
@@ -518,4 +518,115 @@ test("AC-C2: a retried request logs the missing hint ONCE, not once per attempt"
     assert.equal(call.options.mcpServers.booqi.url, MCP_URL);
   }
   assert.equal(logs.length, 1, `expected one line across ${captured.length} attempts, got ${logs.length}: ${logs}`);
+});
+
+// ── The ruling's load-bearing invariant: one URL per SDK session ──────
+//
+// The reader binds the hint ONCE, when the MCP session is created
+// (`apps/cell/src/mcp-relay.ts`, inside `createSession`), so the hint only
+// takes effect on the request that opens that session. The owner's ruling --
+// one chat session is one agent session -- therefore rests on the hint being
+// constant for the life of an SDK session. Today that holds because
+// `resolveConversation` makes the two identifiers coincide when a caller names
+// one (`conversationId: named ?? derived`, `chatSessionId: named`), so two
+// requests sharing a session-store key necessarily carry the same hint.
+//
+// Nothing pinned that coupling. A refactor that keyed the store differently --
+// a tenant prefix, say -- would let two requests share one RESUMED SDK session
+// while carrying two different hints, and no test would have reddened.
+
+test("two requests on one conversation key send one and the same hinted URL", () => {
+  const first = resolveConversation(reqWith({ "x-booqi-chat-session": "chat-7" }), {
+    messages: [{ role: "user", content: "hello" }],
+  });
+  const second = resolveConversation(reqWith({ "x-booqi-chat-session": "chat-7" }), {
+    messages: [{ role: "user", content: "a completely different second turn" }],
+  });
+
+  // Same store key, so the SDK session is resumed rather than restarted...
+  assert.equal(first.conversationId, second.conversationId);
+  // ...and the hint the store key implies is the hint that gets written.
+  assert.equal(first.chatSessionId, second.chatSessionId);
+  assert.equal(first.chatSessionId, first.conversationId);
+
+  const urlFor = (hint: string | undefined) => {
+    const opts = buildQueryOptions(
+      "claude-opus-4-6", undefined, undefined, "sdk-1", configWithMcp, new AbortController(),
+      { chatSessionId: hint },
+    );
+    return opts.mcpServers.booqi.url as string;
+  };
+
+  assert.equal(urlFor(first.chatSessionId), urlFor(second.chatSessionId));
+  assert.equal(urlFor(first.chatSessionId), `${MCP_URL}?session=chat-7`);
+});
+
+// ── The hint must not be mistaken for a stale SDK session ─────────────
+
+test("an SDK error quoting the hinted URL does not discard the conversation", async () => {
+  // The stale-session retry arm matches /no conversation found|session/i and,
+  // when it fires, drops `resumeSessionId`, mints a new SDK session id and
+  // OVERWRITES the store -- i.e. it throws the user's conversation away. This
+  // PR is what puts the substring `session=` into the URL the bridge hands the
+  // SDK, and an MCP transport error routinely quotes the URL it could not
+  // reach. Without the guard the bridge would read its OWN hint as evidence
+  // that the session had expired.
+  const retrying: BridgeConfig = { ...configWithMcp, maxRetries: 0 };
+  const { sessionStore } = __testing.initialiseStores(retrying);
+  sessionStore.record("conv-1", "live-sdk-session");
+
+  const captured: Captured[] = [];
+  __testing.setQuery((({ options }: any) => {
+    captured.push({ options });
+    return (async function* () {
+      // The shape an MCP transport failure takes: the URL, verbatim, hint and all.
+      throw new Error(`MCP server "booqi" failed to connect: GET ${MCP_URL}?session=chat-7 ECONNREFUSED`);
+    })();
+  }) as unknown as QueryFn);
+  __testing.setLog(() => {});
+  const res = fakeRes();
+
+  try {
+    await executeWithRetries(
+      "hello", "claude-opus-4-6", "you are a bookkeeper", "conv-1",
+      false, res, "req-1", retrying, "chat-7",
+    );
+  } finally {
+    __testing.setQuery(undefined);
+    __testing.setLog(undefined);
+  }
+
+  // The conversation survived: the store still points at the live SDK session.
+  assert.equal(
+    sessionStore.get("conv-1")?.claudeSessionId, "live-sdk-session",
+    "the bridge read its own session hint as a stale SDK session and discarded the conversation",
+  );
+  // And a genuine stale-session text is still recognised -- the fix removes
+  // the collision, it does not narrow the rule.
+  assert.equal(captured.length, 1);
+});
+
+test("a genuine stale-session error is still recognised", async () => {
+  const retrying: BridgeConfig = { ...configWithMcp, maxRetries: 1 };
+  const { sessionStore } = __testing.initialiseStores(retrying);
+  sessionStore.record("conv-1", "stale-sdk-session");
+
+  const captured: Captured[] = [];
+  __testing.setQuery(fakeQueryFailingOnce(captured));
+  __testing.setLog(() => {});
+  const res = fakeRes();
+
+  try {
+    await executeWithRetries(
+      "hello", "claude-opus-4-6", "you are a bookkeeper", "conv-1",
+      false, res, "req-1", retrying, "chat-7",
+    );
+  } finally {
+    __testing.setQuery(undefined);
+    __testing.setLog(undefined);
+  }
+
+  // "no conversation found for session" still triggers the fresh-session retry.
+  assert.ok(captured.length >= 2, `expected the stale-session retry, saw ${captured.length} call(s)`);
+  assert.notEqual(sessionStore.get("conv-1")?.claudeSessionId, "stale-sdk-session");
 });

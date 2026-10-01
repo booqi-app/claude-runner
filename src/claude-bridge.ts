@@ -572,8 +572,20 @@ export async function executeWithRetries(
           return;
         }
 
-        // Stale session — retry with fresh
-        if (resumeSessionId && /no conversation found|session/i.test(lastError)) {
+        // Stale session — retry with fresh.
+        //
+        // The error text is read with the session hint REMOVED first. Since
+        // this bridge writes `?session=<id>` into the `mcpServers` URL it
+        // hands the SDK, and an MCP transport error routinely quotes the URL
+        // it failed to reach, the bare /session/i below would otherwise read
+        // the bridge's OWN hint as evidence that the SDK session is stale --
+        // and the branch it guards drops `resumeSessionId`, mints a new id and
+        // OVERWRITES the store, i.e. it discards the user's conversation. The
+        // regex itself is left as it was: narrowing it would risk missing a
+        // genuine stale-session text, and the defect is the new collision, not
+        // the breadth. booqi-app/app#459 part C.
+        const errorWithoutHint = lastError.replace(/[?&]session=[^&\s"'\\]*/gi, "");
+        if (resumeSessionId && /no conversation found|session/i.test(errorWithoutHint)) {
           resumeSessionId = undefined;
           newSessionId = randomUUID();
           sessionStore.record(conversationId, newSessionId);

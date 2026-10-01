@@ -485,6 +485,12 @@ export function applySessionHint(
     const url = entry["url"];
     if (typeof url !== "string") {
       out[name] = entry;
+      // A `url` that is present but not a string is a MISCONFIGURATION, and it
+      // is reported as such. An entry with no `url` at all is a stdio entry and
+      // is silent on purpose -- there is nothing to hint. Collapsing the two
+      // would let a `url: 7` reach the SDK with no line saying why the session
+      // has no tools, which is `absent` coinciding with `in order`.
+      if ("url" in entry) unhinted.push(name);
       continue;
     }
 
@@ -531,14 +537,26 @@ export function sessionHintMessage(hinted: string[]): string {
  * names no exchange gets `{tools: []}` from its gateway and answers from the
  * model alone, which looks like a bad answer rather than a missing hint.
  */
-export function unhintedMcpServersMessage(unhinted: string[], haveIdentifier: boolean): string {
+export function unhintedMcpServersMessage(
+  unhinted: string[],
+  haveIdentifier: boolean,
+  hinted: string[] = [],
+): string {
   const noun = plural(unhinted.length, "entry", "entries");
   const reason = haveIdentifier
-    ? "its configured URL does not parse"
+    ? "its configured URL is not a parseable URL string"
     : "no usable chat-session identifier was available for this request";
+  // What it examined, not just what went wrong: with one entry hinted and
+  // another not, a line naming only the failure reads as if NOTHING was
+  // hinted. The counts are the cheapest thing that cannot be misread.
+  const alsoHinted = hinted.length > 0
+    ? ` ${hinted.length} other ${plural(hinted.length, "entry", "entries")} DID get the hint:`
+      + ` ${quotedNames(hinted)}.`
+    : "";
   return `Claude Runner: no chat-session hint written for ${unhinted.length} mcpServers ${noun}:`
     + ` ${quotedNames(unhinted)} -- ${reason};`
-    + " the URL goes to the SDK unchanged and the cell gateway will answer tools/list with an empty list";
+    + " the URL goes to the SDK unchanged and the cell gateway will answer tools/list with an empty list."
+    + alsoHinted;
 }
 
 /** The subset of `BridgeConfig` that comes from the extension's `config.json`. */
@@ -581,7 +599,14 @@ export function buildQueryOptions(
   newSessionId: string | undefined,
   config: BridgeConfig,
   abortController: AbortController,
-  session: SessionHintContext = {},
+  /**
+   * REQUIRED, deliberately. A defaulted `{}` would make a call site that
+   * forgot the argument indistinguishable from one that genuinely has no
+   * identifier -- and, because `log` would also be absent, it would emit no
+   * line at all, silently voiding AC-C2. A caller with nothing to say passes
+   * `{}` explicitly, which is a visible act.
+   */
+  session: SessionHintContext,
 ): Record<string, any> {
   const opts: Record<string, any> = {
     model,
@@ -638,7 +663,9 @@ export function buildQueryOptions(
     opts.mcpServers = outcome.servers;
 
     if (outcome.unhinted.length > 0) {
-      session.log?.(unhintedMcpServersMessage(outcome.unhinted, chatSessionId !== undefined));
+      session.log?.(unhintedMcpServersMessage(
+        outcome.unhinted, chatSessionId !== undefined, outcome.hinted,
+      ));
     } else if (outcome.hinted.length > 0) {
       session.log?.(sessionHintMessage(outcome.hinted));
     }
