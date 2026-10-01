@@ -1278,6 +1278,20 @@ test("AC-4: bypassPermissions can never ship with an undefined tool set", () => 
   // sweeping the cartesian product of EVERY input dimension this function
   // branches on -- that is what makes it exhaustive over the branch structure
   // rather than over one happy path.
+  //
+  // "Every dimension" is a checkable claim, so here is the list it was checked
+  // against, one line per `if`/ternary in `buildQueryOptions`:
+  //   config.skipPermissions                       -> skipPermissions, 2
+  //   resumeSessionId / else if (newSessionId)      -> resume 2 x newSessionId 2,
+  //                                                   so the BOTH-ABSENT arm runs
+  //   systemPrompt                                  -> systemPrompt, 2
+  //   normaliseSystemPromptMode(...) === "append"   -> systemPromptMode, 4
+  //   if (mcpServers)                               -> mcpServers, 4
+  //   outcome.unhinted.length / else hinted.length  -> session, 2 (a hint plus a
+  //                                                   log sink, or neither)
+  //   config.strictMcpConfig ?? true                -> strictMcpConfig, 3
+  //   config.effort / config.maxBudgetUsd           -> extra, 4, crossed rather
+  //                                                   than set together
   const toolsCases: Array<unknown> = [
     "ABSENT",
     [],
@@ -1289,13 +1303,31 @@ test("AC-4: bypassPermissions can never ship with an undefined tool set", () => 
   let refused = 0;
   let bypass = 0;
 
+  // `effort` and `maxBudgetUsd` guard separate `if`s, so they are crossed rather
+  // than set together: the paired-only version left effort-set/budget-unset and
+  // its converse unexercised.
+  const extras: Array<Partial<BridgeConfig>> = [
+    {},
+    { effort: "high" },
+    { maxBudgetUsd: 5 },
+    { effort: "high", maxBudgetUsd: 5, maxTurns: 1 },
+  ];
+  // Both arms of the session-hint branch. The second carries a log sink, so the
+  // `session.log?.(...)` calls really run instead of short-circuiting.
+  const sessions: Array<Record<string, any>> = [
+    {},
+    { chatSessionId: "chat-1", log: () => {} },
+  ];
+
   for (const skipPermissions of [true, false]) {
     for (const systemPrompt of [undefined, "be brief"]) {
       for (const systemPromptMode of [undefined, "append", "replace", "Replace"]) {
         for (const resume of [undefined, "sdk-session-7"]) {
+         for (const newSessionId of [undefined, "session-1"]) {
           for (const mcpServers of [undefined, CELL_MCP_SERVERS, {}, "not an object"]) {
             for (const strictMcpConfig of [undefined, true, false]) {
-              for (const extra of [{}, { effort: "high" as const, maxBudgetUsd: 5, maxTurns: 1 }]) {
+              for (const extra of extras) {
+               for (const session of sessions) {
                 for (const tools of toolsCases) {
                   const config = baseConfig({
                     skipPermissions,
@@ -1309,8 +1341,8 @@ test("AC-4: bypassPermissions can never ship with an undefined tool set", () => 
                   let opts: Record<string, any> | undefined;
                   try {
                     opts = buildQueryOptions(
-                      "claude-opus-4-6", systemPrompt, resume, "session-1",
-                      config, new AbortController(), {},
+                      "claude-opus-4-6", systemPrompt, resume, newSessionId,
+                      config, new AbortController(), session,
                     );
                   } catch (err) {
                     refused += 1;
@@ -1331,9 +1363,11 @@ test("AC-4: bypassPermissions can never ship with an undefined tool set", () => 
                     assert.equal(Array.isArray(opts.tools), true);
                   }
                 }
+               }
               }
             }
           }
+         }
         }
       }
     }
@@ -1341,10 +1375,11 @@ test("AC-4: bypassPermissions can never ship with an undefined tool set", () => 
 
   // Counts, so a sweep that silently stopped iterating cannot read as a pass.
   // skipPermissions(2) x systemPrompt(2) x systemPromptMode(4) x resume(2)
-  // x mcpServers(4) x strictMcpConfig(3) x extra(2) = 768 shapes, each crossed
-  // with 11 tools values.
-  const shapes = 2 * 2 * 4 * 2 * 4 * 3 * 2;
-  assert.equal(shapes, 768);
+  // x newSessionId(2) x mcpServers(4) x strictMcpConfig(3) x extra(4)
+  // x session(2) = 6144 shapes, each crossed with 11 tools values.
+  const shapes = 2 * 2 * 4 * 2 * 2 * 4 * 3 * 4 * 2;
+  assert.equal(shapes, 6144);
+  assert.equal(produced + refused, 67584, "6144 shapes x 11 tools values");
   assert.equal(toolsCases.length, 11);
   assert.equal(produced + refused, shapes * 11, "every combination must have been exercised");
   assert.equal(produced, 3 * shapes, "the three usable tools values must all produce an object");
@@ -1432,4 +1467,36 @@ test("AC-6: README documents that an absent `tools` key means no built-in tools"
   for (const builtin of ["Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch"]) {
     assert.ok(readme.includes(builtin), `the upgrade note must name ${builtin}`);
   }
+});
+
+test("the unusable-`tools` message cannot be mistaken for a stale SDK session", () => {
+  // `claude-bridge.ts` classifies an SDK error as a stale conversation with
+  // /no conversation found|session/i, and then DISCARDS the caller's
+  // conversation and mints a new id. A configuration message matching that
+  // pattern would throw away a user's chat in order to report a typo in
+  // `config.json`. Asserted on the produced message, over every value that can
+  // produce one -- not on the source line, which would not survive a reword.
+  const staleSessionHeuristic = /no conversation found|session/i;
+  let examined = 0;
+
+  for (const [label, value] of UNUSABLE_TOOLS_VALUES) {
+    examined += 1;
+    const message = unusableToolsMessage(value);
+    assert.match(message, /"tools"/, label);
+    assert.doesNotMatch(message, staleSessionHeuristic, `${label}: ${message}`);
+  }
+
+  assert.equal(examined, 8, "all eight unusable values must have been examined");
+});
+
+test("the absent-key default cannot be widened at runtime", () => {
+  // `readonly string[]` is erased by the compiler, so the type says nothing at
+  // runtime. Frozen, so no cast can widen the default for every later session;
+  // `readTools` also returns a copy, so both the constant and the caller are
+  // protected. One of the two alone would be enough today, which is why a test
+  // pins both.
+  assert.equal(Object.isFrozen(DEFAULT_TOOLS_WHEN_ABSENT), true);
+  assert.throws(() => { (DEFAULT_TOOLS_WHEN_ABSENT as string[]).push("Bash"); }, TypeError);
+  assert.deepEqual([...DEFAULT_TOOLS_WHEN_ABSENT], []);
+  assert.deepEqual(optionsFor(baseConfig()).tools, []);
 });

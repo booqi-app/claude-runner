@@ -580,8 +580,14 @@ export function unhintedMcpServersMessage(
  * SDK tool set to be restricted to the MCP tools of its connection, and before
  * this that requirement held only as long as somebody remembered to write the
  * key. See README.md for the upgrade note.
+ *
+ * `Object.freeze`, not just `readonly`: `readonly` is erased by the compiler, so
+ * one `(DEFAULT_TOOLS_WHEN_ABSENT as string[]).push("Bash")` anywhere in the
+ * process would widen the default for every absent-key session that follows.
+ * `readTools` returns a fresh copy as well -- both, because the copy protects
+ * the caller and the freeze protects the constant.
  */
-export const DEFAULT_TOOLS_WHEN_ABSENT: readonly string[] = [];
+export const DEFAULT_TOOLS_WHEN_ABSENT: readonly string[] = Object.freeze([]);
 
 /** How a configured value is named in `unusableToolsMessage`. */
 function describeConfiguredValue(raw: unknown): string {
@@ -603,7 +609,12 @@ export function unusableToolsMessage(raw: unknown): string {
     + ` but it is ${describeConfiguredValue(raw)}.`
     + ' Use "tools": [] for no tools, or omit the key -- an absent key also means'
     + " no tools. The bridge does not start on an unusable tool set, because the"
-    + " alternative is an SDK session with every built-in tool under"
+    // Deliberately NOT the word "session" anywhere in this message:
+    // `claude-bridge.ts` classifies an SDK error as a stale conversation with
+    // /no conversation found|session/i and responds by discarding the caller's
+    // conversation. A configuration message that matched that pattern would
+    // throw away a user's chat to report a typo in `config.json`.
+    + " alternative is an SDK run with every built-in tool under"
     + ' permissionMode "bypassPermissions".';
 }
 
