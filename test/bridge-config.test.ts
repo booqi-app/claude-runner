@@ -1292,6 +1292,14 @@ test("AC-4: bypassPermissions can never ship with an undefined tool set", () => 
   //   config.strictMcpConfig ?? true                -> strictMcpConfig, 3
   //   config.effort / config.maxBudgetUsd           -> extra, 4, crossed rather
   //                                                   than set together
+  //   config.maxTurns ?? DEFAULT_MAX_TURNS          -> extra, 4 (extras[3])
+  //
+  // And `shapes` below is COMPUTED from those arrays' lengths, not restated as
+  // a literal product. That distinction is load-bearing: with a restated
+  // product, shrinking a loop and editing the number in the same commit is
+  // invisible -- a control that removed the `newSessionId` dimension and
+  // re-pinned the arithmetic self-consistently survived the suite. Deriving the
+  // figure and pinning the ABSOLUTE total kills that mutant.
   const toolsCases: Array<unknown> = [
     "ABSENT",
     [],
@@ -1312,20 +1320,32 @@ test("AC-4: bypassPermissions can never ship with an undefined tool set", () => 
     { maxBudgetUsd: 5 },
     { effort: "high", maxBudgetUsd: 5, maxTurns: 1 },
   ];
-  // Both arms of the session-hint branch. The second carries a log sink, so the
-  // `session.log?.(...)` calls really run instead of short-circuiting.
+  // All three reachable states of the session-hint branch, so that BOTH
+  // `session.log?.(...)` call sites really run rather than short-circuiting on
+  // an absent sink: no hint and no sink; a hint and a sink (the `hinted` arm);
+  // and a sink with NO hint (the `unhinted` arm, which the first two never
+  // reach -- the hintless case had no sink to call).
   const sessions: Array<Record<string, any>> = [
     {},
     { chatSessionId: "chat-1", log: () => {} },
+    { log: () => {} },
   ];
 
-  for (const skipPermissions of [true, false]) {
-    for (const systemPrompt of [undefined, "be brief"]) {
-      for (const systemPromptMode of [undefined, "append", "replace", "Replace"]) {
-        for (const resume of [undefined, "sdk-session-7"]) {
-         for (const newSessionId of [undefined, "session-1"]) {
-          for (const mcpServers of [undefined, CELL_MCP_SERVERS, {}, "not an object"]) {
-            for (const strictMcpConfig of [undefined, true, false]) {
+  const skipPermissionsCases = [true, false];
+  const systemPromptCases = [undefined, "be brief"];
+  const systemPromptModeCases = [undefined, "append", "replace", "Replace"];
+  const resumeCases = [undefined, "sdk-session-7"];
+  const newSessionIdCases = [undefined, "session-1"];
+  const mcpServersCases = [undefined, CELL_MCP_SERVERS, {}, "not an object"];
+  const strictMcpConfigCases = [undefined, true, false];
+
+  for (const skipPermissions of skipPermissionsCases) {
+    for (const systemPrompt of systemPromptCases) {
+      for (const systemPromptMode of systemPromptModeCases) {
+        for (const resume of resumeCases) {
+         for (const newSessionId of newSessionIdCases) {
+          for (const mcpServers of mcpServersCases) {
+            for (const strictMcpConfig of strictMcpConfigCases) {
               for (const extra of extras) {
                for (const session of sessions) {
                 for (const tools of toolsCases) {
@@ -1373,14 +1393,17 @@ test("AC-4: bypassPermissions can never ship with an undefined tool set", () => 
     }
   }
 
-  // Counts, so a sweep that silently stopped iterating cannot read as a pass.
-  // skipPermissions(2) x systemPrompt(2) x systemPromptMode(4) x resume(2)
-  // x newSessionId(2) x mcpServers(4) x strictMcpConfig(3) x extra(4)
-  // x session(2) = 6144 shapes, each crossed with 11 tools values.
-  const shapes = 2 * 2 * 4 * 2 * 2 * 4 * 3 * 4 * 2;
-  assert.equal(shapes, 6144);
-  assert.equal(produced + refused, 67584, "6144 shapes x 11 tools values");
+  // Counts, so a sweep that silently stopped iterating cannot read as a pass --
+  // and DERIVED from the dimension arrays, so a sweep that was quietly narrowed
+  // cannot either. The absolute figure is the pin; `shapes` is the measurement.
+  const shapes = [
+    skipPermissionsCases, systemPromptCases, systemPromptModeCases, resumeCases,
+    newSessionIdCases, mcpServersCases, strictMcpConfigCases, extras, sessions,
+  ].reduce((n, dimension) => n * dimension.length, 1);
+
+  assert.equal(shapes, 9216, "9 dimensions: 2*2*4*2*2*4*3*4*3");
   assert.equal(toolsCases.length, 11);
+  assert.equal(produced + refused, 101376, "9216 shapes x 11 tools values");
   assert.equal(produced + refused, shapes * 11, "every combination must have been exercised");
   assert.equal(produced, 3 * shapes, "the three usable tools values must all produce an object");
   assert.equal(refused, 8 * shapes, "the eight unusable ones must all be refused");
