@@ -21,8 +21,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { __testing, executeWithRetries, type QueryFn } from "../src/claude-bridge.ts";
-import type { BridgeConfig } from "../src/bridge-config.ts";
+import {
+  __testing,
+  executeWithRetries,
+  resolveConversation,
+  type QueryFn,
+} from "../src/claude-bridge.ts";
+import { buildQueryOptions, type BridgeConfig } from "../src/bridge-config.ts";
 
 const config: BridgeConfig = {
   port: 7779,
@@ -108,9 +113,15 @@ async function run(opts: {
    */
   stream?: boolean;
   failEndAfterHeaders?: boolean;
+  /** The chat session a caller named, or nothing -- booqi-app/app#459 part C. */
+  chatSessionId?: string;
+  /** Configuration the request runs with. Defaults to the module `config`. */
+  bridgeConfig?: BridgeConfig;
 }) {
-  const { sessionStore } = __testing.initialiseStores(config);
+  const runConfig = opts.bridgeConfig ?? config;
+  const { sessionStore } = __testing.initialiseStores(runConfig);
   const conversationId = "conv-1";
+  const logs: string[] = [];
 
   if (opts.resumeSessionId) sessionStore.record(conversationId, opts.resumeSessionId);
   if (opts.compactSummary) {
@@ -120,18 +131,20 @@ async function run(opts: {
 
   const captured: Captured[] = [];
   __testing.setQuery(fakeQuery(captured, opts.behaviour));
+  __testing.setLog((message) => logs.push(message));
   const res = fakeRes({ failEndAfterHeaders: opts.failEndAfterHeaders });
 
   try {
     await executeWithRetries(
       "hello", "claude-opus-4-6", opts.systemPrompt, conversationId,
-      opts.stream ?? false, res, "req-1", config,
+      opts.stream ?? false, res, "req-1", runConfig, opts.chatSessionId,
     );
   } finally {
     __testing.setQuery(undefined);
+    __testing.setLog(undefined);
   }
 
-  return { captured, res, sessionStore, conversationId };
+  return { captured, res, sessionStore, conversationId, logs };
 }
 
 // ── AC-1: the prompt actually leaves the transport ──────────────────
@@ -308,3 +321,312 @@ test("a resumed turn also carries the compaction summary", async () => {
 
 // ── the mode actually reaches the wire ──────────────────────────────
 
+
+// ── The session hint on the wire (booqi-app/app#459, AC-C1, AC-C2, AC-C6) ──
+//
+// `bridge-config.test.ts` asserts the options object `buildQueryOptions`
+// returns. These assert what the SDK CALL receives, through the real transport,
+// for BOTH transports -- `handleStreamingResponse` and
+// `handleNonStreamingResponse` each build their own options with their own
+// `buildQueryOptions(...)` call, and streaming is the production default
+// (`const stream = body.stream !== false`). A round that drove only one of them
+// would leave the other pinned by nothing, which is precisely how the
+// system-prompt defect survived three reviewers on this file.
+
+const MCP_URL = "http://127.0.0.1:3004/mcp";
+
+const configWithMcp: BridgeConfig = {
+  ...config,
+  mcpServers: { booqi: { type: "http", url: MCP_URL } },
+};
+
+for (const stream of [false, true]) {
+  const via = stream ? "streaming" : "non-streaming";
+
+  test(`the SDK call receives the hinted MCP url (${via})`, async () => {
+    const { captured } = await run({
+      systemPrompt: "you are a bookkeeper",
+      behaviour: "success",
+      stream,
+      chatSessionId: "chat-42",
+      bridgeConfig: configWithMcp,
+    });
+
+    assert.equal(captured.length, 1);
+    const url: string = captured[0].options.mcpServers.booqi.url;
+    assert.equal(url, `${MCP_URL}?session=chat-42`);
+    // Read it back the way the cell gateway's relay does.
+    assert.equal(new URL(url).searchParams.get("session"), "chat-42");
+  });
+
+  test(`a hintless request sends the url unchanged and logs once (${via})`, async () => {
+    const { captured, logs } = await run({
+      systemPrompt: "you are a bookkeeper",
+      behaviour: "success",
+      stream,
+      bridgeConfig: configWithMcp,
+    });
+
+    assert.equal(captured[0].options.mcpServers.booqi.url, MCP_URL);
+    assert.equal(new URL(captured[0].options.mcpServers.booqi.url).searchParams.get("session"), null);
+    assert.equal(logs.length, 1, `expected one line, got ${logs.length}: ${logs}`);
+    assert.match(logs[0], /no chat-session hint written/);
+  });
+
+  test(`no log line on the wire carries the identifier (${via})`, async () => {
+    const identifier = "chat-cafe1234-secret";
+    const { logs } = await run({
+      systemPrompt: "you are a bookkeeper",
+      behaviour: "success",
+      stream,
+      chatSessionId: identifier,
+      bridgeConfig: configWithMcp,
+    });
+
+    assert.equal(logs.length, 1);
+    for (const line of logs) {
+      assert.equal(line.includes(identifier), false, `log discloses the identifier: ${line}`);
+    }
+  });
+}
+
+// ── Provenance: the bridge never hints with an id it invented itself ──
+//
+// This is the fail-OPEN form of the whole feature and the reason
+// `chatSessionId` is a separate value from `conversationId`. The session store
+// needs a key for every request, so `conversationId` is always a string --
+// `"default"` for an empty message list, `derived-<hash>` otherwise. Handing
+// either to the cell gateway as a tenant routing key would route every
+// hintless request at one guessable exchange. `absent` must stay absent.
+
+function reqWith(headers: Record<string, string> = {}): any {
+  return { headers };
+}
+
+test("a caller-named chat session becomes the hint, by header or by body", () => {
+  for (const [label, req, body] of [
+    ["x-booqi-chat-session", reqWith({ "x-booqi-chat-session": "chat-7" }), {}],
+    ["x-session-id", reqWith({ "x-session-id": "chat-7" }), {}],
+    ["x-conversation-id", reqWith({ "x-conversation-id": "chat-7" }), {}],
+    ["conversation_id", reqWith(), { conversation_id: "chat-7" }],
+    ["metadata.conversation_id", reqWith(), { metadata: { conversation_id: "chat-7" } }],
+  ] as Array<[string, any, Record<string, any>]>) {
+    const resolved = resolveConversation(req, body);
+    assert.equal(resolved.chatSessionId, "chat-7", `not carried by ${label}`);
+    assert.equal(resolved.conversationId, "chat-7", `conversation key wrong for ${label}`);
+  }
+});
+
+test("a derived conversation id is NOT offered as a chat session", () => {
+  // Non-empty messages: `derived-<hash>`.
+  const derived = resolveConversation(reqWith(), {
+    messages: [{ role: "user", content: "hello" }],
+  });
+  assert.equal(derived.chatSessionId, undefined);
+  assert.match(derived.conversationId, /^derived-[0-9a-f]{16}$/);
+
+  // Empty messages: the literal "default", which is exactly the value that
+  // must never leave this process as a routing key.
+  const fallback = resolveConversation(reqWith(), {});
+  assert.equal(fallback.chatSessionId, undefined);
+  assert.equal(fallback.conversationId, "default");
+  assert.notEqual(fallback.chatSessionId, "default");
+});
+
+test("an empty or blank caller value is absent, not a chat session", () => {
+  for (const value of ["", "   "]) {
+    const resolved = resolveConversation(reqWith({ "x-booqi-chat-session": value }), {});
+    assert.equal(resolved.chatSessionId, undefined, `blank accepted: ${JSON.stringify(value)}`);
+    assert.equal(resolved.conversationId, "default");
+  }
+});
+
+test("a derived id reaches the SDK as no hint at all, end to end", async () => {
+  // The two halves joined: what `resolveConversation` refuses is what the SDK
+  // then does not receive. Without this, the refusal above and the writer in
+  // bridge-config could each be right while the wiring between them was not.
+  const derived = resolveConversation(reqWith(), { messages: [{ role: "user", content: "hi" }] });
+  const { captured, logs } = await run({
+    systemPrompt: "you are a bookkeeper",
+    behaviour: "success",
+    stream: true,
+    chatSessionId: derived.chatSessionId,
+    bridgeConfig: configWithMcp,
+  });
+
+  const url: string = captured[0].options.mcpServers.booqi.url;
+  assert.equal(url, MCP_URL);
+  assert.equal(url.includes("session="), false);
+  assert.equal(url.includes(derived.conversationId), false);
+  assert.equal(logs.length, 1);
+});
+
+/**
+ * A fake `query()` whose first call fails with a stale-session error and whose
+ * later calls succeed, so the retry loop of `executeWithRetries` is really
+ * entered. Records one entry per call, like `fakeQuery`.
+ */
+function fakeQueryFailingOnce(captured: Captured[]): QueryFn {
+  let calls = 0;
+  return (({ options }: any) => {
+    captured.push({ options });
+    calls += 1;
+    const failThis = calls === 1;
+    return (async function* () {
+      if (failThis) throw new Error("no conversation found for session");
+      yield {
+        type: "result", subtype: "success", result: "ok", session_id: "sdk-session-2",
+      } as any;
+    })();
+  }) as unknown as QueryFn;
+}
+
+test("AC-C2: a retried request logs the missing hint ONCE, not once per attempt", async () => {
+  // `once` has to mean once per REQUEST. Each retry builds its own options
+  // with its own `buildQueryOptions(...)` call, so the naive wiring emits one
+  // line per SDK attempt -- and a count that moves with the retry policy
+  // cannot be used to tell "the hint is missing" from "the hint is missing a
+  // lot". The logged fact is a property of the request, not of the attempt.
+  const retrying: BridgeConfig = { ...configWithMcp, maxRetries: 2 };
+  const { sessionStore } = __testing.initialiseStores(retrying);
+  sessionStore.record("conv-1", "stale-sdk-session");
+
+  const captured: Captured[] = [];
+  const logs: string[] = [];
+  __testing.setQuery(fakeQueryFailingOnce(captured));
+  __testing.setLog((message) => logs.push(message));
+  const res = fakeRes();
+
+  try {
+    await executeWithRetries(
+      // The NON-streaming transport: `handleStreamingResponse` writes its 200
+      // header before it iterates the query, so a failure there sets
+      // `res.headersSent` and the retry loop returns instead of retrying.
+      // Driving the retry at all requires the transport that fails before any
+      // header is written.
+      "hello", "claude-opus-4-6", "you are a bookkeeper", "conv-1",
+      false, res, "req-1", retrying, undefined,
+    );
+  } finally {
+    __testing.setQuery(undefined);
+    __testing.setLog(undefined);
+  }
+
+  // The retry really happened -- otherwise this test proves nothing.
+  assert.ok(captured.length >= 2, `expected a retry, saw ${captured.length} SDK call(s)`);
+  for (const call of captured) {
+    assert.equal(call.options.mcpServers.booqi.url, MCP_URL);
+  }
+  assert.equal(logs.length, 1, `expected one line across ${captured.length} attempts, got ${logs.length}: ${logs}`);
+});
+
+// ── The ruling's load-bearing invariant: one URL per SDK session ──────
+//
+// The reader binds the hint ONCE, when the MCP session is created
+// (`apps/cell/src/mcp-relay.ts`, inside `createSession`), so the hint only
+// takes effect on the request that opens that session. The owner's ruling --
+// one chat session is one agent session -- therefore rests on the hint being
+// constant for the life of an SDK session. Today that holds because
+// `resolveConversation` makes the two identifiers coincide when a caller names
+// one (`conversationId: named ?? derived`, `chatSessionId: named`), so two
+// requests sharing a session-store key necessarily carry the same hint.
+//
+// Nothing pinned that coupling. A refactor that keyed the store differently --
+// a tenant prefix, say -- would let two requests share one RESUMED SDK session
+// while carrying two different hints, and no test would have reddened.
+
+test("two requests on one conversation key send one and the same hinted URL", () => {
+  const first = resolveConversation(reqWith({ "x-booqi-chat-session": "chat-7" }), {
+    messages: [{ role: "user", content: "hello" }],
+  });
+  const second = resolveConversation(reqWith({ "x-booqi-chat-session": "chat-7" }), {
+    messages: [{ role: "user", content: "a completely different second turn" }],
+  });
+
+  // Same store key, so the SDK session is resumed rather than restarted...
+  assert.equal(first.conversationId, second.conversationId);
+  // ...and the hint the store key implies is the hint that gets written.
+  assert.equal(first.chatSessionId, second.chatSessionId);
+  assert.equal(first.chatSessionId, first.conversationId);
+
+  const urlFor = (hint: string | undefined) => {
+    const opts = buildQueryOptions(
+      "claude-opus-4-6", undefined, undefined, "sdk-1", configWithMcp, new AbortController(),
+      { chatSessionId: hint },
+    );
+    return opts.mcpServers.booqi.url as string;
+  };
+
+  assert.equal(urlFor(first.chatSessionId), urlFor(second.chatSessionId));
+  assert.equal(urlFor(first.chatSessionId), `${MCP_URL}?session=chat-7`);
+});
+
+// ── The hint must not be mistaken for a stale SDK session ─────────────
+
+test("an SDK error quoting the hinted URL does not discard the conversation", async () => {
+  // The stale-session retry arm matches /no conversation found|session/i and,
+  // when it fires, drops `resumeSessionId`, mints a new SDK session id and
+  // OVERWRITES the store -- i.e. it throws the user's conversation away. This
+  // PR is what puts the substring `session=` into the URL the bridge hands the
+  // SDK, and an MCP transport error routinely quotes the URL it could not
+  // reach. Without the guard the bridge would read its OWN hint as evidence
+  // that the session had expired.
+  const retrying: BridgeConfig = { ...configWithMcp, maxRetries: 0 };
+  const { sessionStore } = __testing.initialiseStores(retrying);
+  sessionStore.record("conv-1", "live-sdk-session");
+
+  const captured: Captured[] = [];
+  __testing.setQuery((({ options }: any) => {
+    captured.push({ options });
+    return (async function* () {
+      // The shape an MCP transport failure takes: the URL, verbatim, hint and all.
+      throw new Error(`MCP server "booqi" failed to connect: GET ${MCP_URL}?session=chat-7 ECONNREFUSED`);
+    })();
+  }) as unknown as QueryFn);
+  __testing.setLog(() => {});
+  const res = fakeRes();
+
+  try {
+    await executeWithRetries(
+      "hello", "claude-opus-4-6", "you are a bookkeeper", "conv-1",
+      false, res, "req-1", retrying, "chat-7",
+    );
+  } finally {
+    __testing.setQuery(undefined);
+    __testing.setLog(undefined);
+  }
+
+  // The conversation survived: the store still points at the live SDK session.
+  assert.equal(
+    sessionStore.get("conv-1")?.claudeSessionId, "live-sdk-session",
+    "the bridge read its own session hint as a stale SDK session and discarded the conversation",
+  );
+  // And a genuine stale-session text is still recognised -- the fix removes
+  // the collision, it does not narrow the rule.
+  assert.equal(captured.length, 1);
+});
+
+test("a genuine stale-session error is still recognised", async () => {
+  const retrying: BridgeConfig = { ...configWithMcp, maxRetries: 1 };
+  const { sessionStore } = __testing.initialiseStores(retrying);
+  sessionStore.record("conv-1", "stale-sdk-session");
+
+  const captured: Captured[] = [];
+  __testing.setQuery(fakeQueryFailingOnce(captured));
+  __testing.setLog(() => {});
+  const res = fakeRes();
+
+  try {
+    await executeWithRetries(
+      "hello", "claude-opus-4-6", "you are a bookkeeper", "conv-1",
+      false, res, "req-1", retrying, "chat-7",
+    );
+  } finally {
+    __testing.setQuery(undefined);
+    __testing.setLog(undefined);
+  }
+
+  // "no conversation found for session" still triggers the fresh-session retry.
+  assert.ok(captured.length >= 2, `expected the stale-session retry, saw ${captured.length} call(s)`);
+  assert.notEqual(sessionStore.get("conv-1")?.claudeSessionId, "stale-sdk-session");
+});

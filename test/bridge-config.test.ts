@@ -18,9 +18,14 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import {
+  applySessionHint,
   buildBridgeOptions,
   buildQueryOptions,
   droppedMcpServersMessage,
+  normaliseChatSessionId,
+  sessionHintMessage,
+  SESSION_HINT_PARAM,
+  unhintedMcpServersMessage,
   COMPACT_SUMMARY_HEADING,
   DEFAULT_SYSTEM_PROMPT_MODE,
   isUnknownSystemPromptMode,
@@ -58,6 +63,10 @@ function optionsFor(config: BridgeConfig): Record<string, any> {
     "session-1",
     config,
     new AbortController(),
+    // Explicitly nothing: no chat session named, no log sink. The parameter is
+    // required precisely so that this is a visible choice rather than an
+    // omission that looks the same.
+    {},
   );
 }
 
@@ -358,7 +367,7 @@ test("skipPermissions off leaves both permission keys off", () => {
 
 test("a resume id becomes resume, not sessionId", () => {
   const opts = buildQueryOptions(
-    "claude-opus-4-6", undefined, "resume-9", "new-1", baseConfig(), new AbortController(),
+    "claude-opus-4-6", undefined, "resume-9", "new-1", baseConfig(), new AbortController(), {},
   );
 
   assert.equal(opts.resume, "resume-9");
@@ -503,6 +512,7 @@ function optionsWithEveryBranch(): Record<string, any> {
     undefined,
     baseConfig({ mcpServers: CELL_MCP_SERVERS, tools: [], effort: "medium", maxBudgetUsd: 1 }),
     new AbortController(),
+    {},
   );
 }
 
@@ -550,7 +560,7 @@ test("both fixtures together reach every declared option name", () => {
 
 test("the caller's system prompt reaches the SDK under the real option name", () => {
   const opts = buildQueryOptions(
-    "claude-opus-4-6", "you are a bookkeeper", undefined, "session-1", baseConfig(), new AbortController(),
+    "claude-opus-4-6", "you are a bookkeeper", undefined, "session-1", baseConfig(), new AbortController(), {},
   );
 
   // Default mode is "replace", so the prompt goes out as a plain string.
@@ -578,7 +588,7 @@ test("systemPromptMode defaults to replace -- the agent's prompt, not the coding
 
   for (const config of [baseConfig(), baseConfig({ systemPromptMode: "replace" })]) {
     const opts = buildQueryOptions(
-      "claude-opus-4-6", "P", undefined, "session-1", config, new AbortController(),
+      "claude-opus-4-6", "P", undefined, "session-1", config, new AbortController(), {},
     );
     assert.equal(opts.systemPrompt, "P");
   }
@@ -587,7 +597,7 @@ test("systemPromptMode defaults to replace -- the agent's prompt, not the coding
 test("systemPromptMode append is still available and sends the preset form", () => {
   const opts = buildQueryOptions(
     "claude-opus-4-6", "P", undefined, "session-1",
-    baseConfig({ systemPromptMode: "append" }), new AbortController(),
+    baseConfig({ systemPromptMode: "append" }), new AbortController(), {},
   );
 
   assert.deepEqual(opts.systemPrompt, { type: "preset", preset: "claude_code", append: "P" });
@@ -603,7 +613,7 @@ test("an unrecognised systemPromptMode falls back to the default, and is reporte
 
     const opts = buildQueryOptions(
       "claude-opus-4-6", "P", undefined, "session-1",
-      baseConfig({ systemPromptMode: bad as any }), new AbortController(),
+      baseConfig({ systemPromptMode: bad as any }), new AbortController(), {},
     );
     // Falls back to the default rather than to the 26 KB coding preset.
     assert.equal(opts.systemPrompt, "P");
@@ -671,7 +681,7 @@ test("an empty-string caller prompt stays an empty string, and sets no option", 
   assert.equal(resolveSystemPrompt("P", "", undefined), "P");
 
   const opts = buildQueryOptions(
-    "claude-opus-4-6", "", undefined, "session-1", baseConfig(), new AbortController(),
+    "claude-opus-4-6", "", undefined, "session-1", baseConfig(), new AbortController(), {},
   );
   assert.equal("systemPrompt" in opts, false);
 });
@@ -827,4 +837,296 @@ test("the README settings table and the config schema declare the same keys", ()
 
   const orphaned = [...documented].filter((k) => !(k in schema.properties));
   assert.deepEqual(orphaned, [], `README rows for keys the schema does not declare: ${orphaned}`);
+});
+
+// ── The session-hint writer (booqi-app/app#459, AC-C1 … AC-C6) ──────
+//
+// WHAT THESE PROVE, and why the shape matters. The cell gateway's MCP relay
+// has READ `?session=` (`CHAT_SESSION_QUERY`) since app#480 and nothing ever
+// WROTE it, so in production the SDK session named no exchange and the gateway
+// answered `tools/list` with `{tools: []}`. This is that writer.
+//
+// Every assertion below is on the object `buildQueryOptions` RETURNS, or on
+// what `applySessionHint` returns -- never on the source text of either. The
+// worst measured defect in this estate was on this repository: the regression
+// guards of booqi-app/infra#202 were regexes over `claude-bridge.ts`, and
+// three reviewers each re-introduced the exact defect the issue existed for,
+// in a spelling the regex did not match, with the whole suite green.
+
+/** The URL the issue names verbatim in AC-C1. */
+const AC_C1_URL = "http://127.0.0.1:3004/mcp";
+const AC_C1_SERVERS = { booqi: { type: "http", url: AC_C1_URL } };
+
+/** Collects the log lines one `buildQueryOptions` call emits. */
+function optionsWithHint(
+  config: BridgeConfig,
+  chatSessionId: string | undefined,
+): { opts: Record<string, any>; logs: string[] } {
+  const logs: string[] = [];
+  const opts = buildQueryOptions(
+    "claude-opus-4-6",
+    undefined,
+    undefined,
+    "session-1",
+    config,
+    new AbortController(),
+    { chatSessionId, log: (message) => logs.push(message) },
+  );
+  return { opts, logs };
+}
+
+/** The relay's own reader: `requestUrl.searchParams.get(CHAT_SESSION_QUERY)`. */
+function sessionAsTheRelayReadsIt(url: string): string | null {
+  return new URL(url).searchParams.get(SESSION_HINT_PARAM);
+}
+
+function countOf(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+test("AC-C1: the configured loopback URL reaches the SDK options carrying the session", () => {
+  const { opts } = optionsWithHint(baseConfig({ mcpServers: AC_C1_SERVERS }), "chat-7");
+
+  // Exact string equality, not a substring test: this is the whole URL the
+  // SDK is handed, so a mutant that also rewrote the host or the path shows up
+  // here rather than hiding behind an `includes("session=")`.
+  assert.equal(opts.mcpServers.booqi.url, `${AC_C1_URL}?session=chat-7`);
+  // And the rest of the entry is intact -- the transport type especially.
+  assert.equal(opts.mcpServers.booqi.type, "http");
+});
+
+test("AC-C1: the identifier is encoded, so it cannot inject a second parameter", () => {
+  // Not a conformant identifier (`chatSessionIdSchema` is [A-Za-z0-9_-]{1,200}),
+  // which is exactly why it is the one tested: the schema lives in another
+  // repository and this module must not depend on it holding.
+  const hostile = "a b/c&session=evil&foo=1";
+  const { opts } = optionsWithHint(baseConfig({ mcpServers: AC_C1_SERVERS }), hostile);
+  const url: string = opts.mcpServers.booqi.url;
+
+  // The property that matters is the round trip through the relay's reader.
+  assert.equal(sessionAsTheRelayReadsIt(url), hostile);
+  // One query string, one `session=`, and nothing else got through: the
+  // injected `foo` must NOT be a parameter of its own.
+  assert.equal(countOf(url, "?"), 1);
+  assert.equal(countOf(url, "session="), 1);
+  assert.equal(new URL(url).searchParams.get("foo"), null);
+  assert.equal([...new URL(url).searchParams.keys()].length, 1);
+});
+
+test("AC-C2: with no identifier the URL is handed over unchanged, and once logged", () => {
+  const { opts, logs } = optionsWithHint(baseConfig({ mcpServers: AC_C1_SERVERS }), undefined);
+
+  assert.equal(opts.mcpServers.booqi.url, AC_C1_URL);
+  assert.equal(sessionAsTheRelayReadsIt(opts.mcpServers.booqi.url), null);
+  assert.equal(logs.length, 1, `expected exactly one log line, got ${logs.length}: ${logs}`);
+  assert.match(logs[0], /no chat-session hint written/);
+  assert.match(logs[0], /"booqi"/);
+});
+
+test("AC-C2: an absent identifier NEVER becomes a literal default", () => {
+  // The cross-user defect this battery exists for. `apps/cell/src/sessions.ts`
+  // sets DEFAULT_SESSION_ID = "default" and `chatSessionIdSchema` imposes no
+  // entropy, so `?session=default` is guessed in one attempt -- and every
+  // hintless request would land on the same exchange.
+  // A boxed `String` and an object with a `toString` are in the table on
+  // purpose: `typeof new String("x") !== "string"`, so they must fail CLOSED
+  // rather than be coerced into a routing key nobody named. They pin the
+  // `typeof` guard specifically rather than incidentally.
+  for (const absent of [
+    undefined, "", "   ", "\n", "\t\r\n ", null, 7, 0, NaN, true, false, {}, [],
+    new String("boxed"), { toString: () => "evil" }, () => "evil",
+  ] as unknown[]) {
+    assert.equal(normaliseChatSessionId(absent), undefined, `not absent: ${String(absent)}`);
+
+    const { opts, logs } = optionsWithHint(
+      baseConfig({ mcpServers: AC_C1_SERVERS }),
+      absent as string | undefined,
+    );
+    assert.equal(opts.mcpServers.booqi.url, AC_C1_URL, `URL mutated for ${String(absent)}`);
+    assert.equal(opts.mcpServers.booqi.url.includes("session="), false);
+    assert.equal(logs.length, 1);
+  }
+});
+
+test("AC-C2: a URL that does not parse is handed over unchanged and says why", () => {
+  const broken = { booqi: { type: "http", url: "not a url" } };
+  const { opts, logs } = optionsWithHint(baseConfig({ mcpServers: broken }), "chat-7");
+
+  assert.equal(opts.mcpServers.booqi.url, "not a url");
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /is not a parseable URL string/);
+});
+
+test("AC-C3: an existing query string keeps its parameters and gains one session", () => {
+  const configured = { booqi: { type: "http", url: "http://127.0.0.1:3004/mcp?foo=1" } };
+  const { opts } = optionsWithHint(baseConfig({ mcpServers: configured }), "chat-7");
+  const url: string = opts.mcpServers.booqi.url;
+
+  assert.equal(new URL(url).searchParams.get("foo"), "1");
+  assert.equal(sessionAsTheRelayReadsIt(url), "chat-7");
+  assert.equal(countOf(url, "session="), 1);
+  assert.deepEqual([...new URL(url).searchParams.keys()], ["foo", "session"]);
+});
+
+test("AC-C3: a configured session parameter is overwritten, not duplicated", () => {
+  const configured = { booqi: { type: "http", url: "http://127.0.0.1:3004/mcp?session=stale&foo=1" } };
+  const { opts } = optionsWithHint(baseConfig({ mcpServers: configured }), "chat-7");
+  const url: string = opts.mcpServers.booqi.url;
+
+  assert.equal(countOf(url, "session="), 1);
+  assert.equal(url.includes("stale"), false);
+  assert.equal(sessionAsTheRelayReadsIt(url), "chat-7");
+  assert.equal(new URL(url).searchParams.getAll("session").length, 1);
+  assert.equal(new URL(url).searchParams.get("foo"), "1");
+});
+
+test("AC-C4: only an entry with a url is rewritten; a stdio entry is untouched", () => {
+  const stdio = { command: "node", args: ["./tool-api.mjs"] };
+  const configured = { booqi: { type: "http", url: AC_C1_URL }, local: stdio };
+  const { opts } = optionsWithHint(baseConfig({ mcpServers: configured }), "chat-7");
+
+  assert.equal(opts.mcpServers.booqi.url, `${AC_C1_URL}?session=chat-7`);
+  // Identity, not just deep equality: the very object from configuration is
+  // what the SDK gets, so nothing about it can have been rewritten.
+  assert.equal(opts.mcpServers.local, stdio);
+  assert.deepEqual(opts.mcpServers.local, { command: "node", args: ["./tool-api.mjs"] });
+  assert.equal("url" in opts.mcpServers.local, false);
+  assert.equal("session" in opts.mcpServers.local, false);
+});
+
+test("AC-C4: the writer does not mutate the configured object", () => {
+  const configured = { booqi: { type: "http", url: AC_C1_URL } };
+  const { opts } = optionsWithHint(baseConfig({ mcpServers: configured }), "chat-7");
+
+  assert.equal(configured.booqi.url, AC_C1_URL, "configuration was mutated in place");
+  assert.notEqual(opts.mcpServers.booqi, configured.booqi);
+});
+
+test("AC-C4: readMcpServers' sanitising still holds through the writer", () => {
+  // The `__proto__` refusal and the "empty map is absent" rule, re-asserted on
+  // the far side of the rewrite rather than only on readMcpServers.
+  const withProto = JSON.parse('{"__proto__": {"type":"http","url":"http://127.0.0.1:3004/mcp"},'
+    + '"booqi": {"type":"http","url":"http://127.0.0.1:3004/mcp"}}');
+  const { opts } = optionsWithHint(baseConfig({ mcpServers: withProto }), "chat-7");
+
+  assert.deepEqual(Object.keys(opts.mcpServers), ["booqi"]);
+  assert.equal(Object.getPrototypeOf(opts.mcpServers), Object.prototype);
+  assert.equal(opts.mcpServers.type, undefined);
+
+  // An empty map is still absent, and an all-url map that empties is too.
+  const empty = optionsWithHint(baseConfig({ mcpServers: {} }), "chat-7");
+  assert.equal("mcpServers" in empty.opts, false);
+  assert.equal(empty.logs.length, 0);
+});
+
+test("AC-C5: server names survive the rewrite verbatim", () => {
+  // The SDK derives `mcp__<name>__<tool>` from these, so a rewritten name
+  // silently breaks every tool call while the URL looks perfect.
+  const names = ["booqi", "booqi_tool-api", "Booqi.V2", "a"];
+  const configured: Record<string, unknown> = {};
+  for (const n of names) configured[n] = { type: "http", url: AC_C1_URL };
+
+  const { opts } = optionsWithHint(baseConfig({ mcpServers: configured }), "chat-7");
+
+  assert.deepEqual(Object.keys(opts.mcpServers), names);
+  for (const n of names) {
+    assert.equal(opts.mcpServers[n].url, `${AC_C1_URL}?session=chat-7`, `missing hint on ${n}`);
+  }
+});
+
+test("AC-C6: no log line carries the raw session identifier, on EVERY branch", () => {
+  // The identifier is the routing key and has no entropy in the default path,
+  // so a log of it is a disclosure: anything that can read the log can then
+  // address that exchange.
+  //
+  // EVERY arm, enumerated. Round 1 of this PR asserted only the written arm
+  // and the no-identifier arm, and a mutant that interpolated the identifier
+  // into the UNPARSEABLE-URL reason string survived the whole suite -- the one
+  // survivor in a battery of seventeen. An arm nobody asserts on is an arm
+  // that can disclose. This table is the fix, and `arms` is what it examined.
+  const identifier = "chat-cafe1234-secret";
+  const arms: Array<[string, BridgeConfig, string | undefined]> = [
+    ["hint written", baseConfig({ mcpServers: AC_C1_SERVERS }), identifier],
+    ["no identifier", baseConfig({ mcpServers: AC_C1_SERVERS }), undefined],
+    ["url does not parse", baseConfig({ mcpServers: { booqi: { type: "http", url: "nope" } } }), identifier],
+    ["url is not a string", baseConfig({ mcpServers: { booqi: { type: "http", url: 7 } } }), identifier],
+    [
+      "one hinted, one unparseable",
+      baseConfig({ mcpServers: { ok: { type: "http", url: AC_C1_URL }, bad: { type: "http", url: "::::" } } }),
+      identifier,
+    ],
+  ];
+
+  assert.equal(arms.length, 5, "the arm table must enumerate every branch that logs");
+
+  for (const [label, config, id] of arms) {
+    const { logs } = optionsWithHint(config, id);
+    assert.equal(logs.length, 1, `${label}: expected exactly one line, got ${logs.length}: ${logs}`);
+    assert.equal(
+      logs[0].includes(identifier), false,
+      `${label}: log line discloses the identifier: ${logs[0]}`,
+    );
+  }
+
+  // The success line still says enough to tell "written" from "not written",
+  // and a mixed outcome reports the success as well as the failure -- a line
+  // naming only the failure reads as if nothing at all was hinted.
+  const written = optionsWithHint(baseConfig({ mcpServers: AC_C1_SERVERS }), identifier);
+  assert.match(written.logs[0], /wrote the chat-session hint/);
+  assert.match(written.logs[0], /"booqi"/);
+
+  const mixed = optionsWithHint(
+    baseConfig({ mcpServers: { ok: { type: "http", url: AC_C1_URL }, bad: { type: "http", url: "::::" } } }),
+    identifier,
+  );
+  assert.match(mixed.logs[0], /"bad"/);
+  assert.match(mixed.logs[0], /DID get the hint: "ok"/);
+});
+
+test("AC-C6: the message builders cannot disclose what they are not given", () => {
+  // Not a source-text assertion: `fn.length` is a runtime property of the
+  // function object, and the behavioural table above is what actually holds
+  // the property. This only pins that no identifier-shaped parameter was
+  // added to a builder, which is how the surviving mutant got in.
+  assert.equal(sessionHintMessage.length, 1);
+  assert.equal(unhintedMcpServersMessage.length, 2, "only `unhinted` and the boolean are required");
+  assert.match(sessionHintMessage(["booqi"]), /not logged/);
+});
+
+test("AC-C2: a non-string url is reported, while a stdio entry stays silent", () => {
+  // Distinguishing the three states. A `url` that is PRESENT but not a string
+  // is a misconfiguration and must be named; an entry with NO `url` is a stdio
+  // entry and has nothing to hint, so silence is correct there. Collapsing the
+  // two would let `url: 7` reach the SDK with no line saying why the session
+  // has no tools -- `absent` coinciding with `in order`.
+  const bad = optionsWithHint(baseConfig({ mcpServers: { booqi: { type: "http", url: 7 } } }), "chat-7");
+  assert.equal(bad.logs.length, 1);
+  assert.match(bad.logs[0], /"booqi"/);
+  assert.equal(bad.opts.mcpServers.booqi.url, 7);
+
+  const stdio = optionsWithHint(baseConfig({ mcpServers: { local: { command: "node" } } }), "chat-7");
+  assert.equal(stdio.logs.length, 0);
+  assert.deepEqual(stdio.opts.mcpServers, { local: { command: "node" } });
+});
+
+test("applySessionHint reports what it examined, per name", () => {
+  // A guard that reports counts rather than "ok" (V2.28). `hinted` and
+  // `unhinted` are what the caller logs from, so they are asserted directly.
+  const outcome = applySessionHint(
+    {
+      hinted: { type: "http", url: AC_C1_URL },
+      broken: { type: "http", url: "::::" },
+      stdio: { command: "node" },
+    },
+    "chat-7",
+  );
+
+  assert.deepEqual(outcome.hinted, ["hinted"]);
+  assert.deepEqual(outcome.unhinted, ["broken"]);
+  assert.deepEqual(Object.keys(outcome.servers), ["hinted", "broken", "stdio"]);
+
+  const none = applySessionHint({ booqi: { type: "http", url: AC_C1_URL } }, undefined);
+  assert.deepEqual(none.hinted, []);
+  assert.deepEqual(none.unhinted, ["booqi"]);
+  assert.equal(none.servers.booqi.url, AC_C1_URL);
 });
