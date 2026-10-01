@@ -33,6 +33,9 @@ import {
   KNOWN_NON_SDK_OPTIONS,
   KNOWN_NON_SDK_OPTION_NAMES,
   readMcpServers,
+  readTools,
+  DEFAULT_TOOLS_WHEN_ABSENT,
+  unusableToolsMessage,
   resolveSystemPrompt,
   SDK_OPTION_NAMES,
   summariseMcpServers,
@@ -1129,4 +1132,304 @@ test("applySessionHint reports what it examined, per name", () => {
   assert.deepEqual(none.hinted, []);
   assert.deepEqual(none.unhinted, ["booqi"]);
   assert.equal(none.servers.booqi.url, AC_C1_URL);
+});
+
+
+// ───────────────────────────────────────────────────────────────────────────
+// booqi-app/infra#207 -- the `tools` key must not fail open
+//
+// Every assertion below is on the OBSERVABLE BEHAVIOUR of the exported
+// functions: the object `buildQueryOptions` returns, or the error it throws.
+// None of them reads source text. That is a requirement of the issue (AC-1..
+// AC-5 are "graded on the behaviour of the exported functions, never on source
+// text") and of driver-prompt V2.24: a test that greps for an identifier is
+// satisfied by a comment and misses every alternative spelling of the defect.
+// AC-6 is the single declared exception -- it is a documentation criterion --
+// and it is discharged by PARSING the shipped files, not by matching source.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** Every present-but-unusable `tools` value AC-2 names, plus the falsy ones. */
+const UNUSABLE_TOOLS_VALUES: Array<[string, unknown]> = [
+  // The four types AC-2 names explicitly.
+  ["a string", "Bash"],
+  ["a number", 3],
+  ["null", null],
+  ["a plain object", { Bash: true }],
+  // The falsy ones. These matter MORE than the four above, because under the
+  // old `if (config.tools)` predicate every one of them was already
+  // indistinguishable from an absent key -- and so was silently given the full
+  // built-in tool set. A mutant that keeps a default but gates it on
+  // truthiness or on `?.length` passes AC-1 and dies here.
+  ["the empty string", ""],
+  ["zero", 0],
+  ["false", false],
+  ["NaN", Number.NaN],
+];
+
+test("AC-1: a configuration with NO `tools` key yields tools: [] (not the SDK's built-ins)", () => {
+  const config = baseConfig();
+
+  // The premise of the test, asserted rather than assumed: the key really is
+  // absent, not present-and-undefined. If `baseConfig` ever grows a `tools`
+  // key this test would otherwise quietly stop testing anything.
+  assert.equal("tools" in config, false, "baseConfig must carry NO tools key");
+
+  const opts = optionsFor(config);
+
+  // `"tools" in opts` and the value are two separate claims. The old code
+  // failed the first one, and a fix that sets `tools: undefined` would pass a
+  // deepEqual against `undefined` while leaving the SDK on its built-ins.
+  assert.equal("tools" in opts, true, "an absent key must still produce a tools option");
+  assert.deepEqual(opts.tools, [], "an absent key means NO tools");
+  assert.equal(Array.isArray(opts.tools), true);
+});
+
+test("AC-1: the default is not shared mutable state between calls", () => {
+  const a = optionsFor(baseConfig());
+  const b = optionsFor(baseConfig());
+
+  a.tools.push("Bash");
+
+  assert.deepEqual(b.tools, [], "one caller's mutation must not widen another's tool set");
+  assert.deepEqual([...DEFAULT_TOOLS_WHEN_ABSENT], []);
+});
+
+test("AC-2: a present-but-non-array `tools` fails configuration load, naming the key", () => {
+  let examined = 0;
+
+  for (const [label, value] of UNUSABLE_TOOLS_VALUES) {
+    examined += 1;
+
+    // (a) configuration load -- `buildBridgeOptions` is what `index.ts` calls
+    // in `register()`, so a throw here means the plugin never registers and the
+    // bridge never starts.
+    assert.throws(
+      () => buildBridgeOptions(JSON.parse(JSON.stringify({ tools: value })) as Record<string, unknown>),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, `${label}: expected an Error`);
+        assert.match(err.message, /"tools"/, `${label}: the error must name the key`);
+        return true;
+      },
+      `${label}: configuration load must refuse it`,
+    );
+
+    // (b) and the option builder itself, so the refusal does not depend on the
+    // caller having gone through configuration load. No options object exists.
+    let produced: unknown = "NOTHING WAS PRODUCED";
+    assert.throws(
+      () => { produced = optionsFor(baseConfig({ tools: value as never })); },
+      /"tools"/,
+      `${label}: buildQueryOptions must refuse it`,
+    );
+    assert.equal(produced, "NOTHING WAS PRODUCED", `${label}: no options object may be produced`);
+
+    // (c) and it is refused, not coerced and not silently defaulted. Asserting
+    // the absence of the default is the whole point: `readTools` returning `[]`
+    // for a bad value would be a fail-CLOSED bug but still a bug -- it would
+    // make `"tools": "Bash"` look like it worked.
+    assert.throws(() => readTools(value), /"tools"/, label);
+    assert.match(unusableToolsMessage(value), /"tools"/, label);
+  }
+
+  // What this guard EXAMINED, not just that it is ok.
+  assert.equal(examined, 8, "all eight unusable values must have been examined");
+  assert.equal(examined, UNUSABLE_TOOLS_VALUES.length);
+});
+
+test("AC-2: `null` is refused and is NOT treated as absent", () => {
+  // Called out on its own because `null` is the one value for which "absent"
+  // is a defensible reading, and taking that reading would reinstate the
+  // defect for every config written by hand with an explicit null.
+  assert.throws(() => readTools(null), /"tools"/);
+  assert.notDeepEqual(
+    (() => { try { return readTools(null); } catch { return "threw"; } })(),
+    [],
+  );
+});
+
+test("AC-3: an absent key does not inherit the SDK built-ins, by any spelling", () => {
+  // THE MUTANT-KILLING ASSERTION. It is red under every spelling of the
+  // defect, because it asks what the SDK receives and not how the code asks:
+  //   if (config.tools)                       -> no `tools` key at all
+  //   if (config.tools?.length)               -> no `tools` key at all
+  //   if (config.tools && config.tools.length)-> no `tools` key at all
+  //   opts.tools = config.tools               -> `tools` present but undefined
+  // The last spelling is the reason `"tools" in opts` is not sufficient on its
+  // own and the reason `undefined` is excluded explicitly.
+  const opts = optionsFor(baseConfig());
+
+  assert.notEqual(opts.tools, undefined, "tools must not be undefined");
+  assert.equal(Array.isArray(opts.tools), true, "tools must be an array");
+  assert.equal(opts.tools.length, 0, "and that array must be empty");
+
+  for (const builtin of ["Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch"]) {
+    assert.equal(
+      opts.tools.includes(builtin),
+      false,
+      `the SDK must not be left free to use ${builtin}`,
+    );
+  }
+});
+
+test("AC-4: bypassPermissions can never ship with an undefined tool set", () => {
+  // AC-4 is a UNIVERSAL ("there is no input to buildQueryOptions that yields
+  // permissionMode bypassPermissions with opts.tools undefined"), and a
+  // universal is not discharged by one example. It is discharged here by
+  // sweeping the cartesian product of EVERY input dimension this function
+  // branches on -- that is what makes it exhaustive over the branch structure
+  // rather than over one happy path.
+  const toolsCases: Array<unknown> = [
+    "ABSENT",
+    [],
+    ["mcp__booqi__open_invoices"],
+    ...UNUSABLE_TOOLS_VALUES.map(([, v]) => v),
+  ];
+
+  let produced = 0;
+  let refused = 0;
+  let bypass = 0;
+
+  for (const skipPermissions of [true, false]) {
+    for (const systemPrompt of [undefined, "be brief"]) {
+      for (const systemPromptMode of [undefined, "append", "replace", "Replace"]) {
+        for (const resume of [undefined, "sdk-session-7"]) {
+          for (const mcpServers of [undefined, CELL_MCP_SERVERS, {}, "not an object"]) {
+            for (const strictMcpConfig of [undefined, true, false]) {
+              for (const extra of [{}, { effort: "high" as const, maxBudgetUsd: 5, maxTurns: 1 }]) {
+                for (const tools of toolsCases) {
+                  const config = baseConfig({
+                    skipPermissions,
+                    systemPromptMode: systemPromptMode as never,
+                    mcpServers,
+                    strictMcpConfig,
+                    ...extra,
+                    ...(tools === "ABSENT" ? {} : { tools: tools as never }),
+                  });
+
+                  let opts: Record<string, any> | undefined;
+                  try {
+                    opts = buildQueryOptions(
+                      "claude-opus-4-6", systemPrompt, resume, "session-1",
+                      config, new AbortController(), {},
+                    );
+                  } catch (err) {
+                    refused += 1;
+                    assert.match((err as Error).message, /"tools"/);
+                    continue;
+                  }
+
+                  produced += 1;
+                  // The universal, on every object actually produced.
+                  assert.equal("tools" in opts, true);
+                  assert.equal(Array.isArray(opts.tools), true);
+                  if (opts.permissionMode === "bypassPermissions") {
+                    bypass += 1;
+                    assert.notEqual(
+                      opts.tools, undefined,
+                      "bypassPermissions with an undefined tool set is the defect itself",
+                    );
+                    assert.equal(Array.isArray(opts.tools), true);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Counts, so a sweep that silently stopped iterating cannot read as a pass.
+  // skipPermissions(2) x systemPrompt(2) x systemPromptMode(4) x resume(2)
+  // x mcpServers(4) x strictMcpConfig(3) x extra(2) = 768 shapes, each crossed
+  // with 11 tools values.
+  const shapes = 2 * 2 * 4 * 2 * 4 * 3 * 2;
+  assert.equal(shapes, 768);
+  assert.equal(toolsCases.length, 11);
+  assert.equal(produced + refused, shapes * 11, "every combination must have been exercised");
+  assert.equal(produced, 3 * shapes, "the three usable tools values must all produce an object");
+  assert.equal(refused, 8 * shapes, "the eight unusable ones must all be refused");
+  assert.equal(bypass, 3 * (shapes / 2), "half the produced objects carry bypassPermissions");
+});
+
+test("AC-4: the SHIPPED example configuration produces bypassPermissions AND tools: []", () => {
+  // Not a hand-written config: the actual file install.sh copies into place.
+  // This is the combination the issue was filed about -- skipPermissions true,
+  // no tools key -- read from the artifact rather than restated.
+  const example = JSON.parse(readFileSync(join(repoRoot, "config.example.json"), "utf-8"));
+  assert.equal(example.skipPermissions, true, "the example must still ship skipPermissions");
+
+  const opts = optionsFor(baseConfig(buildBridgeOptions(example) as Partial<BridgeConfig>));
+
+  assert.equal(opts.permissionMode, "bypassPermissions");
+  assert.equal(opts.allowDangerouslySkipPermissions, true);
+  assert.deepEqual(opts.tools, []);
+});
+
+test("AC-5: a configured tool set still reaches the SDK unchanged", () => {
+  // The fix must not turn the restriction into a constant of its own:
+  // booqi-app/infra#195's configured value is still what ships.
+  const configured = ["mcp__booqi__whatever", "mcp__booqi__open_invoices"];
+  const opts = optionsFor(baseConfig({ tools: configured }));
+
+  assert.deepEqual(opts.tools, configured);
+  assert.equal(opts.tools, configured, "the very same array, not a rebuilt one");
+
+  // And a configured `[]` survives as `[]` -- the value a cell ships. This is
+  // the assertion the `?.length` spelling of the defect fails while looking
+  // more careful than the original.
+  const empty: string[] = [];
+  const emptyOpts = optionsFor(baseConfig({ tools: empty }));
+  assert.deepEqual(emptyOpts.tools, []);
+  assert.equal(emptyOpts.tools, empty, "a configured [] is passed through, not re-defaulted");
+
+  // Order and duplicates are configuration too, not something to normalise.
+  const odd = ["b", "a", "a"];
+  assert.deepEqual(optionsFor(baseConfig({ tools: odd })).tools, ["b", "a", "a"]);
+
+  // And through configuration load as well.
+  assert.deepEqual(buildBridgeOptions({ tools: configured }).tools, configured);
+  assert.deepEqual(buildBridgeOptions({ tools: [] }).tools, []);
+  assert.deepEqual(buildBridgeOptions({}).tools, [], "absent at load time is also no tools");
+});
+
+test("AC-6: config.example.json carries an explicit `tools` key, and it is restrictive", () => {
+  // Parsed, not grepped. The absent key WAS the defect, so the shipped example
+  // must now show the default rather than demonstrate the old hazard.
+  const example = JSON.parse(readFileSync(join(repoRoot, "config.example.json"), "utf-8"));
+
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(example, "tools"), true,
+    "config.example.json must carry an explicit tools key",
+  );
+  assert.deepEqual(example.tools, []);
+
+  // And the key the example now carries must be one the plugin schema admits,
+  // otherwise the example and the schema are green while disagreeing.
+  const schema = JSON.parse(readFileSync(join(repoRoot, "openclaw.plugin.json"), "utf-8")).configSchema;
+  assert.equal("tools" in schema.properties, true);
+  assert.equal(schema.properties.tools.type, "array");
+
+  // The schema description is the documented default a user reads in their
+  // editor. It used to say "default: all claude_code tools", which is now a
+  // false statement about the code in this commit.
+  assert.doesNotMatch(
+    schema.properties.tools.description,
+    /default:\s*all/i,
+    "the schema must not still advertise the removed all-built-ins default",
+  );
+});
+
+test("AC-6: README documents that an absent `tools` key means no built-in tools", () => {
+  const readme = readFileSync(join(repoRoot, "README.md"), "utf-8");
+
+  // A documentation criterion, declared as such by the issue. Held to the
+  // claim rather than to an identifier: the upgrade note must state the
+  // direction of the change and must name the built-in tools a user loses.
+  assert.match(readme, /absent\s+`?tools`?\s+key\s+now\s+means\s+no\s+tools/i);
+  assert.match(readme, /\*\*An absent key means NO built-in tools\.\*\*/);
+  assert.match(readme, /behaviour change/i);
+  for (const builtin of ["Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch"]) {
+    assert.ok(readme.includes(builtin), `the upgrade note must name ${builtin}`);
+  }
 });

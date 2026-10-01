@@ -1,6 +1,7 @@
 {
   "port": 7779,
   "skipPermissions": true,
+  "tools": [],
   "maxTurns": 30,
   "defaultModel": "claude-opus-4-6",
   "queueMinDelayMs": 1000,

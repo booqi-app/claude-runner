@@ -81,10 +81,43 @@ Extension settings are in `~/.openclaw/extensions/claude-runner/config.json`:
 | `maxRetries` | `2` | How many times a transient SDK failure is retried before the request fails |
 | `effort` | `"medium"` | Effort level: low, medium, high, max |
 | `maxBudgetUsd` | — | Cost cap per request (optional) |
-| `tools` | — | Restrict available tools (optional) |
+| `tools` | `[]` | The tools the SDK session may use. **An absent key means NO built-in tools.** The bridge sets `tools: []` when the key is missing; it does not let the Agent SDK fall back to its full built-in set (`Bash`, `Read`, `Write`, `Edit`, `WebFetch`, `WebSearch`), which it would otherwise do *under* `permissionMode: "bypassPermissions"`. A present value must be an **array** — a string, a number, `null`, `false` or an object stops the bridge at configuration load with an error naming the key, rather than being coerced or silently dropped. `"tools": []` and an absent key behave identically; write the key when you want the restriction to be visible to the next reader. ⚠️ **Behaviour change on upgrade:** see [An absent `tools` key now means no tools](#an-absent-tools-key-now-means-no-tools). |
 | `mcpServers` | — | MCP servers handed to the SDK session as `mcpServers` in the query options. Keyed by server name; each value is a transport object the Agent SDK understands, e.g. `{"booqi": {"type": "http", "url": "http://127.0.0.1:3010/mcp"}}`. Tool names derive from the key (`mcp__<name>__<tool>`). **This value MUST NOT carry a credential:** the SDK serialises the whole map onto the `claude` subprocess command line as `--mcp-config`, where it is readable in `ps` and `/proc/<pid>/cmdline`. |
 | `strictMcpConfig` | `true` | Use only the servers in `mcpServers`, ignoring MCP configuration the SDK would otherwise discover on the filesystem (a `.mcp.json` in the working directory, user-level MCP settings). Set it to `false` for the SDK's own default. **This is a change from earlier versions of this fork**, which left the SDK to discover whatever it found. Two things to know before leaving it on: with no `mcpServers` configured the session then has no MCP server at all, and on a host carrying an **enterprise-managed MCP configuration** the `claude` subprocess refuses to start while this is enabled — set it to `false` there. |
 | `systemPromptMode` | `"replace"` | How the agent's prompt is combined with the Claude Code preset prompt. See [The system prompt](#the-system-prompt). `"replace"` (default) sends the agent's prompt alone; `"append"` prepends the ~26.6 KB Claude Code preset. **CLAUDE.md/memory loading and today's date are injected from `cwd` in both modes** and are not affected by this setting. |
+
+### An absent `tools` key now means no tools
+
+**This is a behaviour change, and it affects every consumer of this fork that is not a Booqi
+bookkeeping cell.** Before it, `buildQueryOptions` set the SDK's `tools` option only when the
+configuration carried a `tools` key:
+
+```ts
+if (config.tools) {          // <-- absent key: never taken
+  opts.tools = config.tools;
+}
+```
+
+An absent key therefore left the option unset, the Agent SDK fell back to its **full built-in tool
+set** — `Bash`, `Read`, `Write`, `Edit`, `WebFetch`, `WebSearch` — and it did so under
+`permissionMode: "bypassPermissions"`, which the same function sets a few lines above. The shipped
+`config.example.json` had no `tools` key, so the shipped example was exactly the shape that failed
+open.
+
+Now the key has three states and they are kept apart:
+
+| configuration | what the SDK receives |
+|---|---|
+| `"tools": ["mcp__booqi__open_invoices"]` | exactly that list, unchanged |
+| `"tools": []` | `[]` — no tools |
+| key absent | `[]` — no tools (**changed**; it used to be every built-in tool) |
+| `"tools": "Bash"`, `0`, `false`, `""`, `null`, `{}` | **nothing.** The bridge does not start: configuration load fails with an error naming `tools` |
+
+**If you were relying on the old default, add the tools you want by name.** There is no longer a
+value that means "everything"; a permissive tool set has to be written out, which is a visible act
+in a reviewable file. The fork exists to serve a cell that `architecture/cell.md` §1.1 requires to
+have its built-in file, shell and web tools disabled, and the previous default meant that
+requirement held only as long as somebody remembered to write the key.
 
 To set as default model (optional):
 

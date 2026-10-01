@@ -34,6 +34,17 @@ export interface BridgeConfig {
   queueMaxDelayMs?: number;
   queueMaxConcurrency?: number;
   sessionTtlMs?: number;
+  /**
+   * The tool set the SDK session may use, passed into the query options as
+   * `tools`.
+   *
+   * **An absent key means NO tools.** It used to mean "every built-in tool the
+   * SDK has" -- `Bash`, `Read`, `Write`, `Edit`, `WebFetch`, `WebSearch` -- and
+   * it meant that *under* `permissionMode: "bypassPermissions"`, which
+   * `buildQueryOptions` sets a few lines before it reads this key. See
+   * `readTools` for the three states and why `absent` is one of them rather
+   * than a synonym for the most permissive one.
+   */
   tools?: string[];
   /**
    * MCP servers the SDK session may reach, passed into the SDK query options
@@ -559,6 +570,74 @@ export function unhintedMcpServersMessage(
     + alsoHinted;
 }
 
+/**
+ * The tool set an absent `tools` key means: none at all.
+ *
+ * Deliberately fail-closed, and a behaviour change for any consumer of this
+ * fork that is not a Booqi cell: a `config.json` with no `tools` key used to
+ * get the SDK's full built-in tool set and now gets nothing. The direction is
+ * the intended one -- `roadmap/architecture/cell.md` §1.1 requires the cell's
+ * SDK tool set to be restricted to the MCP tools of its connection, and before
+ * this that requirement held only as long as somebody remembered to write the
+ * key. See README.md for the upgrade note.
+ */
+export const DEFAULT_TOOLS_WHEN_ABSENT: readonly string[] = [];
+
+/** How a configured value is named in `unusableToolsMessage`. */
+function describeConfiguredValue(raw: unknown): string {
+  if (raw === null) return "null";
+  if (Array.isArray(raw)) return "an array";
+  if (typeof raw === "object") return "an object";
+  if (typeof raw === "string") return `the string ${JSON.stringify(raw)}`;
+  return `the ${typeof raw} \`${String(raw)}\``;
+}
+
+/**
+ * The error message for a `tools` key that is present but not an array.
+ *
+ * A function rather than an inline string so a test can assert the message a
+ * given value produces without matching a regex against the source.
+ */
+export function unusableToolsMessage(raw: unknown): string {
+  return 'Claude Runner: configuration key "tools" must be an array of tool names,'
+    + ` but it is ${describeConfiguredValue(raw)}.`
+    + ' Use "tools": [] for no tools, or omit the key -- an absent key also means'
+    + " no tools. The bridge does not start on an unusable tool set, because the"
+    + " alternative is an SDK session with every built-in tool under"
+    + ' permissionMode "bypassPermissions".';
+}
+
+/**
+ * Read a `tools` value out of raw configuration -- three states, named.
+ *
+ * The three are kept apart on purpose, because two of them used to be one:
+ *
+ * - **present-and-restrictive** (`[]`, or a list of MCP tool names) -- returned
+ *   as it came in, by identity. The configured value is what ships; this
+ *   function must never turn the restriction into a constant of its own.
+ * - **present-and-permissive** -- there is no such value any more. A permissive
+ *   tool set has to be written out name by name, which is a visible act.
+ * - **absent** (`undefined`) -- `DEFAULT_TOOLS_WHEN_ABSENT`, i.e. no tools.
+ *
+ * Anything else -- a string, a number, `null`, `false`, `""`, an object --
+ * **throws**, naming the key. It is not coerced and it is not quietly replaced
+ * by the default, because those two dispositions are exactly the hazard: the
+ * predicate this replaces was `if (config.tools)`, so every falsy present value
+ * was already indistinguishable from an absent one, and `absent` was in turn
+ * indistinguishable from "give it everything".
+ *
+ * Note what is deliberately NOT a length test. `if (config.tools?.length)` and
+ * `if (config.tools && config.tools.length)` both read as more careful than the
+ * original and are both strictly worse: they silently drop a configured `[]`,
+ * which is the one value a cell actually ships (booqi-app/infra#195 AC-4), and
+ * the full built-in tool set comes back with every test still green.
+ */
+export function readTools(raw: unknown): string[] {
+  if (raw === undefined) return [...DEFAULT_TOOLS_WHEN_ABSENT];
+  if (!Array.isArray(raw)) throw new Error(unusableToolsMessage(raw));
+  return raw as string[];
+}
+
 /** The subset of `BridgeConfig` that comes from the extension's `config.json`. */
 export type ExtensionBridgeOptions = Omit<BridgeConfig, "workDir">;
 
@@ -580,7 +659,10 @@ export function buildBridgeOptions(extConfig: Record<string, unknown>): Extensio
     queueMaxConcurrency: extConfig.queueMaxConcurrency as number | undefined,
     sessionTtlMs: extConfig.sessionTtlMs as number | undefined,
     maxRetries: extConfig.maxRetries as number | undefined,
-    tools: extConfig.tools as string[] | undefined,
+    // NOT a cast. `readTools` throws here, at configuration load, so an
+    // unusable value stops the bridge from registering at all rather than
+    // reaching `buildQueryOptions` as something the SDK will mis-handle.
+    tools: readTools(extConfig.tools),
     mcpServers: extConfig.mcpServers,
     strictMcpConfig: extConfig.strictMcpConfig as boolean | undefined,
     effort: extConfig.effort as BridgeConfig["effort"],
@@ -614,6 +696,21 @@ export function buildQueryOptions(
     maxTurns: config.maxTurns ?? DEFAULT_MAX_TURNS,
     includePartialMessages: true,
     abortController,
+    // Set HERE, unconditionally, and not under an `if` further down.
+    //
+    // It used to be `if (config.tools) { opts.tools = config.tools; }`, below
+    // the `bypassPermissions` assignment that follows a few lines on. An absent
+    // key therefore left the option unset and the Agent SDK fell back to its
+    // full built-in tool set -- `Bash`, `Read`, `Write`, `Edit`, `WebFetch`,
+    // `WebSearch` -- under bypassPermissions. `absent` coincided silently with
+    // the most permissive value there is, which is this estate's dominant
+    // defect class and here its security-relevant instance (booqi-app/infra#207).
+    //
+    // Being in the object literal is itself part of the fix: there is no branch
+    // left for a later reader to make conditional, so `tools` is a key of every
+    // object this function returns. The only other way out of this function is
+    // the throw inside `readTools`, which produces no object at all.
+    tools: readTools(config.tools),
   };
 
   if (config.skipPermissions) {
@@ -642,10 +739,6 @@ export function buildQueryOptions(
       normaliseSystemPromptMode(config.systemPromptMode) === "append"
         ? { type: "preset", preset: "claude_code", append: systemPrompt }
         : systemPrompt;
-  }
-
-  if (config.tools) {
-    opts.tools = config.tools;
   }
 
   const mcpServers = readMcpServers(config.mcpServers);

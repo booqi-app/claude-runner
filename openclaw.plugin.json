@@ -58,7 +58,7 @@
       "tools": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Allowed tools list (default: all claude_code tools)"
+        "description": "The tools the SDK session may use. An ABSENT key means NO built-in tools: the bridge sets tools to [] rather than letting the SDK fall back to its full built-in set, which it would do under permissionMode bypassPermissions. A present value must be an array; anything else stops the bridge at configuration load."
       },
       "strictMcpConfig": {
         "type": "boolean",
