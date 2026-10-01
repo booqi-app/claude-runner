@@ -21,7 +21,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { __testing, executeWithRetries, type QueryFn } from "../src/claude-bridge.ts";
+import {
+  __testing,
+  executeWithRetries,
+  resolveConversation,
+  type QueryFn,
+} from "../src/claude-bridge.ts";
 import type { BridgeConfig } from "../src/bridge-config.ts";
 
 const config: BridgeConfig = {
@@ -108,9 +113,15 @@ async function run(opts: {
    */
   stream?: boolean;
   failEndAfterHeaders?: boolean;
+  /** The chat session a caller named, or nothing -- booqi-app/app#459 part C. */
+  chatSessionId?: string;
+  /** Configuration the request runs with. Defaults to the module `config`. */
+  bridgeConfig?: BridgeConfig;
 }) {
-  const { sessionStore } = __testing.initialiseStores(config);
+  const runConfig = opts.bridgeConfig ?? config;
+  const { sessionStore } = __testing.initialiseStores(runConfig);
   const conversationId = "conv-1";
+  const logs: string[] = [];
 
   if (opts.resumeSessionId) sessionStore.record(conversationId, opts.resumeSessionId);
   if (opts.compactSummary) {
@@ -120,18 +131,20 @@ async function run(opts: {
 
   const captured: Captured[] = [];
   __testing.setQuery(fakeQuery(captured, opts.behaviour));
+  __testing.setLog((message) => logs.push(message));
   const res = fakeRes({ failEndAfterHeaders: opts.failEndAfterHeaders });
 
   try {
     await executeWithRetries(
       "hello", "claude-opus-4-6", opts.systemPrompt, conversationId,
-      opts.stream ?? false, res, "req-1", config,
+      opts.stream ?? false, res, "req-1", runConfig, opts.chatSessionId,
     );
   } finally {
     __testing.setQuery(undefined);
+    __testing.setLog(undefined);
   }
 
-  return { captured, res, sessionStore, conversationId };
+  return { captured, res, sessionStore, conversationId, logs };
 }
 
 // ── AC-1: the prompt actually leaves the transport ──────────────────
@@ -308,3 +321,142 @@ test("a resumed turn also carries the compaction summary", async () => {
 
 // ── the mode actually reaches the wire ──────────────────────────────
 
+
+// ── The session hint on the wire (booqi-app/app#459, AC-C1, AC-C2, AC-C6) ──
+//
+// `bridge-config.test.ts` asserts the options object `buildQueryOptions`
+// returns. These assert what the SDK CALL receives, through the real transport,
+// for BOTH transports -- `handleStreamingResponse` and
+// `handleNonStreamingResponse` each build their own options with their own
+// `buildQueryOptions(...)` call, and streaming is the production default
+// (`const stream = body.stream !== false`). A round that drove only one of them
+// would leave the other pinned by nothing, which is precisely how the
+// system-prompt defect survived three reviewers on this file.
+
+const MCP_URL = "http://127.0.0.1:3004/mcp";
+
+const configWithMcp: BridgeConfig = {
+  ...config,
+  mcpServers: { booqi: { type: "http", url: MCP_URL } },
+};
+
+for (const stream of [false, true]) {
+  const via = stream ? "streaming" : "non-streaming";
+
+  test(`the SDK call receives the hinted MCP url (${via})`, async () => {
+    const { captured } = await run({
+      systemPrompt: "you are a bookkeeper",
+      behaviour: "success",
+      stream,
+      chatSessionId: "chat-42",
+      bridgeConfig: configWithMcp,
+    });
+
+    assert.equal(captured.length, 1);
+    const url: string = captured[0].options.mcpServers.booqi.url;
+    assert.equal(url, `${MCP_URL}?session=chat-42`);
+    // Read it back the way the cell gateway's relay does.
+    assert.equal(new URL(url).searchParams.get("session"), "chat-42");
+  });
+
+  test(`a hintless request sends the url unchanged and logs once (${via})`, async () => {
+    const { captured, logs } = await run({
+      systemPrompt: "you are a bookkeeper",
+      behaviour: "success",
+      stream,
+      bridgeConfig: configWithMcp,
+    });
+
+    assert.equal(captured[0].options.mcpServers.booqi.url, MCP_URL);
+    assert.equal(new URL(captured[0].options.mcpServers.booqi.url).searchParams.get("session"), null);
+    assert.equal(logs.length, 1, `expected one line, got ${logs.length}: ${logs}`);
+    assert.match(logs[0], /no chat-session hint written/);
+  });
+
+  test(`no log line on the wire carries the identifier (${via})`, async () => {
+    const identifier = "chat-cafe1234-secret";
+    const { logs } = await run({
+      systemPrompt: "you are a bookkeeper",
+      behaviour: "success",
+      stream,
+      chatSessionId: identifier,
+      bridgeConfig: configWithMcp,
+    });
+
+    assert.equal(logs.length, 1);
+    for (const line of logs) {
+      assert.equal(line.includes(identifier), false, `log discloses the identifier: ${line}`);
+    }
+  });
+}
+
+// ── Provenance: the bridge never hints with an id it invented itself ──
+//
+// This is the fail-OPEN form of the whole feature and the reason
+// `chatSessionId` is a separate value from `conversationId`. The session store
+// needs a key for every request, so `conversationId` is always a string --
+// `"default"` for an empty message list, `derived-<hash>` otherwise. Handing
+// either to the cell gateway as a tenant routing key would route every
+// hintless request at one guessable exchange. `absent` must stay absent.
+
+function reqWith(headers: Record<string, string> = {}): any {
+  return { headers };
+}
+
+test("a caller-named chat session becomes the hint, by header or by body", () => {
+  for (const [label, req, body] of [
+    ["x-booqi-chat-session", reqWith({ "x-booqi-chat-session": "chat-7" }), {}],
+    ["x-session-id", reqWith({ "x-session-id": "chat-7" }), {}],
+    ["x-conversation-id", reqWith({ "x-conversation-id": "chat-7" }), {}],
+    ["conversation_id", reqWith(), { conversation_id: "chat-7" }],
+    ["metadata.conversation_id", reqWith(), { metadata: { conversation_id: "chat-7" } }],
+  ] as Array<[string, any, Record<string, any>]>) {
+    const resolved = resolveConversation(req, body);
+    assert.equal(resolved.chatSessionId, "chat-7", `not carried by ${label}`);
+    assert.equal(resolved.conversationId, "chat-7", `conversation key wrong for ${label}`);
+  }
+});
+
+test("a derived conversation id is NOT offered as a chat session", () => {
+  // Non-empty messages: `derived-<hash>`.
+  const derived = resolveConversation(reqWith(), {
+    messages: [{ role: "user", content: "hello" }],
+  });
+  assert.equal(derived.chatSessionId, undefined);
+  assert.match(derived.conversationId, /^derived-[0-9a-f]{16}$/);
+
+  // Empty messages: the literal "default", which is exactly the value that
+  // must never leave this process as a routing key.
+  const fallback = resolveConversation(reqWith(), {});
+  assert.equal(fallback.chatSessionId, undefined);
+  assert.equal(fallback.conversationId, "default");
+  assert.notEqual(fallback.chatSessionId, "default");
+});
+
+test("an empty or blank caller value is absent, not a chat session", () => {
+  for (const value of ["", "   "]) {
+    const resolved = resolveConversation(reqWith({ "x-booqi-chat-session": value }), {});
+    assert.equal(resolved.chatSessionId, undefined, `blank accepted: ${JSON.stringify(value)}`);
+    assert.equal(resolved.conversationId, "default");
+  }
+});
+
+test("a derived id reaches the SDK as no hint at all, end to end", async () => {
+  // The two halves joined: what `resolveConversation` refuses is what the SDK
+  // then does not receive. Without this, the refusal above and the writer in
+  // bridge-config could each be right while the wiring between them was not.
+  const derived = resolveConversation(reqWith(), { messages: [{ role: "user", content: "hi" }] });
+  const { captured, logs } = await run({
+    systemPrompt: "you are a bookkeeper",
+    behaviour: "success",
+    stream: true,
+    chatSessionId: derived.chatSessionId,
+    bridgeConfig: configWithMcp,
+  });
+
+  const url: string = captured[0].options.mcpServers.booqi.url;
+  assert.equal(url, MCP_URL);
+  assert.equal(url.includes("session="), false);
+  assert.equal(url.includes(derived.conversationId), false);
+  assert.equal(logs.length, 1);
+});

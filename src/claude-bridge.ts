@@ -22,7 +22,11 @@ import type { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 // the extension. A `.ts` specifier resolves under that loader AND under plain
 // `node --test` type stripping, which is what lets test/claude-bridge.test.ts
 // import this module at all. booqi-app/infra#202.
-import { buildQueryOptions, resolveSystemPrompt } from "./bridge-config.ts";
+import {
+  buildQueryOptions,
+  normaliseChatSessionId,
+  resolveSystemPrompt,
+} from "./bridge-config.ts";
 import type { BridgeConfig } from "./bridge-config.ts";
 
 export type { BridgeConfig, McpServerEntry } from "./bridge-config.ts";
@@ -44,6 +48,22 @@ export type { BridgeConfig, McpServerEntry } from "./bridge-config.ts";
 export type QueryFn = typeof sdkQuery;
 
 let queryOverride: QueryFn | undefined;
+
+/**
+ * Where this module's operational log lines go.
+ *
+ * `index.ts` owns the extension's logger and this module cannot reach it
+ * (it is loaded by the hermetic suite, which has no OpenClaw host), so the
+ * default is `console.warn` -- the same default the cell gateway's relay uses
+ * -- and `__testing.setLog` replaces it. A line nobody can observe is a line
+ * that cannot be asserted, and the one line the session hint emits is an
+ * acceptance criterion.
+ */
+let logOverride: ((message: string) => void) | undefined;
+
+function bridgeLog(message: string): void {
+  (logOverride ?? console.warn)(message);
+}
 
 async function getQuery(): Promise<QueryFn> {
   if (queryOverride) return queryOverride;
@@ -336,17 +356,70 @@ function deriveConversationIdFromMessages(messages: Array<{ role: string; conten
   return `derived-${hash}`;
 }
 
-function resolveConversationId(
+/**
+ * Header a caller uses to name the chat session a request belongs to.
+ *
+ * The same name the cell gateway's relay reads
+ * (`apps/cell/src/mcp-relay.ts`: `CHAT_SESSION_HEADER = "x-booqi-chat-session"`),
+ * so the two ends of the hint are spelled identically and a reader of either
+ * finds the other.
+ */
+const CHAT_SESSION_HEADER = "x-booqi-chat-session";
+
+/** A request's conversation key, and whether anyone but us named it. */
+export interface ResolvedConversation {
+  /** The session-store key. Always a string, derived if nothing named one. */
+  conversationId: string;
+  /**
+   * The chat session a CALLER named, or `undefined`.
+   *
+   * `undefined` is a third state and is kept distinct on purpose: it is not
+   * "the default session", it is "nobody said". `conversationId` always has a
+   * value because the session store needs a key, and reusing it as the chat
+   * session would hand the cell gateway a bridge-invented string -- `"default"`
+   * for an empty message list, `derived-<hash>` otherwise -- as a tenant
+   * routing key. That is the fail-open form of this feature.
+   */
+  chatSessionId: string | undefined;
+}
+
+/**
+ * MEASURED, 2026-10-01 (booqi-app/app#459 part C, test plan step 0).
+ *
+ * Nothing in the OpenClaw host sends a session identifier to an
+ * OpenAI-compatible provider: a search of the host source for `x-session-id`,
+ * `x-conversation-id` and `conversation_id` over its provider, llm and agent
+ * trees returns no request-building hit (the only `conversation_id` is a CLI
+ * output column). The cell drives the agent with
+ * `sessionKey: agent:boekhouder:<chatSessionId>`
+ * (`apps/cell/src/openclaw.ts`), and that key stops at the host.
+ *
+ * So TODAY every request takes the `undefined` branch below, the hint is not
+ * written, and one log line says so -- which is correct and fail-closed, not a
+ * regression: that is exactly the behaviour the relay already has for a
+ * hintless session (`tools/list` -> `{tools: []}`).
+ *
+ * The missing link is the cell image's OpenClaw agent definition passing its
+ * session key through as `conversation_id` or as the header above. That is
+ * infra work and is filed as a follow-up; this function is the end of it that
+ * belongs in this repository, and it is ready for either spelling.
+ */
+export function resolveConversation(
   req: IncomingMessage,
   body: Record<string, any>,
-): string {
-  return (
+): ResolvedConversation {
+  const named = normaliseChatSessionId(
+    (req.headers[CHAT_SESSION_HEADER] as string) ||
     (req.headers["x-session-id"] as string) ||
     (req.headers["x-conversation-id"] as string) ||
     body.conversation_id ||
-    body.metadata?.conversation_id ||
-    deriveConversationIdFromMessages(body.messages ?? [])
+    body.metadata?.conversation_id,
   );
+
+  return {
+    conversationId: named ?? deriveConversationIdFromMessages(body.messages ?? []),
+    chatSessionId: named,
+  };
 }
 
 // ── Request handler ─────────────────────────────────────────────────
@@ -376,7 +449,7 @@ async function handleCompletions(
 
   const prompt = extractPromptFromMessages(messages);
   const systemPrompt = extractSystemPrompt(messages);
-  const conversationId = resolveConversationId(req, body);
+  const { conversationId, chatSessionId } = resolveConversation(req, body);
 
   if (!prompt) {
     res.writeHead(400, { "Content-Type": "application/json" });
@@ -386,7 +459,9 @@ async function handleCompletions(
 
   try {
     await requestQueue.enqueue(async () => {
-      await executeWithRetries(prompt, model, systemPrompt, conversationId, stream, res, requestId, config);
+      await executeWithRetries(
+        prompt, model, systemPrompt, conversationId, stream, res, requestId, config, chatSessionId,
+      );
     });
   } catch (err: any) {
     if (!res.headersSent) {
@@ -406,6 +481,12 @@ export async function executeWithRetries(
   res: ServerResponse,
   requestId: string,
   config: BridgeConfig,
+  /**
+   * The chat session a caller named, or `undefined` when nobody did.
+   *
+   * Separate from `conversationId` on purpose; see `ResolvedConversation`.
+   */
+  chatSessionId?: string,
 ): Promise<void> {
   const maxRetries = config.maxRetries ?? MAX_RETRIES;
   let lastError = "";
@@ -447,9 +528,15 @@ export async function executeWithRetries(
         const effectiveSystemPrompt = resolveSystemPrompt(systemPrompt, compactSummary, resumeSessionId);
 
         if (stream) {
-          await handleStreamingResponse(prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
+          await handleStreamingResponse(
+            prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
+            res, requestId, config, chatSessionId,
+          );
         } else {
-          await handleNonStreamingResponse(prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId, res, requestId, config);
+          await handleNonStreamingResponse(
+            prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
+            res, requestId, config, chatSessionId,
+          );
         }
         summaryDelivered = true;
         return;
@@ -516,9 +603,13 @@ async function handleStreamingResponse(
   res: ServerResponse,
   requestId: string,
   config: BridgeConfig,
+  chatSessionId: string | undefined,
 ): Promise<void> {
   const abortController = new AbortController();
-  const options = buildQueryOptions(model, systemPrompt, resumeSessionId, newSessionId, config, abortController);
+  const options = buildQueryOptions(
+    model, systemPrompt, resumeSessionId, newSessionId, config, abortController,
+    { chatSessionId, log: bridgeLog },
+  );
 
   const q = (await getQuery())({ prompt, options });
   activeQueries.set(requestId, abortController);
@@ -673,9 +764,13 @@ async function handleNonStreamingResponse(
   res: ServerResponse,
   requestId: string,
   config: BridgeConfig,
+  chatSessionId: string | undefined,
 ): Promise<void> {
   const abortController = new AbortController();
-  const options = buildQueryOptions(model, systemPrompt, resumeSessionId, newSessionId, config, abortController);
+  const options = buildQueryOptions(
+    model, systemPrompt, resumeSessionId, newSessionId, config, abortController,
+    { chatSessionId, log: bridgeLog },
+  );
 
   const q = (await getQuery())({ prompt, options });
   activeQueries.set(requestId, abortController);
@@ -857,6 +952,10 @@ export const __testing = {
   },
   setQuery(fn: QueryFn | undefined): void {
     queryOverride = fn;
+  },
+  /** Replaces this module's log sink, so the one line per request is readable. */
+  setLog(fn: ((message: string) => void) | undefined): void {
+    logOverride = fn;
   },
 };
 

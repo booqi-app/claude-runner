@@ -356,6 +356,191 @@ export function droppedMcpServersMessage(dropped: string[]): string {
     + ` -- each must be an object${protoNote}`;
 }
 
+/**
+ * Query parameter the cell gateway's MCP relay reads the chat session from.
+ *
+ * The reader is merged code: `apps/cell/src/mcp-relay.ts` exports
+ * `CHAT_SESSION_QUERY = "session"` and resolves a session with
+ * `headerValue(req, CHAT_SESSION_HEADER) ?? requestUrl.searchParams.get(CHAT_SESSION_QUERY)`.
+ * It accepts either form; the query parameter is the one this module can write,
+ * because the SDK takes a URL from `mcpServers` and the bridge never touches
+ * the request the SDK then sends.
+ *
+ * Owner ruling, 2026-09-26T21:32:09Z, quoted verbatim:
+ * *"'1 chat sessie is 1 agent sessie (zoals een thread op discord) maar een
+ * gebruiker kan meerdere chats (threads) starten.' ... **Ruling: YES.** ...
+ * `?session=<chatSessionId>` is expressible; the SDK session starts per chat
+ * session ... Authorisation of the hint: option 1 (`chatSessionId` as carrier)
+ * is sufficient for M1 because the control plane already refuses to forward a
+ * foreign session id (app#434 tests). **Part C unfreezes.**"*
+ */
+export const SESSION_HINT_PARAM = "session";
+
+/**
+ * The per-request facts the session hint needs, injected rather than imported.
+ *
+ * `log` is here for the same reason `abortController` is a parameter: this
+ * module must keep importing nothing, so it cannot reach a logger and must not
+ * call `console` itself. `claude-bridge.ts` passes its own sink.
+ */
+export interface SessionHintContext {
+  /**
+   * The chat session this request belongs to, as named by the CALLER.
+   *
+   * MUST be left `undefined` when no caller named one. A value the bridge
+   * invented for itself -- `deriveConversationIdFromMessages` returns
+   * `"default"` for an empty message list and `derived-<hash>` otherwise -- is
+   * NOT a chat session identifier, and passing one here would route every
+   * such request at one guessable exchange. `apps/cell/src/sessions.ts`
+   * defines `DEFAULT_SESSION_ID = "default"` and `chatSessionIdSchema` imposes
+   * no entropy, so `?session=default` is guessed in one attempt.
+   */
+  chatSessionId?: string | undefined;
+  /** Where the one line about the outcome goes. */
+  log?: ((message: string) => void) | undefined;
+}
+
+/**
+ * Narrow a candidate chat-session identifier to one that may be written.
+ *
+ * Three states are distinguished and `absent` is one of them: a non-string, an
+ * empty string and a whitespace-only string all return `undefined`, which the
+ * caller turns into the fail-closed branch. There is deliberately NO default
+ * value anywhere on this path -- see `SessionHintContext.chatSessionId`.
+ */
+export function normaliseChatSessionId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/** What `applySessionHint` did, per server name. */
+export interface SessionHintOutcome {
+  /** The map to hand to the SDK. A new object; the input is never mutated. */
+  servers: Record<string, McpServerEntry>;
+  /** Names whose `url` now carries the hint. */
+  hinted: string[];
+  /**
+   * Names that carry a `url` but did NOT get the hint -- either because no
+   * identifier was available, or because the configured URL does not parse.
+   * Their URL is handed to the SDK unchanged.
+   */
+  unhinted: string[];
+}
+
+/**
+ * Set `?session=<chatSessionId>` on one configured URL.
+ *
+ * `set`, not append: `URLSearchParams.set` replaces an existing `session` and
+ * leaves every other parameter alone, so a configured `.../mcp?foo=1` keeps
+ * `foo=1` and never grows a second `session`. The value is encoded by the
+ * serialiser, so an identifier carrying `&`, `=`, `/` or a space cannot inject
+ * a parameter -- and it round-trips through the relay's own
+ * `searchParams.get("session")`, which is the reader that matters.
+ *
+ * Returns `undefined` for a URL that does not parse. That is the fail-closed
+ * answer: a URL this module cannot read is a URL it must not rewrite, and the
+ * caller then hands the configured string through untouched and says so.
+ */
+function withSessionHint(url: string, chatSessionId: string): string | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return undefined;
+  }
+  parsed.searchParams.set(SESSION_HINT_PARAM, chatSessionId);
+  return parsed.toString();
+}
+
+/**
+ * Write the chat-session hint into every `mcpServers` entry that has a URL.
+ *
+ * Only an entry whose value carries a string `url` is rewritten: a stdio entry
+ * (`{ command, args }`) has no URL to carry a hint and is passed through as the
+ * very same object, so nothing about it can change here. Server names are
+ * preserved verbatim -- the SDK derives `mcp__<name>__<tool>` from them, so a
+ * rewritten name silently breaks every tool call.
+ *
+ * With `chatSessionId === undefined` NOTHING is rewritten and every URL-bearing
+ * entry is reported as `unhinted`. That is the safe branch and it is the point:
+ * the merged relay answers a hintless session's `tools/list` with `{tools: []}`,
+ * which leaks nothing, whereas a guessed or defaulted hint is a cross-tenant
+ * routing fault.
+ */
+export function applySessionHint(
+  servers: Record<string, McpServerEntry>,
+  chatSessionId: string | undefined,
+): SessionHintOutcome {
+  const out: Record<string, McpServerEntry> = {};
+  const hinted: string[] = [];
+  const unhinted: string[] = [];
+
+  for (const [name, entry] of Object.entries(servers)) {
+    // Re-applied rather than assumed: `readMcpServers` already drops these,
+    // but this function is exported and `out[name] = ...` on such a name
+    // writes to the prototype instead of adding a key.
+    if (UNUSABLE_SERVER_NAMES.has(name)) continue;
+
+    const url = entry["url"];
+    if (typeof url !== "string") {
+      out[name] = entry;
+      continue;
+    }
+
+    const rewritten = chatSessionId === undefined
+      ? undefined
+      : withSessionHint(url, chatSessionId);
+
+    if (rewritten === undefined) {
+      out[name] = entry;
+      unhinted.push(name);
+      continue;
+    }
+
+    out[name] = { ...entry, url: rewritten };
+    hinted.push(name);
+  }
+
+  return { servers: out, hinted, unhinted };
+}
+
+function quotedNames(names: string[]): string {
+  return names.map((n) => JSON.stringify(n)).join(", ");
+}
+
+/**
+ * The one log line for a request whose hint WAS written.
+ *
+ * It names the servers and never the identifier. The identifier is the routing
+ * key and it has no entropy in the default path, so logging it is a disclosure
+ * rather than a diagnostic: anything that can read the log can then address
+ * that exchange. The server names are enough to tell "the hint was written"
+ * from "it was not", which is the only question a log can answer here.
+ */
+export function sessionHintMessage(hinted: string[]): string {
+  const noun = plural(hinted.length, "entry", "entries");
+  return `Claude Runner: wrote the chat-session hint into ${hinted.length} mcpServers ${noun}:`
+    + ` ${quotedNames(hinted)} -- the identifier is the routing key and is not logged`;
+}
+
+/**
+ * The one log line for a request whose hint was NOT written.
+ *
+ * Silence here is the failure this exists to prevent: a cell whose SDK session
+ * names no exchange gets `{tools: []}` from its gateway and answers from the
+ * model alone, which looks like a bad answer rather than a missing hint.
+ */
+export function unhintedMcpServersMessage(unhinted: string[], haveIdentifier: boolean): string {
+  const noun = plural(unhinted.length, "entry", "entries");
+  const reason = haveIdentifier
+    ? "its configured URL does not parse"
+    : "no usable chat-session identifier was available for this request";
+  return `Claude Runner: no chat-session hint written for ${unhinted.length} mcpServers ${noun}:`
+    + ` ${quotedNames(unhinted)} -- ${reason};`
+    + " the URL goes to the SDK unchanged and the cell gateway will answer tools/list with an empty list";
+}
+
 /** The subset of `BridgeConfig` that comes from the extension's `config.json`. */
 export type ExtensionBridgeOptions = Omit<BridgeConfig, "workDir">;
 
@@ -396,6 +581,7 @@ export function buildQueryOptions(
   newSessionId: string | undefined,
   config: BridgeConfig,
   abortController: AbortController,
+  session: SessionHintContext = {},
 ): Record<string, any> {
   const opts: Record<string, any> = {
     model,
@@ -439,7 +625,23 @@ export function buildQueryOptions(
 
   const mcpServers = readMcpServers(config.mcpServers);
   if (mcpServers) {
-    opts.mcpServers = mcpServers;
+    // The session hint. This is the writer the merged relay has been waiting
+    // for: it reads `?session=` (and the header) and nothing wrote either, so
+    // in production the SDK session named no exchange and `tools/list`
+    // answered `{tools: []}`. See booqi-app/app#459 part C.
+    //
+    // Exactly one line is logged per request, whichever branch is taken --
+    // never none, so an absent hint cannot pass for a written one, and never
+    // two, so the line is countable.
+    const chatSessionId = normaliseChatSessionId(session.chatSessionId);
+    const outcome = applySessionHint(mcpServers, chatSessionId);
+    opts.mcpServers = outcome.servers;
+
+    if (outcome.unhinted.length > 0) {
+      session.log?.(unhintedMcpServersMessage(outcome.unhinted, chatSessionId !== undefined));
+    } else if (outcome.hinted.length > 0) {
+      session.log?.(sessionHintMessage(outcome.hinted));
+    }
   }
 
   // Set unconditionally, including when no server is configured -- that is the
