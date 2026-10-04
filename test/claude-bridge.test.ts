@@ -583,11 +583,122 @@ test("a session key on a CALLER channel is taken verbatim, not unwrapped", () =>
   assert.equal(resolved.chatSessionId, "agent:boekhouder:chat-7");
 });
 
-test("a chat session id containing colons survives the unwrap whole", () => {
-  // `apps/cell/src/openclaw.ts` does NOT sanitise the chat session id, so the
-  // tail is taken greedily rather than split on every colon.
-  const resolved = resolveConversation(reqWith({ session_id: "agent:boekhouder:a:b:c" }), {});
-  assert.equal(resolved.chatSessionId, "a:b:c");
+test("a tail that is not a conformant chat session id is refused", () => {
+  // Review round 2 REPLACED a test that asserted the opposite of this one. It
+  // said "a chat session id containing colons survives the unwrap whole", on
+  // the stated ground that the cell does not sanitise the id. That ground was
+  // wrong: `apps/cell/src/openclaw.ts` indeed does not, but the control plane
+  // does, upstream of everything that reaches the binding map --
+  // `chatSessionIdSchema` (`packages/shared/src/chat.ts`,
+  // `/^[A-Za-z0-9_-]+$/`, 1..200) is applied to `params.sessionId` on BOTH
+  // `chat.send` and `chat.history` (`apps/cell/src/protocol.ts`). So `a:b:c` is
+  // not a conversation worth preserving; it is unbindable by construction, and
+  // forwarding it would buy a `bound: true` over a `tenant_unavailable`.
+  const refused = [
+    "agent:boekhouder:a:b:c",
+    "agent:boekhouder:chat-A, agent:boekhouder:chat-B", // Node's duplicate-header join
+    "agent:boekhouder:chat-A, chat-B",
+    "agent:boekhouder:AGENT:other:chat-9", // nesting in another case
+    "agent:boekhouder:chat 7",
+    "agent:boekhouder:a/b",
+    "agent:boekhouder:a.b",
+    `agent:boekhouder:${"a".repeat(201)}`,
+  ];
+  for (const value of refused) {
+    const resolved = resolveConversation(reqWith({ session_id: value }), {});
+    assert.equal(resolved.chatSessionId, undefined, `accepted: ${JSON.stringify(value)}`);
+    assert.equal(resolved.conversationId, "default");
+  }
+});
+
+test("a session key with anything before `agent:` is refused", () => {
+  // Review round 2, surviving mutant S1. Dropping the `^` anchor from
+  // AGENT_SESSION_KEY left the suite green at 125/125 while really changing
+  // behaviour: `sess-of-agent:b:chat-9` would unwrap to `chat-9`. That is the
+  // fabrication boundary this guard exists to hold -- a value that merely
+  // CONTAINS a session key is not one -- so it is pinned here rather than left
+  // to the next reader to rediscover.
+  for (const value of [
+    "sess-of-agent:boekhouder:chat-9",
+    "xxagent:boekhouder:chat-9",
+    "x agent:boekhouder:chat-9",
+    "1agent:boekhouder:chat-9",
+  ]) {
+    // NOTE: a prefix of pure WHITESPACE is deliberately absent from this list.
+    // `" agent:b:chat-9"` is trimmed by `normaliseChatSessionId` before the
+    // pattern is applied and then legitimately IS a session key -- Node strips
+    // surrounding header whitespace too. Asserting a refusal there would pin a
+    // bug, not a guard; I wrote that case first and the suite caught it.
+    const resolved = resolveConversation(reqWith({ session_id: value }), {});
+    assert.equal(resolved.chatSessionId, undefined, `accepted: ${JSON.stringify(value)}`);
+  }
+});
+
+test("whitespace inside the unwrapped tail is trimmed, not routed on", () => {
+  // Review round 2, surviving mutant S2. The existing "no chat session left in
+  // it" test only exercises TRAILING whitespace, which the outer
+  // `normaliseChatSessionId` already strips -- so dropping the INNER trim of
+  // the captured tail stayed green while yielding " chat-7" as a routing key.
+  for (const value of ["agent:boekhouder: chat-7", "agent:boekhouder:\tchat-7", "agent:boekhouder:chat-7 "]) {
+    const resolved = resolveConversation(reqWith({ session_id: value }), {});
+    assert.equal(resolved.chatSessionId, "chat-7", `not trimmed: ${JSON.stringify(value)}`);
+  }
+});
+
+test("an earlier caller channel wins over a later one that also names a session", () => {
+  // Review round 2, surviving mutant S3. The precedence test above only ever
+  // makes the EARLIER channels blank, so it pins "a later channel is
+  // reachable" and not "the earlier one wins" -- swapping two channels stayed
+  // green. `x-booqi-chat-session` is the relay's own canonical header and
+  // `x-session-id` is generic, so a silent reorder would be a misroute.
+  const ladder: Array<[string, Record<string, string>, Record<string, any>]> = [
+    [
+      "x-booqi-chat-session over x-session-id",
+      { "x-booqi-chat-session": "chat-win", "x-session-id": "chat-lose" },
+      {},
+    ],
+    [
+      "x-session-id over x-conversation-id",
+      { "x-session-id": "chat-win", "x-conversation-id": "chat-lose" },
+      {},
+    ],
+    [
+      "x-conversation-id over conversation_id",
+      { "x-conversation-id": "chat-win" },
+      { conversation_id: "chat-lose" },
+    ],
+    [
+      "conversation_id over metadata.conversation_id",
+      {},
+      { conversation_id: "chat-win", metadata: { conversation_id: "chat-lose" } },
+    ],
+    [
+      "every caller channel over every affinity header",
+      {
+        "metadata-placeholder": "x",
+        session_id: "agent:boekhouder:chat-lose",
+        "x-client-request-id": "agent:boekhouder:chat-lose",
+        "x-session-affinity": "agent:boekhouder:chat-lose",
+      },
+      { metadata: { conversation_id: "chat-win" } },
+    ],
+  ];
+  for (const [label, headers, body] of ladder) {
+    const resolved = resolveConversation(reqWith(headers), body);
+    assert.equal(resolved.chatSessionId, "chat-win", `precedence wrong: ${label}`);
+  }
+});
+
+test("a conformant chat session id at the edges of the schema is accepted", () => {
+  // The other half of the guard: it must not refuse what the control plane
+  // would issue. Absent this, "refuse everything" would pass the test above.
+  for (const id of ["a", "0", "chat-7", "abc_DEF-123", "default", "a".repeat(200)]) {
+    const resolved = resolveConversation(
+      reqWith({ session_id: `agent:boekhouder:${id}` }),
+      {},
+    );
+    assert.equal(resolved.chatSessionId, id, `refused: ${JSON.stringify(id)}`);
+  }
 });
 
 test("a derived conversation id is NOT offered as a chat session", () => {

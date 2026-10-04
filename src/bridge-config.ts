@@ -434,12 +434,32 @@ export function normaliseChatSessionId(value: unknown): string | undefined {
  * The agent id is matched as `[^:]+` rather than spelled out: the cell's agent
  * id is configuration (`agents.list[].id` in the rendered `openclaw.json`), and
  * a bridge that only recognised `boekhouder` would go quietly fail-closed the
- * day a second cell used another name. The tail is greedy because the chat
- * session id is NOT sanitised by the cell -- it is the control plane's own
- * identifier, and splitting it on a colon would silently route two
- * conversations at one exchange.
+ * day a second cell used another name.
+ *
+ * The tail is captured greedily so that a malformed value is captured WHOLE and
+ * then refused by `CHAT_SESSION_ID` for a reportable reason, rather than
+ * failing to match this pattern at all and being refused for a misleading one.
+ * Both end in a refusal; only one of them is diagnosable.
+ *
+ * An earlier revision justified the greedy tail by claiming the chat session id
+ * is not sanitised, so a colon in it had to survive. Review round 2 disproved
+ * that: `apps/cell/src/openclaw.ts` does not sanitise it, but the control plane
+ * does, upstream of every path that reaches the relay's binding map. A colon in
+ * the tail is therefore not a conversation to preserve -- it is a fabrication.
  */
 const AGENT_SESSION_KEY = /^agent:[^:]+:([\s\S]+)$/;
+
+/**
+ * A chat session id as the control plane issues one.
+ *
+ * Mirrors `chatSessionIdSchema` in the app repo's `packages/shared/src/chat.ts`
+ * (`z.string().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/)`). Kept as a literal
+ * rather than imported because this repository is a standalone OpenClaw
+ * extension with no dependency on `@booqi/shared` and a hermetic test suite
+ * that installs nothing; see the coupling note in
+ * {@link chatSessionFromAgentSessionKey}.
+ */
+const CHAT_SESSION_ID = /^[A-Za-z0-9_-]{1,200}$/;
 
 /**
  * Recover the chat session id from an OpenClaw agent session key.
@@ -460,20 +480,37 @@ export function chatSessionFromAgentSessionKey(value: unknown): string | undefin
   if (match === null) return undefined;
   const tail = normaliseChatSessionId(match[1]);
   if (tail === undefined) return undefined;
-  // A tail that still contains a session key is not a chat session id, and the
-  // two ways it can happen are both fabrications rather than conversations:
+  // The tail must be a chat session id the control plane would actually have
+  // issued. This is checked against the real schema rather than by blacklisting
+  // the shapes we happen to have thought of (review round 2):
   //
-  //  - Node joins REPEATED headers of these names with ", " into one string,
-  //    so two copies of the header arrive as
-  //    `agent:b:chat-A, agent:b:chat-B` and the greedy tail would yield
-  //    `chat-A, agent:b:chat-B` -- an id belonging to neither party; and
-  //  - a nested `agent:b:agent:other:chat-9` would be unwrapped exactly one
-  //    level, yielding another agent's key as a routing key.
+  //   `packages/shared/src/chat.ts` -> chatSessionIdSchema
+  //     z.string().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/)
   //
-  // Either one written into `?session=` buys a `bound: true` log line over a
-  // `tenant_unavailable` answer, which is the false green this whole guard
-  // exists to prevent. Refusing is fail-closed and stays diagnosable.
-  if (tail.includes("agent:")) return undefined;
+  // and `apps/cell/src/protocol.ts` applies that schema to `params.sessionId`
+  // on BOTH `chat.send` and `chat.history` -- i.e. on every id that can reach
+  // `bindExchange` and so every id the relay's `connectionByChatSession` map
+  // can ever hold. An id outside it is unbindable by construction.
+  //
+  // One anchored test subsumes the whole fabrication class, each of which would
+  // otherwise be written into `?session=` and buy a `bound: true` log line over
+  // a `tenant_unavailable` answer -- the false green this guard exists to stop:
+  //
+  //  - Node joins REPEATED headers of these names with ", " into ONE string, so
+  //    two copies arrive as `agent:b:chat-A, agent:b:chat-B` and the greedy tail
+  //    yields `chat-A, agent:b:chat-B` (comma and space are both illegal);
+  //  - a nested `agent:b:agent:other:chat-9` would otherwise be unwrapped one
+  //    level, yielding another agent's key as a routing key -- in ANY case,
+  //    which a case-sensitive substring check missed; and
+  //  - arbitrary junk carrying colons, slashes or spaces.
+  //
+  // THE COUPLING IS DELIBERATE AND IS NAMED HERE so it is findable: if the
+  // control plane ever LOOSENS `chatSessionIdSchema`, this check starts
+  // refusing ids that are by then legitimate. That failure is fail-closed --
+  // the hint is dropped and one log line says so, the same branch a hintless
+  // request already takes -- so it degrades to today's behaviour rather than to
+  // a mis-route. The two must be changed together.
+  if (!CHAT_SESSION_ID.test(tail)) return undefined;
   return tail;
 }
 
