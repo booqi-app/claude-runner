@@ -417,6 +417,81 @@ test("a caller-named chat session becomes the hint, by header or by body", () =>
   }
 });
 
+// ── OpenClaw's session-affinity headers (booqi-app/infra#327 item 1) ──────
+//
+// MEASURED on the dev host, 2026-10-04, inside the running reference cell
+// `/opt/booqi/cells/demo-boekhouding/` (OpenClaw 2026.7.1-beta.5):
+//
+//   /app/node_modules/@openclaw/ai/src/providers/openai-completions.ts:620
+//     if (sessionId && compat.sendSessionAffinityHeaders) {
+//       headers.session_id = sessionId;
+//       headers["x-client-request-id"] = sessionId;
+//       headers["x-session-affinity"] = sessionId;
+//     }
+//
+// So the host DOES send a session identifier to an OpenAI-compatible provider
+// -- under three names none of which this bridge used to read. That corrects
+// the claim this file and `resolveConversation` carried since 2026-10-01.
+//
+// What it does NOT send is the cell's `sessionKey`. The value is OpenClaw's own
+// session RECORD id: `agents/boekhouder/sessions/sessions.json` maps the key
+// `agent:boekhouder:<chatSessionId>` onto `{ sessionId: "<uuid>" }`, and the
+// provider call site reads `ctx.params.session.id`. A uuid is meaningless to
+// `apps/cell`'s relay, whose `connectionByChatSession` map is keyed by the
+// control plane's chat session id.
+//
+// Hence the rule these tests pin: an affinity header is honoured ONLY when it
+// carries the `agent:<agentId>:<chatSessionId>` key shape, and an opaque value
+// is refused. Writing `?session=<uuid>` instead would make the relay log
+// `bound: true` while `backendFor` still resolved to nothing -- a tool call
+// answered `tenant_unavailable` behind a log line claiming it was bound. The
+// fail-closed branch is diagnosable; that one is not.
+
+test("an affinity header carrying the cell's session key yields the chat session", () => {
+  for (const header of ["session_id", "x-client-request-id", "x-session-affinity"]) {
+    const resolved = resolveConversation(reqWith({ [header]: "agent:boekhouder:chat-7" }), {});
+    assert.equal(resolved.chatSessionId, "chat-7", `not unwrapped from ${header}`);
+    assert.equal(resolved.conversationId, "chat-7", `conversation key wrong for ${header}`);
+  }
+});
+
+test("an opaque OpenClaw session id on an affinity header is refused, not written", () => {
+  // The literal uuid measured in the reference cell's sessions.json.
+  for (const header of ["session_id", "x-client-request-id", "x-session-affinity"]) {
+    const resolved = resolveConversation(
+      reqWith({ [header]: "b66bdf67-0f4d-46d8-8051-4c9251fdde62" }),
+      {},
+    );
+    assert.equal(resolved.chatSessionId, undefined, `uuid accepted from ${header}`);
+    assert.equal(resolved.conversationId, "default");
+  }
+});
+
+test("a caller-named chat session wins over an affinity header", () => {
+  const resolved = resolveConversation(
+    reqWith({
+      "x-booqi-chat-session": "chat-named",
+      "session_id": "agent:boekhouder:chat-affinity",
+    }),
+    {},
+  );
+  assert.equal(resolved.chatSessionId, "chat-named");
+});
+
+test("a session key with no chat session left in it is absent, not empty", () => {
+  for (const value of ["agent:boekhouder:", "agent:boekhouder:   ", "agent:boekhouder", "agent:", "boekhouder:chat-7"]) {
+    const resolved = resolveConversation(reqWith({ session_id: value }), {});
+    assert.equal(resolved.chatSessionId, undefined, `accepted: ${JSON.stringify(value)}`);
+  }
+});
+
+test("a chat session id containing colons survives the unwrap whole", () => {
+  // `apps/cell/src/openclaw.ts` does NOT sanitise the chat session id, so the
+  // tail is taken greedily rather than split on every colon.
+  const resolved = resolveConversation(reqWith({ session_id: "agent:boekhouder:a:b:c" }), {});
+  assert.equal(resolved.chatSessionId, "a:b:c");
+});
+
 test("a derived conversation id is NOT offered as a chat session", () => {
   // Non-empty messages: `derived-<hash>`.
   const derived = resolveConversation(reqWith(), {

@@ -425,6 +425,42 @@ export function normaliseChatSessionId(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/**
+ * OpenClaw's agent session key, as `apps/cell` mints it.
+ *
+ * `apps/cell/src/openclaw.ts`:
+ *   `openClawSessionKey(chatSessionId) => \`agent:${OPENCLAW_AGENT_ID}:${chatSessionId}\``
+ *
+ * The agent id is matched as `[^:]+` rather than spelled out: the cell's agent
+ * id is configuration (`agents.list[].id` in the rendered `openclaw.json`), and
+ * a bridge that only recognised `boekhouder` would go quietly fail-closed the
+ * day a second cell used another name. The tail is greedy because the chat
+ * session id is NOT sanitised by the cell -- it is the control plane's own
+ * identifier, and splitting it on a colon would silently route two
+ * conversations at one exchange.
+ */
+const AGENT_SESSION_KEY = /^agent:[^:]+:([\s\S]+)$/;
+
+/**
+ * Recover the chat session id from an OpenClaw agent session key.
+ *
+ * Returns `undefined` for anything that is not that key shape -- which is the
+ * whole point of the function and not a defensive afterthought. OpenClaw's
+ * session-affinity headers carry its own session RECORD id (a uuid) whenever
+ * the agent run was not keyed, and `apps/cell`'s relay cannot resolve a uuid:
+ * its `connectionByChatSession` map is keyed by the control plane's chat
+ * session id. Writing a uuid into `?session=` would buy a `bound: true` log
+ * line and a `tenant_unavailable` answer behind it. Absent is the honest
+ * value; see `SessionHintContext.chatSessionId`.
+ */
+export function chatSessionFromAgentSessionKey(value: unknown): string | undefined {
+  const key = normaliseChatSessionId(value);
+  if (key === undefined) return undefined;
+  const match = AGENT_SESSION_KEY.exec(key);
+  if (match === null) return undefined;
+  return normaliseChatSessionId(match[1]);
+}
+
 /** What `applySessionHint` did, per server name. */
 export interface SessionHintOutcome {
   /** The map to hand to the SDK. A new object; the input is never mutated. */
