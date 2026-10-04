@@ -24,6 +24,7 @@ import type { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 // import this module at all. booqi-app/infra#202.
 import {
   buildQueryOptions,
+  chatSessionFromAgentSessionKey,
   normaliseChatSessionId,
   resolveSystemPrompt,
 } from "./bridge-config.ts";
@@ -385,6 +386,35 @@ function deriveConversationIdFromMessages(messages: Array<{ role: string; conten
  */
 const CHAT_SESSION_HEADER = "x-booqi-chat-session";
 
+/**
+ * The headers OpenClaw's OpenAI-compatible provider actually sends.
+ *
+ * MEASURED 2026-10-04 in the running reference cell (OpenClaw
+ * 2026.7.1-beta.5), `@openclaw/ai/src/providers/openai-completions.ts:620`:
+ * all three are set to the same `options.sessionId`, gated on
+ * `compat.sendSessionAffinityHeaders` (default `false` for this provider, so
+ * the cell's model entry must opt in).
+ *
+ * They are read through `chatSessionFromAgentSessionKey`, never directly: the
+ * value is OpenClaw's own session id unless the run was keyed by the cell, and
+ * only the keyed form names something `apps/cell` can resolve.
+ */
+const SESSION_AFFINITY_HEADERS = ["session_id", "x-client-request-id", "x-session-affinity"] as const;
+
+/**
+ * The chat session an OpenClaw session-affinity header names, if any.
+ *
+ * First header that unwraps wins. All three carry the same value in the
+ * measured host, so the order is only a tie-break for a host that diverges.
+ */
+function affinityChatSession(req: IncomingMessage): string | undefined {
+  for (const header of SESSION_AFFINITY_HEADERS) {
+    const unwrapped = chatSessionFromAgentSessionKey(req.headers[header]);
+    if (unwrapped !== undefined) return unwrapped;
+  }
+  return undefined;
+}
+
 /** A request's conversation key, and whether anyone but us named it. */
 export interface ResolvedConversation {
   /** The session-store key. Always a string, derived if nothing named one. */
@@ -403,37 +433,72 @@ export interface ResolvedConversation {
 }
 
 /**
- * MEASURED, 2026-10-01 (booqi-app/app#459 part C, test plan step 0).
+ * MEASURED, 2026-10-04, on the dev host, inside the RUNNING reference cell
+ * `/opt/booqi/cells/demo-boekhouding/` (booqi-app/infra#327 item 1).
  *
- * Nothing in the OpenClaw host sends a session identifier to an
- * OpenAI-compatible provider: a search of the host source for `x-session-id`,
- * `x-conversation-id` and `conversation_id` over its provider, llm and agent
- * trees returns no request-building hit (the only `conversation_id` is a CLI
- * output column). The cell drives the agent with
- * `sessionKey: agent:boekhouder:<chatSessionId>`
- * (`apps/cell/src/openclaw.ts`), and that key stops at the host.
+ * This supersedes the note that stood here from 2026-10-01, which said the
+ * OpenClaw host sends no session identifier to an OpenAI-compatible provider.
+ * That note was wrong, and wrong in a way that mattered: it searched for
+ * `x-session-id`, `x-conversation-id` and `conversation_id`, and the host uses
+ * none of those three spellings. OpenClaw 2026.7.1-beta.5 does send one --
+ * `@openclaw/ai/src/providers/openai-completions.ts:620-623` sets `session_id`,
+ * `x-client-request-id` and `x-session-affinity`, all to `options.sessionId`,
+ * behind `compat.sendSessionAffinityHeaders` (line 1389: default `false` for
+ * this provider, so the cell's model entry has to ask for it).
  *
- * So TODAY every request takes the `undefined` branch below, the hint is not
- * written, and one log line says so -- which is correct and fail-closed, not a
- * regression: that is exactly the behaviour the relay already has for a
+ * TWO things therefore have to be true before a hint is written, and only the
+ * first of them lives in this repository:
+ *
+ *  1. this function reads the names the host really uses -- it now does; and
+ *  2. the value on those headers is the cell's `sessionKey`
+ *     (`agent:<agentId>:<chatSessionId>`, `apps/cell/src/openclaw.ts`) rather
+ *     than OpenClaw's own session record id.
+ *
+ * On (2) the measurement is that the host keys agent runs by that string but
+ * stores them under a uuid: `agents/boekhouder/sessions/sessions.json` maps
+ * `"agent:boekhouder:<chatSessionId>" -> { sessionId: "<uuid>" }`, and the
+ * provider call site reads `ctx.params.session.id`. So today the headers are
+ * expected to carry the uuid, `chatSessionFromAgentSessionKey` refuses it, and
+ * this function stays on the `undefined` branch -- fail-closed, with one log
+ * line saying so, which is the same behaviour the relay already has for a
  * hintless session (`tools/list` -> `{tools: []}`).
  *
- * The missing link is the cell image's OpenClaw agent definition passing its
- * session key through as `conversation_id` or as the header above. That is
- * infra work and is filed as a follow-up; this function is the end of it that
- * belongs in this repository, and it is ready for either spelling.
+ * That refusal is deliberate and is the load-bearing half of this change.
+ * `apps/cell/src/mcp-relay.ts` logs `bound: hint !== null` but resolves a
+ * backend through `connectionByChatSession`, which only ever holds control-plane
+ * chat session ids. A uuid written into `?session=` would log `bound: true` and
+ * still answer every `tools/call` with `tenant_unavailable` -- a false green on
+ * exactly the signal infra#327 is being diagnosed from.
+ *
+ * Making (2) true is NOT this repository's to make: the cell's chat session id
+ * has to reach the bridge, either by the host passing its session KEY to the
+ * provider, or by `apps/cell` registering the host's session id as an alias for
+ * the same exchange in its relay. Both are filed on infra#327; this function is
+ * the end of it that belongs here, and it is ready for either.
  */
 export function resolveConversation(
   req: IncomingMessage,
   body: Record<string, any>,
 ): ResolvedConversation {
-  const named = normaliseChatSessionId(
-    (req.headers[CHAT_SESSION_HEADER] as string) ||
-    (req.headers["x-session-id"] as string) ||
-    (req.headers["x-conversation-id"] as string) ||
-    body.conversation_id ||
-    body.metadata?.conversation_id,
-  );
+  // A caller that names the chat session outright wins: that is an explicit
+  // statement of intent, while an affinity header is a side effect of how the
+  // host happens to key its agent runs.
+  //
+  // Each candidate is normalised INDIVIDUALLY. Normalising one `||` chain was a
+  // defect (review round 1, MAJOR): `||` short-circuits on the first TRUTHY
+  // value while `normaliseChatSessionId` then rejects whitespace, so a blank
+  // `x-booqi-chat-session` -- or a non-string truthy `conversation_id` -- ended
+  // the search and collapsed the whole chain to `undefined`, skipping a valid
+  // later channel. Before the affinity headers below existed that only lost the
+  // hint, which is fail-closed; with them it handed the request to a DIFFERENT
+  // chat session, which is not.
+  const named =
+    normaliseChatSessionId(req.headers[CHAT_SESSION_HEADER]) ??
+    normaliseChatSessionId(req.headers["x-session-id"]) ??
+    normaliseChatSessionId(req.headers["x-conversation-id"]) ??
+    normaliseChatSessionId(body.conversation_id) ??
+    normaliseChatSessionId(body.metadata?.conversation_id) ??
+    affinityChatSession(req);
 
   return {
     conversationId: named ?? deriveConversationIdFromMessages(body.messages ?? []),

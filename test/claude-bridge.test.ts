@@ -417,6 +417,290 @@ test("a caller-named chat session becomes the hint, by header or by body", () =>
   }
 });
 
+// ── OpenClaw's session-affinity headers (booqi-app/infra#327 item 1) ──────
+//
+// MEASURED on the dev host, 2026-10-04, inside the running reference cell
+// `/opt/booqi/cells/demo-boekhouding/` (OpenClaw 2026.7.1-beta.5):
+//
+//   /app/node_modules/@openclaw/ai/src/providers/openai-completions.ts:620
+//     if (sessionId && compat.sendSessionAffinityHeaders) {
+//       headers.session_id = sessionId;
+//       headers["x-client-request-id"] = sessionId;
+//       headers["x-session-affinity"] = sessionId;
+//     }
+//
+// So the host DOES send a session identifier to an OpenAI-compatible provider
+// -- under three names none of which this bridge used to read. That corrects
+// the claim this file and `resolveConversation` carried since 2026-10-01.
+//
+// What it does NOT send is the cell's `sessionKey`. The value is OpenClaw's own
+// session RECORD id: `agents/boekhouder/sessions/sessions.json` maps the key
+// `agent:boekhouder:<chatSessionId>` onto `{ sessionId: "<uuid>" }`, and the
+// provider call site reads `ctx.params.session.id`. A uuid is meaningless to
+// `apps/cell`'s relay, whose `connectionByChatSession` map is keyed by the
+// control plane's chat session id.
+//
+// Hence the rule these tests pin: an affinity header is honoured ONLY when it
+// carries the `agent:<agentId>:<chatSessionId>` key shape, and an opaque value
+// is refused. Writing `?session=<uuid>` instead would make the relay log
+// `bound: true` while `backendFor` still resolved to nothing -- a tool call
+// answered `tenant_unavailable` behind a log line claiming it was bound. The
+// fail-closed branch is diagnosable; that one is not.
+
+test("an affinity header carrying the cell's session key yields the chat session", () => {
+  for (const header of ["session_id", "x-client-request-id", "x-session-affinity"]) {
+    const resolved = resolveConversation(reqWith({ [header]: "agent:boekhouder:chat-7" }), {});
+    assert.equal(resolved.chatSessionId, "chat-7", `not unwrapped from ${header}`);
+    assert.equal(resolved.conversationId, "chat-7", `conversation key wrong for ${header}`);
+  }
+});
+
+test("an opaque OpenClaw session id on an affinity header is refused, not written", () => {
+  // The literal uuid measured in the reference cell's sessions.json.
+  for (const header of ["session_id", "x-client-request-id", "x-session-affinity"]) {
+    const resolved = resolveConversation(
+      reqWith({ [header]: "b66bdf67-0f4d-46d8-8051-4c9251fdde62" }),
+      {},
+    );
+    assert.equal(resolved.chatSessionId, undefined, `uuid accepted from ${header}`);
+    assert.equal(resolved.conversationId, "default");
+  }
+});
+
+test("a caller-named chat session wins over an affinity header", () => {
+  const resolved = resolveConversation(
+    reqWith({
+      "x-booqi-chat-session": "chat-named",
+      "session_id": "agent:boekhouder:chat-affinity",
+    }),
+    {},
+  );
+  assert.equal(resolved.chatSessionId, "chat-named");
+});
+
+test("a session key with no chat session left in it is absent, not empty", () => {
+  for (const value of ["agent:boekhouder:", "agent:boekhouder:   ", "agent:boekhouder", "agent:", "boekhouder:chat-7"]) {
+    const resolved = resolveConversation(reqWith({ session_id: value }), {});
+    assert.equal(resolved.chatSessionId, undefined, `accepted: ${JSON.stringify(value)}`);
+  }
+});
+
+test("a blank earlier caller header does not hand the request to an affinity header", () => {
+  // Review round 1, MAJOR. `||` short-circuits on the first TRUTHY value, but
+  // `normaliseChatSessionId` then rejects whitespace -- so a blank
+  // `x-booqi-chat-session` used to collapse the whole caller chain to
+  // `undefined` and let the affinity header decide, SKIPPING a valid
+  // `x-session-id`. Before this file read affinity headers at all that only
+  // lost the hint, which is fail-closed; now it would route the request at a
+  // DIFFERENT chat session, which is not.
+  const resolved = resolveConversation(
+    reqWith({
+      "x-booqi-chat-session": " ",
+      "x-session-id": "chat-caller-named",
+      "session_id": "agent:boekhouder:chat-affinity",
+    }),
+    {},
+  );
+  assert.equal(resolved.chatSessionId, "chat-caller-named");
+  assert.equal(resolved.conversationId, "chat-caller-named");
+});
+
+test("a non-string truthy caller value does not shadow a later valid one", () => {
+  // Same root cause, body edition: `conversation_id: 12345` is truthy, so the
+  // `||` chain stopped there and `metadata.conversation_id` was never read.
+  const resolved = resolveConversation(reqWith(), {
+    conversation_id: 12345,
+    metadata: { conversation_id: "chat-meta" },
+  });
+  assert.equal(resolved.chatSessionId, "chat-meta");
+});
+
+test("every caller channel is tried in turn, not just the first truthy one", () => {
+  // The precedence order itself, pinned channel by channel: each one wins over
+  // the ones after it, and a blank value in any earlier channel is skipped
+  // rather than being allowed to end the search.
+  const channels: Array<[string, Record<string, string>, Record<string, any>]> = [
+    ["x-booqi-chat-session", { "x-booqi-chat-session": "chat-win" }, {}],
+    ["x-session-id", { "x-booqi-chat-session": "  ", "x-session-id": "chat-win" }, {}],
+    [
+      "x-conversation-id",
+      { "x-booqi-chat-session": "  ", "x-session-id": " ", "x-conversation-id": "chat-win" },
+      {},
+    ],
+    ["conversation_id", { "x-session-id": " " }, { conversation_id: "chat-win" }],
+    ["metadata.conversation_id", { "x-session-id": " " }, { metadata: { conversation_id: "chat-win" } }],
+  ];
+  for (const [label, headers, body] of channels) {
+    const resolved = resolveConversation(reqWith(headers), body);
+    assert.equal(resolved.chatSessionId, "chat-win", `channel not reached: ${label}`);
+  }
+});
+
+test("a duplicated affinity header is refused rather than fabricating an id", () => {
+  // Review round 1, P2 raised by two reviewers independently. Node joins
+  // repeated headers of these names with ", " into ONE string, so two copies
+  // arrive as `agent:b:chat-A, agent:b:chat-B` and the greedy tail would hand
+  // the relay `chat-A, agent:b:chat-B` -- an id belonging to nobody, written
+  // into `?session=`, which is the exact `bound: true` + `tenant_unavailable`
+  // false green the key-shape guard exists to prevent.
+  //
+  // Not reachable from the measured host (it assigns the three headers from an
+  // object literal), but a proxy or retry layer that appends a second copy is
+  // all it takes.
+  const resolved = resolveConversation(
+    reqWith({ "x-session-affinity": "agent:boekhouder:chat-A, agent:boekhouder:chat-B" }),
+    {},
+  );
+  assert.equal(resolved.chatSessionId, undefined);
+  assert.equal(resolved.conversationId, "default");
+});
+
+test("a nested session key is refused, not unwrapped one level", () => {
+  const resolved = resolveConversation(
+    reqWith({ session_id: "agent:boekhouder:agent:other:chat-9" }),
+    {},
+  );
+  assert.equal(resolved.chatSessionId, undefined);
+});
+
+test("a session key on a CALLER channel is taken verbatim, not unwrapped", () => {
+  // Pinned on purpose rather than changed. The unwrap is applied ONLY to the
+  // affinity headers, because those are known to carry OpenClaw's identity
+  // while a caller channel carries whatever the caller chose -- and the cell
+  // does not sanitise the chat session id, so a value that merely LOOKS like a
+  // session key could be a real chat session id.
+  //
+  // The consequence is deliberate and is the thing this test exists to make
+  // visible: if infra#327 option (A) ever lands by having the host send its
+  // session KEY on one of these names, the bridge would write
+  // `?session=agent:boekhouder:chat-7` and regress to the false green. Whoever
+  // implements (A) must make that choice explicitly, and this test will fail
+  // and force them to.
+  const resolved = resolveConversation(
+    reqWith({ "x-booqi-chat-session": "agent:boekhouder:chat-7" }),
+    {},
+  );
+  assert.equal(resolved.chatSessionId, "agent:boekhouder:chat-7");
+});
+
+test("a tail that is not a conformant chat session id is refused", () => {
+  // Review round 2 REPLACED a test that asserted the opposite of this one. It
+  // said "a chat session id containing colons survives the unwrap whole", on
+  // the stated ground that the cell does not sanitise the id. That ground was
+  // wrong: `apps/cell/src/openclaw.ts` indeed does not, but the control plane
+  // does, upstream of everything that reaches the binding map --
+  // `chatSessionIdSchema` (`packages/shared/src/chat.ts`,
+  // `/^[A-Za-z0-9_-]+$/`, 1..200) is applied to `params.sessionId` on BOTH
+  // `chat.send` and `chat.history` (`apps/cell/src/protocol.ts`). So `a:b:c` is
+  // not a conversation worth preserving; it is unbindable by construction, and
+  // forwarding it would buy a `bound: true` over a `tenant_unavailable`.
+  const refused = [
+    "agent:boekhouder:a:b:c",
+    "agent:boekhouder:chat-A, agent:boekhouder:chat-B", // Node's duplicate-header join
+    "agent:boekhouder:chat-A, chat-B",
+    "agent:boekhouder:AGENT:other:chat-9", // nesting in another case
+    "agent:boekhouder:chat 7",
+    "agent:boekhouder:a/b",
+    "agent:boekhouder:a.b",
+    `agent:boekhouder:${"a".repeat(201)}`,
+  ];
+  for (const value of refused) {
+    const resolved = resolveConversation(reqWith({ session_id: value }), {});
+    assert.equal(resolved.chatSessionId, undefined, `accepted: ${JSON.stringify(value)}`);
+    assert.equal(resolved.conversationId, "default");
+  }
+});
+
+test("a session key with anything before `agent:` is refused", () => {
+  // Review round 2, surviving mutant S1. Dropping the `^` anchor from
+  // AGENT_SESSION_KEY left the suite green at 125/125 while really changing
+  // behaviour: `sess-of-agent:b:chat-9` would unwrap to `chat-9`. That is the
+  // fabrication boundary this guard exists to hold -- a value that merely
+  // CONTAINS a session key is not one -- so it is pinned here rather than left
+  // to the next reader to rediscover.
+  for (const value of [
+    "sess-of-agent:boekhouder:chat-9",
+    "xxagent:boekhouder:chat-9",
+    "x agent:boekhouder:chat-9",
+    "1agent:boekhouder:chat-9",
+  ]) {
+    // NOTE: a prefix of pure WHITESPACE is deliberately absent from this list.
+    // `" agent:b:chat-9"` is trimmed by `normaliseChatSessionId` before the
+    // pattern is applied and then legitimately IS a session key -- Node strips
+    // surrounding header whitespace too. Asserting a refusal there would pin a
+    // bug, not a guard; I wrote that case first and the suite caught it.
+    const resolved = resolveConversation(reqWith({ session_id: value }), {});
+    assert.equal(resolved.chatSessionId, undefined, `accepted: ${JSON.stringify(value)}`);
+  }
+});
+
+test("whitespace inside the unwrapped tail is trimmed, not routed on", () => {
+  // Review round 2, surviving mutant S2. The existing "no chat session left in
+  // it" test only exercises TRAILING whitespace, which the outer
+  // `normaliseChatSessionId` already strips -- so dropping the INNER trim of
+  // the captured tail stayed green while yielding " chat-7" as a routing key.
+  for (const value of ["agent:boekhouder: chat-7", "agent:boekhouder:\tchat-7", "agent:boekhouder:chat-7 "]) {
+    const resolved = resolveConversation(reqWith({ session_id: value }), {});
+    assert.equal(resolved.chatSessionId, "chat-7", `not trimmed: ${JSON.stringify(value)}`);
+  }
+});
+
+test("an earlier caller channel wins over a later one that also names a session", () => {
+  // Review round 2, surviving mutant S3. The precedence test above only ever
+  // makes the EARLIER channels blank, so it pins "a later channel is
+  // reachable" and not "the earlier one wins" -- swapping two channels stayed
+  // green. `x-booqi-chat-session` is the relay's own canonical header and
+  // `x-session-id` is generic, so a silent reorder would be a misroute.
+  const ladder: Array<[string, Record<string, string>, Record<string, any>]> = [
+    [
+      "x-booqi-chat-session over x-session-id",
+      { "x-booqi-chat-session": "chat-win", "x-session-id": "chat-lose" },
+      {},
+    ],
+    [
+      "x-session-id over x-conversation-id",
+      { "x-session-id": "chat-win", "x-conversation-id": "chat-lose" },
+      {},
+    ],
+    [
+      "x-conversation-id over conversation_id",
+      { "x-conversation-id": "chat-win" },
+      { conversation_id: "chat-lose" },
+    ],
+    [
+      "conversation_id over metadata.conversation_id",
+      {},
+      { conversation_id: "chat-win", metadata: { conversation_id: "chat-lose" } },
+    ],
+    [
+      "every caller channel over every affinity header",
+      {
+        "metadata-placeholder": "x",
+        session_id: "agent:boekhouder:chat-lose",
+        "x-client-request-id": "agent:boekhouder:chat-lose",
+        "x-session-affinity": "agent:boekhouder:chat-lose",
+      },
+      { metadata: { conversation_id: "chat-win" } },
+    ],
+  ];
+  for (const [label, headers, body] of ladder) {
+    const resolved = resolveConversation(reqWith(headers), body);
+    assert.equal(resolved.chatSessionId, "chat-win", `precedence wrong: ${label}`);
+  }
+});
+
+test("a conformant chat session id at the edges of the schema is accepted", () => {
+  // The other half of the guard: it must not refuse what the control plane
+  // would issue. Absent this, "refuse everything" would pass the test above.
+  for (const id of ["a", "0", "chat-7", "abc_DEF-123", "default", "a".repeat(200)]) {
+    const resolved = resolveConversation(
+      reqWith({ session_id: `agent:boekhouder:${id}` }),
+      {},
+    );
+    assert.equal(resolved.chatSessionId, id, `refused: ${JSON.stringify(id)}`);
+  }
+});
+
 test("a derived conversation id is NOT offered as a chat session", () => {
   // Non-empty messages: `derived-<hash>`.
   const derived = resolveConversation(reqWith(), {
