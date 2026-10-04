@@ -483,14 +483,22 @@ export function resolveConversation(
   // A caller that names the chat session outright wins: that is an explicit
   // statement of intent, while an affinity header is a side effect of how the
   // host happens to key its agent runs.
+  //
+  // Each candidate is normalised INDIVIDUALLY. Normalising one `||` chain was a
+  // defect (review round 1, MAJOR): `||` short-circuits on the first TRUTHY
+  // value while `normaliseChatSessionId` then rejects whitespace, so a blank
+  // `x-booqi-chat-session` -- or a non-string truthy `conversation_id` -- ended
+  // the search and collapsed the whole chain to `undefined`, skipping a valid
+  // later channel. Before the affinity headers below existed that only lost the
+  // hint, which is fail-closed; with them it handed the request to a DIFFERENT
+  // chat session, which is not.
   const named =
-    normaliseChatSessionId(
-      (req.headers[CHAT_SESSION_HEADER] as string) ||
-      (req.headers["x-session-id"] as string) ||
-      (req.headers["x-conversation-id"] as string) ||
-      body.conversation_id ||
-      body.metadata?.conversation_id,
-    ) ?? affinityChatSession(req);
+    normaliseChatSessionId(req.headers[CHAT_SESSION_HEADER]) ??
+    normaliseChatSessionId(req.headers["x-session-id"]) ??
+    normaliseChatSessionId(req.headers["x-conversation-id"]) ??
+    normaliseChatSessionId(body.conversation_id) ??
+    normaliseChatSessionId(body.metadata?.conversation_id) ??
+    affinityChatSession(req);
 
   return {
     conversationId: named ?? deriveConversationIdFromMessages(body.messages ?? []),

@@ -458,7 +458,23 @@ export function chatSessionFromAgentSessionKey(value: unknown): string | undefin
   if (key === undefined) return undefined;
   const match = AGENT_SESSION_KEY.exec(key);
   if (match === null) return undefined;
-  return normaliseChatSessionId(match[1]);
+  const tail = normaliseChatSessionId(match[1]);
+  if (tail === undefined) return undefined;
+  // A tail that still contains a session key is not a chat session id, and the
+  // two ways it can happen are both fabrications rather than conversations:
+  //
+  //  - Node joins REPEATED headers of these names with ", " into one string,
+  //    so two copies of the header arrive as
+  //    `agent:b:chat-A, agent:b:chat-B` and the greedy tail would yield
+  //    `chat-A, agent:b:chat-B` -- an id belonging to neither party; and
+  //  - a nested `agent:b:agent:other:chat-9` would be unwrapped exactly one
+  //    level, yielding another agent's key as a routing key.
+  //
+  // Either one written into `?session=` buys a `bound: true` log line over a
+  // `tenant_unavailable` answer, which is the false green this whole guard
+  // exists to prevent. Refusing is fail-closed and stays diagnosable.
+  if (tail.includes("agent:")) return undefined;
+  return tail;
 }
 
 /** What `applySessionHint` did, per server name. */
