@@ -471,6 +471,40 @@ test("a caller-named chat session becomes the hint, by header or by body", () =>
 const MEASURED_HOST_SESSION_UUID = "b66bdf67-0f4d-46d8-8051-4c9251fdde62";
 
 /**
+ * STRUCTURALLY DISTINCT host-session uuids, all of which must be accepted and
+ * returned VERBATIM.
+ *
+ * FINDING F-V1, raised by the independent verification reviewer on this PR and
+ * fixed in the same round. The suite previously contained exactly ONE distinct
+ * uuid literal, so an implementation that ignored its input and always returned
+ * that one constant was indistinguishable from a correct one -- the reviewer
+ * demonstrated it as a SURVIVING mutant. Verbatim-ness across distinct values
+ * is precisely the property `apps/cell`'s alias table depends on, because
+ * `chatSessionByHostSession` is keyed by the exact string `sessions.describe`
+ * returned, so a constant or a transform would miss it on every session but
+ * one.
+ *
+ * It also supplies the arm the version and variant nibbles never had. The
+ * matcher deliberately does NOT constrain them -- the cell never interprets
+ * this value, it only looks it up, so refusing a uuid the host really minted
+ * because we disagreed about its version field would be a fail-closed bug with
+ * no compensating benefit. The measured exemplar is a well-formed v4, so that
+ * deliberate looseness was unarmed until this list existed.
+ *
+ * The nil uuid is included on purpose: it is admitted, that is deliberate, and
+ * it is not a hole. An alias is a lookup and never an authorisation, so a
+ * uuid-shaped value no alias knows still serves nothing.
+ */
+const HOST_SESSION_UUIDS = [
+  MEASURED_HOST_SESSION_UUID,                 // v4, variant 8 -- the measured one
+  "00000000-0000-0000-0000-000000000000",     // the nil uuid
+  "ffffffff-ffff-ffff-ffff-ffffffffffff",     // every nibble f
+  "0c4fbf75-1234-1abc-0def-0123456789ab",     // version nibble 1, variant nibble 0
+  "9a8b7c6d-5e4f-7a3b-c2d1-e0f918273645",     // version nibble 7, variant nibble c
+  "deadbeef-0000-9999-ffff-012345678900",     // mixed, trailing zeroes
+] as const;
+
+/**
  * Opaque, present, and still refused after S4.
  *
  * Deliberately a value that `chatSessionIdSchema` would ADMIT
@@ -496,22 +530,31 @@ test("AC-4: a host-session uuid on an affinity header is ACCEPTED and written", 
   // non-uuid opaque value refused.
   //
   // Kill: revert the relaxation in `examineAgentSessionKey` -> red.
+  //
+  // Looped over EVERY header name and EVERY member of `HOST_SESSION_UUIDS`
+  // rather than over the single measured exemplar (finding F-V1): a constant
+  // return is only detectable against a population, and the version/variant
+  // nibbles are only armed by one.
   for (const header of SESSION_AFFINITY_HEADERS) {
-    const resolved = resolveConversation(
-      reqWith({ [header]: MEASURED_HOST_SESSION_UUID }),
-      {},
-    );
-    assert.equal(
-      resolved.chatSessionId,
-      MEASURED_HOST_SESSION_UUID,
-      `uuid not accepted from ${header}`,
-    );
-    // Taken VERBATIM. The cell's alias table is keyed by the exact string
-    // `sessions.describe` returned, so any transform here would miss it.
-    assert.equal(resolved.conversationId, MEASURED_HOST_SESSION_UUID);
-    const entry = resolved.affinityHeaders.find((e) => e.header === header)!;
-    assert.equal(entry.verdict.kind, "accepted", `${header} not reported accepted`);
+    for (const uuid of HOST_SESSION_UUIDS) {
+      const resolved = resolveConversation(reqWith({ [header]: uuid }), {});
+      assert.equal(
+        resolved.chatSessionId,
+        uuid,
+        `uuid not accepted verbatim from ${header}: ${JSON.stringify(uuid)}`,
+      );
+      // Taken VERBATIM. The cell's alias table is keyed by the exact string
+      // `sessions.describe` returned, so any transform here would miss it.
+      assert.equal(resolved.conversationId, uuid);
+      const entry = resolved.affinityHeaders.find((e) => e.header === header)!;
+      assert.equal(entry.verdict.kind, "accepted", `${header} not reported accepted`);
+    }
   }
+  // The population is genuinely a population, so the loop above cannot be
+  // satisfied by a constant. Asserted rather than assumed: a careless edit that
+  // collapsed the list would otherwise silently restore the F-V1 blind spot.
+  assert.equal(new Set(HOST_SESSION_UUIDS).size, HOST_SESSION_UUIDS.length);
+  assert.ok(HOST_SESSION_UUIDS.length >= 3, "a constant return needs >=2 distinct values to detect");
 });
 
 test("AC-4: an opaque value that is NOT uuid-shaped is still refused, not written", () => {
@@ -1272,6 +1315,15 @@ test("S4 JOIN: the measured host-session uuid reaches the SDK url as ?session=",
   // The hint was written, so the hintless examination report is deliberately
   // absent from this line -- unchanged S1 behaviour.
   assert.equal(/ABSENT/.test(logs[0]), false);
+  // NIT 3, review round 1: an ACCEPTED identifier is still an identifier. The
+  // refused path was already armed against disclosure; this arms the accepted
+  // one, which is the path that now carries a real host session id.
+  assert.equal(
+    logs[0].includes(MEASURED_HOST_SESSION_UUID),
+    false,
+    `the accepted uuid reached the log line: ${logs[0]}`,
+  );
+  assert.equal(logs[0].includes("b66bdf67"), false, `a fragment of the uuid reached the log line: ${logs[0]}`);
 });
 
 test("S1 JOIN: an accepted affinity header routes, and the hint reaches the SDK url", async () => {

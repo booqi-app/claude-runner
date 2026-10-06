@@ -397,9 +397,14 @@ const CHAT_SESSION_HEADER = "x-booqi-chat-session";
  * `compat.sendSessionAffinityHeaders` (default `false` for this provider, so
  * the cell's model entry must opt in).
  *
- * They are read through `chatSessionFromAgentSessionKey`, never directly: the
- * value is OpenClaw's own session id unless the run was keyed by the cell, and
- * only the keyed form names something `apps/cell` can resolve.
+ * They are read through `chatSessionFromAgentSessionKey`, never directly. That
+ * classifier admits TWO shapes and nothing else: the cell's keyed form
+ * `agent:<agentId>:<chatSessionId>`, which it unwraps, and a bare OpenClaw
+ * session RECORD id -- a uuid -- which it takes verbatim. The second was
+ * REFUSED until infra#327 S4, and the refusal was correct for as long as
+ * `apps/cell`'s relay had nothing to resolve a uuid against; booqi-app/app#615
+ * gave it an alias table, so the uuid now names something the relay can route
+ * on. Anything that is neither shape is still refused.
  */
 export const SESSION_AFFINITY_HEADERS = ["session_id", "x-client-request-id", "x-session-affinity"] as const;
 
@@ -479,31 +484,42 @@ export interface ResolvedConversation {
  * first of them lives in this repository:
  *
  *  1. this function reads the names the host really uses -- it now does; and
- *  2. the value on those headers is the cell's `sessionKey`
- *     (`agent:<agentId>:<chatSessionId>`, `apps/cell/src/openclaw.ts`) rather
- *     than OpenClaw's own session record id.
+ *  2. the value on those headers names something `apps/cell` can resolve.
+ *
+ * BOTH ARE NOW TRUE, and (2) was made true in the OTHER direction from the one
+ * this block originally foresaw. It expected the host to start sending the
+ * cell's `sessionKey`; what landed instead is that the cell learned to resolve
+ * what the host already sends. See below.
  *
  * On (2) the measurement is that the host keys agent runs by that string but
  * stores them under a uuid: `agents/boekhouder/sessions/sessions.json` maps
  * `"agent:boekhouder:<chatSessionId>" -> { sessionId: "<uuid>" }`, and the
- * provider call site reads `ctx.params.session.id`. So today the headers are
- * expected to carry the uuid, `chatSessionFromAgentSessionKey` refuses it, and
- * this function stays on the `undefined` branch -- fail-closed, with one log
- * line saying so, which is the same behaviour the relay already has for a
- * hintless session (`tools/list` -> `{tools: []}`).
+ * provider call site reads `ctx.params.session.id`. So the headers carry the
+ * UUID, not the key.
  *
- * That refusal is deliberate and is the load-bearing half of this change.
- * `apps/cell/src/mcp-relay.ts` logs `bound: hint !== null` but resolves a
- * backend through `connectionByChatSession`, which only ever holds control-plane
- * chat session ids. A uuid written into `?session=` would log `bound: true` and
- * still answer every `tools/call` with `tenant_unavailable` -- a false green on
- * exactly the signal infra#327 is being diagnosed from.
+ * THIS BLOCK USED TO SAY THAT THE REFUSAL OF THAT UUID WAS "THE LOAD-BEARING
+ * HALF OF THIS CHANGE". IT NO LONGER IS, AND THE SENTENCE IS REPLACED RATHER
+ * THAN LEFT TO MISLEAD THE NEXT READER (review MINOR, b1006-2 loop A). What
+ * made the refusal right was a property of the OTHER repository:
+ * `apps/cell/src/mcp-relay.ts` logged `bound: hint !== null` while resolving
+ * backends through `connectionByChatSession`, which only ever held
+ * control-plane chat session ids -- so a uuid in `?session=` bought a
+ * `bound: true` log line over a `tenant_unavailable` answer, a false green on
+ * exactly the signal infra#327 is diagnosed from.
  *
- * Making (2) true is NOT this repository's to make: the cell's chat session id
- * has to reach the bridge, either by the host passing its session KEY to the
- * provider, or by `apps/cell` registering the host's session id as an alias for
- * the same exchange in its relay. Both are filed on infra#327; this function is
- * the end of it that belongs here, and it is ready for either.
+ * booqi-app/app#615 (MERGED, on `app` main) removed that property: the relay
+ * now registers the host session uuid as an ALIAS for the exchange it belongs
+ * to (`chatSessionByHostSession`), authored by the cell from `sessions.describe`
+ * rather than guessed. The uuid therefore NAMES an exchange, and infra#327 S4
+ * relaxed `chatSessionFromAgentSessionKey` to accept it -- strictly narrower
+ * than `chatSessionIdSchema`, because a uuid is schema-legal and deferring to
+ * the schema would accept arbitrary junk as a routing key.
+ *
+ * What remains fail-closed is everything else: a value that is neither the
+ * keyed form nor uuid-shaped still yields `undefined` and one log line saying
+ * so, the same branch a hintless request takes (`tools/list` -> `{tools: []}`).
+ * An alias is a LOOKUP, never an authorisation: a uuid-shaped value that no
+ * alias knows still serves nothing, which is `app#609` honoured structurally.
  */
 export function resolveConversation(
   req: IncomingMessage,

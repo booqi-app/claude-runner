@@ -1746,14 +1746,47 @@ const CHAT_SESSION_ID_SCHEMA = /^[A-Za-z0-9_-]{1,200}$/;
 
 const MEASURED_HOST_SESSION_UUID = "b66bdf67-0f4d-46d8-8051-4c9251fdde62";
 
-test("S4 AC-4: the measured host-session uuid is accepted and yielded verbatim", () => {
-  // Kill: revert the relaxation -> red.
-  const got = examineAgentSessionKey(MEASURED_HOST_SESSION_UUID);
-  assert.deepEqual(got.verdict, { kind: "accepted" });
-  assert.equal(got.chatSessionId, MEASURED_HOST_SESSION_UUID);
-  // Verbatim, because the cell's alias table is keyed by the exact string the
-  // host returned from `sessions.describe`.
-  assert.equal(chatSessionFromAgentSessionKey(MEASURED_HOST_SESSION_UUID), MEASURED_HOST_SESSION_UUID);
+/**
+ * STRUCTURALLY DISTINCT host-session uuids -- finding F-V1, closed on BOTH
+ * projections of the classifier rather than only on `resolveConversation`.
+ *
+ * The suite held exactly one uuid literal, so a constant-returning
+ * implementation was indistinguishable from a correct one. Verbatim-ness across
+ * distinct values is the property `apps/cell`'s alias table depends on, and the
+ * list doubles as the only arm the deliberately unconstrained version and
+ * variant nibbles have.
+ */
+const HOST_SESSION_UUIDS = [
+  MEASURED_HOST_SESSION_UUID,                 // v4, variant 8 -- the measured one
+  "00000000-0000-0000-0000-000000000000",     // the nil uuid, admitted on purpose
+  "ffffffff-ffff-ffff-ffff-ffffffffffff",     // every nibble f
+  "0c4fbf75-1234-1abc-0def-0123456789ab",     // version nibble 1, variant nibble 0
+  "9a8b7c6d-5e4f-7a3b-c2d1-e0f918273645",     // version nibble 7, variant nibble c
+  "deadbeef-0000-9999-ffff-012345678900",     // mixed, trailing zeroes
+] as const;
+
+test("S4 AC-4: every host-session uuid shape is accepted and yielded VERBATIM", () => {
+  // Kill: revert the relaxation -> red. Kill: return a constant instead of
+  // `key` -> red on every member but the first (finding F-V1; a single
+  // exemplar could not see this).
+  assert.equal(new Set(HOST_SESSION_UUIDS).size, HOST_SESSION_UUIDS.length, "the population must be distinct");
+  assert.ok(HOST_SESSION_UUIDS.length >= 3);
+  for (const uuid of HOST_SESSION_UUIDS) {
+    const got = examineAgentSessionKey(uuid);
+    assert.deepEqual(got.verdict, { kind: "accepted" }, `not accepted: ${uuid}`);
+    assert.equal(got.chatSessionId, uuid, `not verbatim: ${uuid}`);
+    // Verbatim through the projection too, because the cell's alias table is
+    // keyed by the exact string the host returned from `sessions.describe`.
+    assert.equal(chatSessionFromAgentSessionKey(uuid), uuid, `projection not verbatim: ${uuid}`);
+  }
+  // The version and variant nibbles are NOT constrained, and that is a
+  // decision rather than an oversight: the cell never interprets this value,
+  // it only looks it up. Stated as an arm so the next reader finds the reason
+  // instead of "tightening" it and fail-closing on real host uuids.
+  const versions = new Set(HOST_SESSION_UUIDS.map((u) => u[14]));
+  assert.ok(versions.size >= 3, `the population must exercise several version nibbles, got ${[...versions].join(",")}`);
+  const variants = new Set(HOST_SESSION_UUIDS.map((u) => u[19]));
+  assert.ok(variants.size >= 3, `the population must exercise several variant nibbles, got ${[...variants].join(",")}`);
 });
 
 test("S4 AC-4: the uuid matcher is STRICTLY NARROWER than chatSessionIdSchema", () => {
