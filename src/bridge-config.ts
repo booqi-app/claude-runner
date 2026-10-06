@@ -472,16 +472,57 @@ const AGENT_SESSION_KEY = /^agent:[^:]+:([\s\S]+)$/;
 const CHAT_SESSION_ID = /^[A-Za-z0-9_-]{1,200}$/;
 
 /**
+ * OpenClaw's own session RECORD id, as the host mints one.
+ *
+ * STRICTLY NARROWER THAN {@link CHAT_SESSION_ID}, AND THAT IS THE WHOLE POINT
+ * (booqi-app/infra#327 AC-4). A uuid IS a valid chat session id by the control
+ * plane's schema -- `/^[A-Za-z0-9_-]+$/.test("b66bdf67-0f4d-46d8-8051-4c9251fdde62")`
+ * is `true` -- so "accept anything the schema admits" would accept arbitrary
+ * caller junk as a routing key and would not be a relaxation at all, it would
+ * be the removal of the guard. This matches uuid SHAPE: five hyphen-separated
+ * hex groups of exactly 8-4-4-4-12.
+ *
+ * LOWER-CASE HEX ONLY, deliberately. The host writes these into
+ * `agents/<id>/sessions/sessions.json` lower-cased, and `apps/cell`'s alias
+ * table (`chatSessionByHostSession`, app#615) is keyed by the exact string
+ * `sessions.describe` returned. Accepting `B66BDF67-...` would produce a hint
+ * that misses that map -- i.e. a `bound: true` log line over a
+ * `tenant_unavailable` answer, the precise false green this guard exists to
+ * prevent. An upper-case uuid is refused, and an arm pins it.
+ *
+ * The version and variant nibbles are NOT constrained. The cell never
+ * interprets this value; it only looks it up. Refusing a uuid the host really
+ * minted because we disagreed about its version field would be a fail-closed
+ * bug with no compensating benefit, and the narrowness AC is already satisfied
+ * by the shape.
+ */
+const HOST_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
  * Recover the chat session id from an OpenClaw agent session key.
  *
- * Returns `undefined` for anything that is not that key shape -- which is the
- * whole point of the function and not a defensive afterthought. OpenClaw's
- * session-affinity headers carry its own session RECORD id (a uuid) whenever
- * the agent run was not keyed, and `apps/cell`'s relay cannot resolve a uuid:
- * its `connectionByChatSession` map is keyed by the control plane's chat
- * session id. Writing a uuid into `?session=` would buy a `bound: true` log
- * line and a `tenant_unavailable` answer behind it. Absent is the honest
- * value; see `SessionHintContext.chatSessionId`.
+ * Accepts TWO shapes and nothing else, and the second one arrived with S4:
+ *
+ *  1. the cell's agent session key, `agent:<agentId>:<chatSessionId>`, which
+ *     is unwrapped to its tail; and
+ *  2. a bare OpenClaw session RECORD id -- a uuid -- which is taken verbatim,
+ *     because `apps/cell`'s relay now registers it as an alias for the
+ *     exchange it belongs to (`chatSessionByHostSession`, booqi-app/app#615).
+ *
+ * Everything else returns `undefined`, which is the whole point of the
+ * function and not a defensive afterthought. Before the alias existed, (2) was
+ * refused on purpose: a uuid the relay could not resolve would have bought a
+ * `bound: true` log line and a `tenant_unavailable` answer behind it. The
+ * refusal was load-bearing then; the alias is what makes accepting it honest
+ * now, and the uuid matcher is strictly narrower than {@link CHAT_SESSION_ID}
+ * so that this is a relaxation and not the removal of the guard.
+ *
+ * Absent is still a state; see `SessionHintContext.chatSessionId`.
+ *
+ * ONLY the session-affinity headers reach this function. The caller channels
+ * in `resolveConversation` go through `normaliseChatSessionId` and are taken
+ * verbatim, unwrapped by nothing -- `test/claude-bridge.test.ts` pins that
+ * asymmetry and explains why a caller-supplied value must not be unwrapped.
  */
 export function chatSessionFromAgentSessionKey(value: unknown): string | undefined {
   return examineAgentSessionKey(value).chatSessionId;
@@ -555,6 +596,28 @@ export function examineAgentSessionKey(value: unknown): AgentSessionKeyExaminati
   }
   const match = AGENT_SESSION_KEY.exec(key);
   if (match === null) {
+    // THE S4 RELAXATION (booqi-app/infra#327 part (iii)).
+    //
+    // A bare host-session uuid is now a NAME the relay can route on, because
+    // `apps/cell`'s relay registers it as an alias for the exchange it belongs
+    // to (`chatSessionByHostSession`, booqi-app/app#615, merged). Before that
+    // alias existed this value was unresolvable and accepting it would have
+    // bought a `bound: true` log line over a `tenant_unavailable` answer --
+    // which is why the refusal was correct then and is wrong now.
+    //
+    // THE ORDER IS LOAD-BEARING AND IS ENFORCED OUTSIDE THIS REPOSITORY.
+    // `docker/cell/Dockerfile:121` in `booqi-app/infra` pins the runner by
+    // SHA, so this relaxation reaches no cell until that pin is bumped (S5).
+    // That is the mechanism by which PO ruling infra#327#issuecomment-5981950365
+    // -- "the relaxation and the alias in the same change, never before" --
+    // survives the fact that the two live in different repositories.
+    //
+    // It is NOT a widening to `CHAT_SESSION_ID`: see {@link HOST_SESSION_UUID}.
+    // An opaque value that is not uuid-shaped is still refused, under the same
+    // rule name as before, so the S1 report does not lose a world.
+    if (HOST_SESSION_UUID.test(key)) {
+      return { chatSessionId: key, verdict: { kind: "accepted" } };
+    }
     return {
       chatSessionId: undefined,
       verdict: { kind: "refused", rule: "not-an-agent-session-key" },

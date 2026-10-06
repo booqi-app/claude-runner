@@ -452,6 +452,34 @@ test("a caller-named chat session becomes the hint, by header or by body", () =>
 // answered `tenant_unavailable` behind a log line claiming it was bound. The
 // fail-closed branch is diagnosable; that one is not.
 
+// ── S4: a bare host-session uuid is now a NAME (infra#327 part (iii)) ──
+//
+// The refusal the block above describes was correct while `apps/cell`'s relay
+// had nothing to resolve a uuid against. booqi-app/app#615 (MERGED, on `app`
+// main) registers the host session uuid as an ALIAS for the exchange it
+// belongs to, so the value is resolvable and refusing it now LOSES the demo
+// path rather than protecting it.
+//
+// Two exemplars are used throughout, and keeping them distinct is the point:
+// the uuid is the value the host really sends and is now ACCEPTED, while an
+// opaque non-uuid value is still REFUSED under the unchanged rule name. Every
+// arm below that merely needs "something refused" uses the second one, so that
+// S1's ABSENT-vs-REFUSED arms keep testing what they were written to test
+// instead of silently becoming S4 arms.
+
+/** The literal uuid measured in the reference cell's `sessions.json`. */
+const MEASURED_HOST_SESSION_UUID = "b66bdf67-0f4d-46d8-8051-4c9251fdde62";
+
+/**
+ * Opaque, present, and still refused after S4.
+ *
+ * Deliberately a value that `chatSessionIdSchema` would ADMIT
+ * (`/^[A-Za-z0-9_-]+$/`) -- see the narrowness arm in
+ * `test/bridge-config.test.ts`. If the uuid matcher is ever widened to that
+ * schema, this constant is accepted and the arms using it go red.
+ */
+const OPAQUE_NOT_A_UUID = "not-a-uuid-just-words";
+
 test("an affinity header carrying the cell's session key yields the chat session", () => {
   for (const header of ["session_id", "x-client-request-id", "x-session-affinity"]) {
     const resolved = resolveConversation(reqWith({ [header]: "agent:boekhouder:chat-7" }), {});
@@ -460,16 +488,66 @@ test("an affinity header carrying the cell's session key yields the chat session
   }
 });
 
-test("an opaque OpenClaw session id on an affinity header is refused, not written", () => {
-  // The literal uuid measured in the reference cell's sessions.json.
-  for (const header of ["session_id", "x-client-request-id", "x-session-affinity"]) {
+test("AC-4: a host-session uuid on an affinity header is ACCEPTED and written", () => {
+  // THE INVERSION. This arm previously asserted the exact opposite, and was
+  // left in place by its author so that landing part (iii) would be DETECTED
+  // rather than announced. It is inverted here, not deleted -- the negative
+  // case it used to carry now lives in the arm directly below, which keeps a
+  // non-uuid opaque value refused.
+  //
+  // Kill: revert the relaxation in `examineAgentSessionKey` -> red.
+  for (const header of SESSION_AFFINITY_HEADERS) {
     const resolved = resolveConversation(
-      reqWith({ [header]: "b66bdf67-0f4d-46d8-8051-4c9251fdde62" }),
+      reqWith({ [header]: MEASURED_HOST_SESSION_UUID }),
       {},
     );
-    assert.equal(resolved.chatSessionId, undefined, `uuid accepted from ${header}`);
-    assert.equal(resolved.conversationId, "default");
+    assert.equal(
+      resolved.chatSessionId,
+      MEASURED_HOST_SESSION_UUID,
+      `uuid not accepted from ${header}`,
+    );
+    // Taken VERBATIM. The cell's alias table is keyed by the exact string
+    // `sessions.describe` returned, so any transform here would miss it.
+    assert.equal(resolved.conversationId, MEASURED_HOST_SESSION_UUID);
+    const entry = resolved.affinityHeaders.find((e) => e.header === header)!;
+    assert.equal(entry.verdict.kind, "accepted", `${header} not reported accepted`);
   }
+});
+
+test("AC-4: an opaque value that is NOT uuid-shaped is still refused, not written", () => {
+  // The negative half of the inversion above, and the arm that makes S4 a
+  // relaxation rather than the removal of the guard.
+  //
+  // Kill: widen the uuid matcher to `[A-Za-z0-9_-]+` (i.e. to
+  // `chatSessionIdSchema`) -> red. That mutant is the one this AC exists for:
+  // a uuid IS a valid chat session id by that schema, so "accept what the
+  // schema admits" accepts arbitrary caller junk as a routing key.
+  for (const header of SESSION_AFFINITY_HEADERS) {
+    const resolved = resolveConversation(reqWith({ [header]: OPAQUE_NOT_A_UUID }), {});
+    assert.equal(resolved.chatSessionId, undefined, `junk accepted from ${header}`);
+    assert.equal(resolved.conversationId, "default");
+    const entry = resolved.affinityHeaders.find((e) => e.header === header)!;
+    assert.equal(entry.verdict.kind, "refused", `${header} must stay refused`);
+    assert.equal(
+      entry.verdict.kind === "refused" ? entry.verdict.rule : undefined,
+      "not-an-agent-session-key",
+      "the rule name must not change: S1's report would lose a world",
+    );
+  }
+});
+
+test("AC-4: an accepted agent session key still wins over a uuid on a later header", () => {
+  // The routing rule is unchanged -- "first that unwraps wins" -- and the uuid
+  // becoming acceptable must not reorder it. Kill: make the uuid branch
+  // short-circuit the loop in `examineAffinityChatSession`.
+  const resolved = resolveConversation(
+    reqWith({
+      "session_id": "agent:boekhouder:chat-keyed",
+      "x-session-affinity": MEASURED_HOST_SESSION_UUID,
+    }),
+    {},
+  );
+  assert.equal(resolved.chatSessionId, "chat-keyed");
 });
 
 test("a caller-named chat session wins over an affinity header", () => {
@@ -959,9 +1037,11 @@ test("AC-1 arm: a header that was never sent is ABSENT, per name", () => {
 
 test("AC-1 arm: a header that WAS sent and rejected is present-but-refused, with the rule named", () => {
   // Kill: drop the rule from the verdict, or report `absent` for a refusal.
-  // The literal uuid measured in the reference cell's sessions.json -- the
-  // exact value route A would start sending.
-  const uuid = "b66bdf67-0f4d-46d8-8051-4c9251fdde62";
+  // An opaque non-uuid value. This arm is about ABSENT-vs-REFUSED, not about
+  // which values are refused; it used the measured uuid until S4 made that
+  // value ACCEPTED, so it now uses a value that is still refused under the
+  // same rule. The intent of the arm is unchanged.
+  const uuid = OPAQUE_NOT_A_UUID;
   for (const header of SESSION_AFFINITY_HEADERS) {
     const resolved = resolveConversation(reqWith({ [header]: uuid }), {});
     const entry = resolved.affinityHeaders.find((e) => e.header === header)!;
@@ -1018,7 +1098,10 @@ for (const stream of [false, true]) {
     // THE arm that matters. An implementation that merely adds nouns to the
     // message survives every other arm here and dies on this one, because
     // before S1 these two runs produced the byte-identical string.
-    const uuid = "b66bdf67-0f4d-46d8-8051-4c9251fdde62";
+    // Still-refused exemplar: see `OPAQUE_NOT_A_UUID`. Was the measured uuid
+    // before S4 made that accepted; the two worlds this arm separates are
+    // ABSENT and REFUSED, which is untouched by S4.
+    const uuid = OPAQUE_NOT_A_UUID;
     const absentRun = await run({
       systemPrompt: undefined, behaviour: "success", stream,
       bridgeConfig: configWithMcp,
@@ -1078,7 +1161,7 @@ for (const stream of [false, true]) {
       systemPrompt: undefined, behaviour: "success", stream,
       bridgeConfig: configWithMcp,
       affinityHeaders: resolveConversation(
-        reqWith({ "session_id": "b66bdf67-0f4d-46d8-8051-4c9251fdde62" }), {},
+        reqWith({ "session_id": OPAQUE_NOT_A_UUID }), {},
       ).affinityHeaders,
     });
     assert.equal(logs.length, 1);
@@ -1148,9 +1231,12 @@ test("S1 JOIN: a real request with NO affinity header logs ABSENT, per header na
   assert.equal(/UNAVAILABLE/.test(logs[0]), false, `the report did not reach the log line: ${logs[0]}`);
 });
 
-test("S1 JOIN: a real request carrying the measured uuid logs present-but-refused, with the rule", async () => {
+test("S1 JOIN: a real request carrying an opaque non-uuid logs present-but-refused, with the rule", async () => {
   // Kill: the same deletion, and also any collapse of ABSENT into refused.
-  const uuid = "b66bdf67-0f4d-46d8-8051-4c9251fdde62";
+  // Re-pointed by S4 from the measured uuid, which is now accepted; the
+  // present-but-refused world this arm pins still exists and is reached by any
+  // opaque value that is not uuid-shaped.
+  const uuid = OPAQUE_NOT_A_UUID;
   const { logs } = await driveCompletions({ "session_id": uuid });
   assert.equal(logs.length, 1);
   assert.match(logs[0], /examined 3 session-affinity header names: 0 accepted, 1 present-but-refused, 2 ABSENT/);
@@ -1162,10 +1248,30 @@ test("S1 JOIN: a real request carrying the measured uuid logs present-but-refuse
 test("S1 JOIN: the two worlds produce DIFFERENT lines through the real entry point", async () => {
   // The decisive arm, now over the production wire rather than a hand-built report.
   const absent = await driveCompletions({});
-  const refused = await driveCompletions({
-    "session_id": "b66bdf67-0f4d-46d8-8051-4c9251fdde62",
-  });
+  const refused = await driveCompletions({ "session_id": OPAQUE_NOT_A_UUID });
   assert.notEqual(absent.logs[0], refused.logs[0]);
+});
+
+test("S4 JOIN: the measured host-session uuid reaches the SDK url as ?session=", async () => {
+  // THE END-TO-END AC. Through `handleCompletions`, the real entry point: the
+  // value the host actually sends now produces a hint on the MCP url, which is
+  // the string `apps/cell`'s alias table (app#615) is keyed by.
+  //
+  // Kill: revert the relaxation -> this goes red and the hintless line returns.
+  const { logs, captured } = await driveCompletions({
+    "session_id": MEASURED_HOST_SESSION_UUID,
+  });
+  assert.equal(captured.length, 1);
+  assert.equal(
+    new URL(captured[0].options.mcpServers.booqi.url).searchParams.get("session"),
+    MEASURED_HOST_SESSION_UUID,
+    "the uuid did not reach the SDK url verbatim",
+  );
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /wrote the chat-session hint/);
+  // The hint was written, so the hintless examination report is deliberately
+  // absent from this line -- unchanged S1 behaviour.
+  assert.equal(/ABSENT/.test(logs[0]), false);
 });
 
 test("S1 JOIN: an accepted affinity header routes, and the hint reaches the SDK url", async () => {
