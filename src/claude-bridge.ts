@@ -609,8 +609,10 @@ export async function executeWithRetries(
   chatSessionId?: string,
   /**
    * The per-header affinity verdicts, for the one log line. Defaulted so the
-   * unit suite's existing direct callers keep compiling; an empty report makes
-   * the line say exactly what it said before, never a fabricated `ABSENT`.
+   * unit suite's existing direct callers keep compiling. An empty report is
+   * rendered as an explicit `UNAVAILABLE` marker -- deliberately NOT as the
+   * pre-S1 string, so a missing report cannot impersonate an undeployed
+   * build -- and never as a fabricated `ABSENT`.
    */
   affinityHeaders: readonly AffinityHeaderExamination[] = [],
 ): Promise<void> {

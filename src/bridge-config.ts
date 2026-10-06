@@ -412,8 +412,9 @@ export interface SessionHintContext {
    *
    * Carried so the ONE log line can report what it EXAMINED rather than only
    * that it found nothing. Optional because `buildQueryOptions` has callers
-   * that never saw an HTTP request; an omitted report degrades the line to
-   * what it said before this field existed, it does not fabricate `ABSENT`.
+   * that never saw an HTTP request; an omitted report renders an explicit
+   * `UNAVAILABLE` marker rather than degrading to the pre-S1 string, and it
+   * never fabricates `ABSENT`.
    */
   affinityHeaders?: readonly AffinityHeaderExamination[] | undefined;
   /** Where the one line about the outcome goes. */
@@ -542,7 +543,7 @@ export interface AgentSessionKeyExamination {
  *
  * `undefined` in means `not-a-string`, which is NOT the same as `absent`: only
  * the CALLER knows whether the header was sent at all. See
- * {@link examineAffinityHeaderValues}.
+ * {@link examineAffinityHeaders}.
  */
 export function examineAgentSessionKey(value: unknown): AgentSessionKeyExamination {
   if (typeof value !== "string") {
@@ -611,11 +612,14 @@ export function examineAgentSessionKey(value: unknown): AgentSessionKeyExaminati
  * was also present and also refused" is exactly the fact that tells an
  * operator whether the host is sending these at all.
  *
- * Absence is decided HERE and nowhere else. Node gives `undefined` for a
- * header it did not receive and never for one it did -- repeated headers of
- * these names arrive joined with ", " into one string -- so `undefined` is a
- * sound absence test, and it is the only thing that can tell `ABSENT` from
- * {@link AffinityRefusalRule} `not-a-string`.
+ * Absence is decided HERE and nowhere else, and it is decided by
+ * `Object.hasOwn` rather than by an `undefined` index lookup -- see the
+ * comment on the check itself for why the distinction is load-bearing. Node
+ * gives no value at all for a header it did not receive and never `undefined`
+ * for one it did (repeated headers of these names arrive joined with ", " into
+ * one string, and an empty one arrives as ""), so own-ness plus an
+ * `undefined`-value check is a sound absence test. It is the only thing that
+ * can tell `ABSENT` from {@link AffinityRefusalRule} `not-a-string`.
  *
  * @param names   the header names to examine, in priority order
  * @param headers a lower-cased header bag (`IncomingMessage.headers`)
