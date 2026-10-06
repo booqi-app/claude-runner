@@ -391,7 +391,21 @@ const claudeRunnerPlugin = {
       discovery: {
         order: "late",
         run: async (ctx: ProviderDiscoveryContext) => {
-          const explicit = ctx.config.models?.providers?.[PROVIDER_ID];
+          // Resolved the way the HOST resolves it, not by exact key. OpenClaw
+          // finds the configured provider through `findNormalizedProviderValue`
+          // (`packages/model-catalog-core/src/provider-id.ts:6,15-28`), which is
+          // `trim().toLowerCase()`, reached via
+          // `models-config.providers.implicit.ts:326-339` and `:447-459`. An
+          // exact-key lookup here diverges on any case or whitespace variant:
+          // the plugin would take the plugin-advertised branch and report the
+          // override ACTIVE while the host took the discarding branch. That is
+          // the silent-reassurance failure this slice exists to prevent, so the
+          // two lookups are deliberately the same lookup.
+          const configuredProviders = ctx.config.models?.providers ?? {};
+          const explicitKey = Object.keys(configuredProviders).find(
+            (key) => key.trim().toLowerCase() === PROVIDER_ID,
+          );
+          const explicit = explicitKey ? configuredProviders[explicitKey] : undefined;
           if (explicit && Array.isArray(explicit.models) && explicit.models.length > 0) {
             await ensureBridgeRunning(ctx, bridgeOpts);
             reportSessionAffinityRoute(ctx, "config-declared", explicit.models.length);

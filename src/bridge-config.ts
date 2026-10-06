@@ -1037,6 +1037,20 @@ export type ExtensionBridgeOptions = Omit<BridgeConfig, "workDir">;
  * this slice cannot afford, so it is reported instead of hoped about -- the same
  * discipline as the S1 affinity line, which reports what it EXAMINED rather
  * than asserting an outcome.
+ *
+ * 🔴 AND THE REMEDY IS NARROW, measured. The remedy is `"models": []`, NOT the
+ * deletion of the key. `ModelProvidersSchema.superRefine`
+ * (`src/config/zod-schema.core.ts:559-567`) raises "custom model providers must
+ * declare models" for any provider that is not in
+ * `BUILT_IN_MODEL_PROVIDER_OVERLAY_IDS` (`:435-515`), and `claude-runner` is not
+ * in that list -- `grep -ac claude-runner` over that file returns 0. An invalid
+ * config is `EXIT_CONFIG_ERROR` 78 (`src/cli/gateway-cli/run.ts:82,453`), which
+ * is ALSO `SYSTEMD_NO_RESTART_EXIT_STATUS` (`src/daemon/service-runtime.ts:44`),
+ * so the cell does not crash-loop -- it stays DOWN until a human intervenes.
+ * An earlier version of this line told the operator to delete the key. A line
+ * addressed to whoever is debugging an empty `tools/list` must not be the thing
+ * that takes the cell down, so the message states both the working remedy and
+ * the trap.
  */
 export type SessionAffinityRoute = "plugin-advertised" | "config-declared";
 
@@ -1089,9 +1103,13 @@ export function sessionAffinityOverrideMessage(report: SessionAffinityOverrideRe
     + ` implicit-provider merge replaces the discovered models array with the config one`
     + ` (models-config.providers.implicit.ts:287-294), so compat.sendSessionAffinityHeaders`
     + ` never reaches the request and the cell gateway will keep answering tools/list with`
-    + ` an empty list. REMEDY: delete the "models" array from that provider entry in`
-    + ` openclaw.json and let this plugin advertise its catalog instead; the override takes`
-    + ` effect on that route. ${tail}.`
+    + ` an empty list. REMEDY: set that provider entry's "models" to an EMPTY ARRAY`
+    + ` ("models": []) in openclaw.json -- do NOT delete the key. An empty array routes`
+    + ` this plugin to its own advertised catalog, where the override does take effect.`
+    + ` DELETING the key fails config validation ("custom model providers must declare`
+    + ` models"), because claude-runner is not a bundled provider overlay, and the gateway`
+    + ` then exits 78 -- which is also systemd's no-restart status, so the cell stays DOWN`
+    + ` until a human intervenes. ${tail}.`
   );
 }
 

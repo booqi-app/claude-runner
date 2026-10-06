@@ -56,7 +56,7 @@ const PROVIDER_ID = "claude-runner";
 const AFFINITY_HEADERS = ["session_id", "x-client-request-id", "x-session-affinity"] as const;
 
 /** Every arm asserts; this is the count the self-check at the bottom enforces. */
-const EXPECTED_ARMS = 28;
+const EXPECTED_ARMS = 32;
 let armsRun = 0;
 const arm = (name: string, fn: () => void | Promise<void>) =>
   test(name, async () => {
@@ -664,7 +664,9 @@ arm("R1 config-declared route logs on the ERROR channel, with 0 effective and th
   assert.ok(line, `no session-affinity verdict on the error channel; got ${JSON.stringify(logs)}`);
   assert.match(line!, /WILL BE DISCARDED/);
   assert.match(line!, /examined 3 model rows: 0 effective, 3 discarded-by-host\./);
-  assert.match(line!, /REMEDY: delete the "models" array/);
+  assert.match(line!, /REMEDY: set that provider entry's "models" to an EMPTY ARRAY/);
+  assert.match(line!, /do NOT delete the key/);
+  assert.match(line!, /exits 78/);
   assert.equal(
     logs.info.some((l) => l.includes("session-affinity override ACTIVE")),
     false,
@@ -691,6 +693,33 @@ arm("R2 plugin-advertised route logs on the INFO channel and leaves the error ch
   );
 });
 
+arm("R4 a case-variant provider key is resolved the way the HOST resolves it", async () => {
+  // The host finds the configured provider via trim().toLowerCase()
+  // (provider-id.ts:6,15-28), so `"Claude-Runner"` with models IS the
+  // discarding branch for the host. An exact-key lookup in the plugin would
+  // miss it, take the plugin-advertised branch and report the override ACTIVE
+  // while the host discarded it -- silent reassurance, the exact failure this
+  // slice exists to prevent.
+  const { out, logs } = await runDiscoveryLogged({
+    models: { providers: { "  Claude-Runner ": structuredClone(CELL_PROVIDER_ENTRY) } },
+    plugins: { entries: { "claude-runner": { enabled: true } } },
+  });
+  assert.equal(
+    (out!.provider.models as AnyRec[]).length,
+    3,
+    "the variant key was not resolved, so the plugin took the wrong branch",
+  );
+  assert.ok(
+    logs.error.some((l) => l.includes("WILL BE DISCARDED")),
+    `reported the wrong route for a variant key: ${JSON.stringify(logs)}`,
+  );
+  assert.equal(
+    logs.info.some((l) => l.includes("ACTIVE on the plugin-advertised")),
+    false,
+    "claimed the override was active while the host discards it",
+  );
+});
+
 arm("R3 the verdict counts the rows the HOST will use, not the rows the plugin knows", async () => {
   // The cell declares 3; the plugin advertises 4. A report that counted its own
   // catalog would say 4 and be wrong about the cell.
@@ -704,6 +733,79 @@ arm("R3 the verdict counts the rows the HOST will use, not the rows the plugin k
     3,
     "the two catalogues happen to be the same size, so this arm proves nothing",
   );
+});
+
+// ---------------------------------------------------------------------------
+// V. THE REMEDY IS VALIDATED AGAINST THE HOST'S OWN RULE
+//
+// An earlier head of this PR printed "delete the models array". Measured:
+// `ModelProvidersSchema.superRefine` (`src/config/zod-schema.core.ts:559-567`)
+// raises "custom model providers must declare models" for any provider not in
+// `BUILT_IN_MODEL_PROVIDER_OVERLAY_IDS` (`:435-515`), and `claude-runner` is
+// not in that list. An invalid config is EXIT_CONFIG_ERROR 78, which is also
+// SYSTEMD_NO_RESTART_EXIT_STATUS -- the cell stays DOWN, it does not even
+// crash-loop. A remedy addressed to whoever is debugging an empty tools/list
+// must not be the thing that takes the cell down, so the remedy string itself
+// is now an asserted artefact.
+// ---------------------------------------------------------------------------
+
+/** zod-schema.core.ts:559-567, for a provider that is not a bundled overlay. */
+function hostAcceptsProviderEntry(entry: AnyRec): boolean {
+  return typeof entry.baseUrl === "string" && Array.isArray(entry.models);
+}
+
+arm("V1 the printed remedy produces a config the host ACCEPTS", async () => {
+  const entry = structuredClone(CELL_PROVIDER_ENTRY) as AnyRec;
+  entry.models = []; // what the line now tells the operator to do
+  assert.equal(hostAcceptsProviderEntry(entry), true, "the remedy yields an invalid config");
+});
+
+arm("V2 the remedy the line explicitly warns against would be REJECTED", async () => {
+  // The negative control on V1. Without it V1 could pass against a predicate
+  // that accepts everything.
+  const entry = structuredClone(CELL_PROVIDER_ENTRY) as AnyRec;
+  delete entry.models; // the advice an earlier head of this PR printed
+  assert.equal(
+    hostAcceptsProviderEntry(entry),
+    false,
+    "deleting the key is accepted after all -- re-read zod-schema.core.ts:559-567",
+  );
+  const { logs } = await runDiscoveryLogged(cellConfig());
+  const line = logs.error.find((l) => l.includes("session-affinity override"))!;
+  assert.equal(
+    /REMEDY: delete the/.test(line),
+    false,
+    "the line still tells the operator to delete the key",
+  );
+});
+
+arm("V3 the remedy actually routes to the branch where the override works", async () => {
+  // End to end on the remedy itself: apply it, run the real discovery.run, run
+  // the measured host merge, and require the flag on the wire.
+  const entry = structuredClone(CELL_PROVIDER_ENTRY) as AnyRec;
+  entry.models = [];
+  const config = {
+    models: { providers: { [PROVIDER_ID]: entry } },
+    plugins: { entries: { "claude-runner": { enabled: true } } },
+  };
+  const { out, logs } = await runDiscoveryLogged(config);
+  assert.ok(
+    logs.info.some((l) => l.includes("ACTIVE on the plugin-advertised model catalog")),
+    `the remedy did not route to the working branch: ${JSON.stringify(logs)}`,
+  );
+  const merged = hostMergeImplicitProvider({
+    providerId: PROVIDER_ID,
+    existing: entry,
+    implicit: out!.provider,
+  });
+  const models = merged.models as AnyRec[];
+  assert.ok(models.length > 0, "the merge kept the empty config array");
+  for (const m of models) {
+    const received = await overTheWire(wireHeadersFor(m, SESSION));
+    for (const h of AFFINITY_HEADERS) {
+      assert.equal(received[h], SESSION, `after the remedy, ${m.id}: ${h} never arrived`);
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------
