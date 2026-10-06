@@ -3,6 +3,22 @@
   "name": "Claude Code Runner",
   "description": "Uses Claude Agent SDK as a local provider — delegates all reasoning, tool use, and file editing to the SDK.",
   "providers": ["claude-runner"],
+  "modelCatalog": {
+    "runtimeAugment": true,
+    "providers": {
+      "claude-runner": {
+        "baseUrl": "http://127.0.0.1:7779/v1",
+        "api": "openai-completions",
+        "models": [
+          { "id": "claude-opus-4-6", "compat": { "sendSessionAffinityHeaders": true } },
+          { "id": "claude-opus-4-5", "compat": { "sendSessionAffinityHeaders": true } },
+          { "id": "claude-sonnet-4-6", "compat": { "sendSessionAffinityHeaders": true } },
+          { "id": "claude-sonnet-4", "compat": { "sendSessionAffinityHeaders": true } },
+          { "id": "claude-haiku-4-5", "compat": { "sendSessionAffinityHeaders": true } }
+        ]
+      }
+    }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
