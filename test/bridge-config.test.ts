@@ -1687,3 +1687,40 @@ test("AC-1 arm: the hintless log line carries the examination; the hinted one do
   // does not fabricate ABSENT.
   assert.equal(/ABSENT/.test(unhintedMcpServersMessage(["booqi"], false)), false);
 });
+
+test("AC-1 arm: an omitted report renders UNAVAILABLE, never silence", () => {
+  // Kill: fall back to the pre-S1 string when no report was threaded through.
+  // Silence would be BYTE-IDENTICAL to a pre-S1 build, so an operator reading
+  // `docker logs` could not tell "the old image is still deployed" from "the
+  // new image is deployed and the wiring is broken". This line is the
+  // measurement instrument for the whole infra#327 chain-head reading; it must
+  // not have a failure mode that impersonates the old world.
+  const bare = unhintedMcpServersMessage(["booqi"], false);
+  assert.match(bare, /affinity-header examination UNAVAILABLE/);
+  assert.equal(/ABSENT/.test(bare), false, "an empty report must not fabricate ABSENT");
+
+  // The hinted/unparseable-URL branch stays silent about affinity: those
+  // verdicts decided nothing there.
+  assert.equal(/UNAVAILABLE/.test(unhintedMcpServersMessage(["booqi"], true)), false);
+});
+
+test("AC-1 arm: ABSENT is decided by hasOwn, not by a prototype lookup", () => {
+  // Kill: `headers[name] === undefined`. `IncomingMessage.headers` is NOT a
+  // null-prototype object, so a header name colliding with `Object.prototype`
+  // would read as PRESENT and be refused `not-a-string` while never having
+  // been sent -- the exact ABSENT/refused confusion this slice removes.
+  for (const name of ["constructor", "toString", "valueOf", "hasOwnProperty"]) {
+    const [entry] = examineAffinityHeaders([name], {});
+    assert.deepEqual(
+      entry.verdict,
+      { kind: "absent" },
+      `${name} was read off the prototype and reported as present`,
+    );
+  }
+  // A genuinely present value of such a name is still examined normally.
+  const [present] = examineAffinityHeaders(["toString"], { toString: "agent:a:chat-7" });
+  assert.deepEqual(present.verdict, { kind: "accepted" });
+  // ...and an explicit `undefined` own-property is still ABSENT, not a refusal.
+  const [explicit] = examineAffinityHeaders(["session_id"], { session_id: undefined });
+  assert.deepEqual(explicit.verdict, { kind: "absent" });
+});

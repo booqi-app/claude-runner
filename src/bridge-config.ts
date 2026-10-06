@@ -625,6 +625,16 @@ export function examineAffinityHeaders(
   headers: Record<string, unknown>,
 ): AffinityHeaderExamination[] {
   return names.map((header) => {
+    // `Object.hasOwn`, not `headers[header] === undefined`. `IncomingMessage.headers`
+    // is NOT a null-prototype object, so a header name that collides with
+    // something on `Object.prototype` -- `constructor`, `toString`, `valueOf` --
+    // would read as PRESENT and be refused `not-a-string` while never having
+    // been sent. That is exactly the ABSENT/refused confusion this slice exists
+    // to remove, so it is closed here rather than left to the next person who
+    // adds a header name. (Review finding, b1006-1 loop F.)
+    if (!Object.hasOwn(headers, header)) {
+      return { header, verdict: { kind: "absent" } as AffinityVerdict };
+    }
     const raw = headers[header];
     if (raw === undefined) return { header, verdict: { kind: "absent" } as AffinityVerdict };
     return { header, verdict: examineAgentSessionKey(raw).verdict };
@@ -808,8 +818,16 @@ export function unhintedMcpServersMessage(
   // separates them. Only rendered when there is no identifier: when the
   // identifier came from a NON-affinity channel the affinity verdicts did not
   // decide anything and reporting them would read as if they had.
-  const affinitySuffix = !haveIdentifier && affinityHeaders.length > 0
-    ? ` ${affinityExaminationSummary(affinityHeaders)}.`
+  // An EMPTY report renders as an explicit "unavailable", never as silence.
+  // Silence here would be byte-identical to a pre-S1 build, so an operator
+  // reading `docker logs` could not tell "the old image is still deployed"
+  // from "the new image is deployed and the report was not threaded through".
+  // This line is the measurement instrument for the whole infra#327 chain-head
+  // reading; it must not have a failure mode that looks like the old world.
+  const affinitySuffix = !haveIdentifier
+    ? (affinityHeaders.length > 0
+      ? ` ${affinityExaminationSummary(affinityHeaders)}.`
+      : " affinity-header examination UNAVAILABLE (no report was threaded to this log line).")
     : "";
   const alsoHinted = hinted.length > 0
     ? ` ${hinted.length} other ${plural(hinted.length, "entry", "entries")} DID get the hint:`

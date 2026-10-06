@@ -1047,14 +1047,17 @@ for (const stream of [false, true]) {
 
   test(`AC-1 arm: no identifier value reaches the log line (${via})`, async () => {
     // Kill: render the refused value, or any part of it, into the message.
-    const planted = "agent:boekhouder:chatSECRETcafe1234";
+    // The needle must be the value actually SENT, or the assertion is
+    // tautological: a string that never enters the system can never leave it.
+    // (Review finding, b1006-1 loop F.)
+    const planted = "agent:boekhouder:chat SECRET cafe1234";
     const { logs } = await run({
       systemPrompt: undefined, behaviour: "success", stream,
       bridgeConfig: configWithMcp,
       // Refused on the tail rule, so the classifier HELD the value and still
       // must not print it.
       affinityHeaders: resolveConversation(
-        reqWith({ "session_id": "agent:boekhouder:chat SECRET cafe1234" }), {},
+        reqWith({ "session_id": planted }), {},
       ).affinityHeaders,
     });
     assert.equal(logs.length, 1);
@@ -1088,3 +1091,93 @@ for (const stream of [false, true]) {
     assert.deepEqual([accepted, refused, absent], [0, 1, 2]);
   });
 }
+
+// ── S1: the PRODUCTION JOIN, end to end through handleCompletions ───
+//
+// `handleCompletions` is the ONLY place in production where the report
+// produced by `resolveConversation` reaches `executeWithRetries` and so the
+// log line. Every arm above hands `executeWithRetries` a hand-computed
+// report, which proves the resolver and the renderer but NOT the wire between
+// them: deleting the `affinityHeaders,` argument in `handleCompletions` left
+// all of them green while the deployed line reverted to the pre-S1 string.
+// That is a surviving mutant on the entire purpose of the slice, and the only
+// other thing that would have caught it is the deploy-and-read step this
+// slice exists to serve. (Review finding, b1006-1 loop F.)
+
+/** A fake IncomingMessage carrying a JSON body, async-iterable like the real one. */
+function fakeReq(headers: Record<string, string>, body: unknown): any {
+  const payload = Buffer.from(JSON.stringify(body));
+  return {
+    headers,
+    async *[Symbol.asyncIterator]() { yield payload; },
+  };
+}
+
+async function driveCompletions(headers: Record<string, string>) {
+  const runConfig = configWithMcp;
+  __testing.initialiseStores(runConfig);
+  const logs: string[] = [];
+  const captured: Captured[] = [];
+  __testing.setQuery(fakeQuery(captured, "success"));
+  __testing.setLog((message) => logs.push(message));
+  const res = fakeRes({});
+  try {
+    await __testing.handleCompletions(
+      fakeReq(headers, { model: "claude-runner/claude-opus-4-6", stream: false,
+                         messages: [{ role: "user", content: "hello" }] }),
+      res as any,
+      runConfig,
+    );
+  } finally {
+    __testing.setQuery(undefined);
+    __testing.setLog(undefined);
+  }
+  return { logs, captured };
+}
+
+test("S1 JOIN: a real request with NO affinity header logs ABSENT, per header name", async () => {
+  // Kill: delete the `affinityHeaders` argument in `handleCompletions`.
+  const { logs } = await driveCompletions({});
+  assert.equal(logs.length, 1, `expected one line, got: ${logs}`);
+  assert.match(logs[0], /no usable chat-session identifier was available/);
+  assert.match(logs[0], /examined 3 session-affinity header names: 0 accepted, 0 present-but-refused, 3 ABSENT/);
+  for (const name of SESSION_AFFINITY_HEADERS) {
+    assert.ok(logs[0].includes(`${JSON.stringify(name)}=ABSENT`), `${name} not reported: ${logs[0]}`);
+  }
+  // And the degradation marker must NOT appear: the report WAS threaded.
+  assert.equal(/UNAVAILABLE/.test(logs[0]), false, `the report did not reach the log line: ${logs[0]}`);
+});
+
+test("S1 JOIN: a real request carrying the measured uuid logs present-but-refused, with the rule", async () => {
+  // Kill: the same deletion, and also any collapse of ABSENT into refused.
+  const uuid = "b66bdf67-0f4d-46d8-8051-4c9251fdde62";
+  const { logs } = await driveCompletions({ "session_id": uuid });
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /examined 3 session-affinity header names: 0 accepted, 1 present-but-refused, 2 ABSENT/);
+  assert.match(logs[0], /"session_id"=present-but-refused\(not-an-agent-session-key\)/);
+  assert.match(logs[0], /"x-client-request-id"=ABSENT/);
+  assert.equal(logs[0].includes(uuid), false, `the uuid reached the log line: ${logs[0]}`);
+});
+
+test("S1 JOIN: the two worlds produce DIFFERENT lines through the real entry point", async () => {
+  // The decisive arm, now over the production wire rather than a hand-built report.
+  const absent = await driveCompletions({});
+  const refused = await driveCompletions({
+    "session_id": "b66bdf67-0f4d-46d8-8051-4c9251fdde62",
+  });
+  assert.notEqual(absent.logs[0], refused.logs[0]);
+});
+
+test("S1 JOIN: an accepted affinity header routes, and the hint reaches the SDK url", async () => {
+  // Proves the join does not merely log: the same report path still routes.
+  const { logs, captured } = await driveCompletions({ "session_id": "agent:boekhouder:chat-7" });
+  assert.equal(captured.length, 1);
+  assert.equal(
+    new URL(captured[0].options.mcpServers.booqi.url).searchParams.get("session"),
+    "chat-7",
+  );
+  // Hint written -> the hinted line, which deliberately carries no examination.
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /wrote the chat-session hint/);
+});
+

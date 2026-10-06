@@ -1102,6 +1102,17 @@ export const __testing = {
   setLog(fn: ((message: string) => void) | undefined): void {
     logOverride = fn;
   },
+  /**
+   * The real HTTP entry point, exposed so the JOIN can be tested.
+   *
+   * `handleCompletions` is the ONLY place in production where
+   * `resolveConversation().affinityHeaders` reaches `executeWithRetries`.
+   * Before this was exposed, deleting that one argument left all arms green
+   * while the deployed log line silently reverted to the pre-S1 string -- a
+   * surviving mutant on the entire purpose of the slice, catchable only by the
+   * deploy-and-read step it exists to serve. (Review finding, b1006-1 loop F.)
+   */
+  handleCompletions,
 };
 
 export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<typeof createServer>> {
