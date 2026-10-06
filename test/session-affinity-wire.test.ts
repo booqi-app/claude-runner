@@ -56,7 +56,7 @@ const PROVIDER_ID = "claude-runner";
 const AFFINITY_HEADERS = ["session_id", "x-client-request-id", "x-session-affinity"] as const;
 
 /** Every arm asserts; this is the count the self-check at the bottom enforces. */
-const EXPECTED_ARMS = 27;
+const EXPECTED_ARMS = 28;
 let armsRun = 0;
 const arm = (name: string, fn: () => void | Promise<void>) =>
   test(name, async () => {
@@ -306,6 +306,27 @@ arm("B4 an operator's other compat keys survive; only this one is forced", async
   const m = (out!.provider.models as AnyRec[])[0];
   assert.equal(m.compat.noParallelToolCalls, true, "an unrelated compat key was dropped");
   assert.equal(m.compat.sendSessionAffinityHeaders, true);
+});
+
+arm("B7 a non-object row in the config models array is handed back untouched", async () => {
+  // Before this slice the array was passed through whole, so a malformed row
+  // never got dereferenced on this path. A string row spread into an object
+  // becomes {"0":"j","1":"u",...} and a null row throws -- both would be new
+  // failure modes introduced by decorating the array.
+  const out = await runDiscovery(
+    cellLikeConfig([
+      { id: "claude-opus-4-6", api: "openai-completions" },
+      null,
+      "junk",
+      5,
+    ] as AnyRec[]),
+  );
+  const models = out!.provider.models as AnyRec[];
+  assert.equal(models.length, 4);
+  assert.equal(models[0].compat.sendSessionAffinityHeaders, true);
+  assert.equal(models[1], null, "a null row was mangled instead of passed through");
+  assert.equal(models[2], "junk", "a string row was spread into an object");
+  assert.equal(models[3], 5, "a numeric row was spread into an object");
 });
 
 arm("B6 a pre-existing FALSE value on the config model is overridden, not honoured", async () => {
