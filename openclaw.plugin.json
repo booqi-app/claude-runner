@@ -3,67 +3,6 @@
   "name": "Claude Code Runner",
   "description": "Uses Claude Agent SDK as a local provider — delegates all reasoning, tool use, and file editing to the SDK.",
   "providers": ["claude-runner"],
-  "modelCatalog": {
-    "runtimeAugment": true,
-    "providers": {
-      "claude-runner": {
-        "baseUrl": "http://127.0.0.1:7779/v1",
-        "api": "openai-completions",
-        "models": [
-          {
-            "id": "claude-opus-4-6",
-            "name": "Claude Opus 4.6 (SDK)",
-            "reasoning": true,
-            "input": ["text", "image"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 200000,
-            "maxTokens": 16384,
-            "compat": { "sendSessionAffinityHeaders": true }
-          },
-          {
-            "id": "claude-opus-4-5",
-            "name": "Claude Opus 4.5 (SDK)",
-            "reasoning": true,
-            "input": ["text", "image"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 200000,
-            "maxTokens": 16384,
-            "compat": { "sendSessionAffinityHeaders": true }
-          },
-          {
-            "id": "claude-sonnet-4-6",
-            "name": "Claude Sonnet 4.6 (SDK)",
-            "reasoning": true,
-            "input": ["text", "image"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 200000,
-            "maxTokens": 16384,
-            "compat": { "sendSessionAffinityHeaders": true }
-          },
-          {
-            "id": "claude-sonnet-4",
-            "name": "Claude Sonnet 4 (SDK)",
-            "reasoning": false,
-            "input": ["text", "image"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 200000,
-            "maxTokens": 8192,
-            "compat": { "sendSessionAffinityHeaders": true }
-          },
-          {
-            "id": "claude-haiku-4-5",
-            "name": "Claude Haiku 4.5 (SDK)",
-            "reasoning": false,
-            "input": ["text"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 200000,
-            "maxTokens": 8192,
-            "compat": { "sendSessionAffinityHeaders": true }
-          }
-        ]
-      }
-    }
-  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
