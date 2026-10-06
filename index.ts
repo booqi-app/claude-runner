@@ -157,13 +157,32 @@ const MODELS = [
 // `sessionAffinityOverrideReport` in `src/bridge-config.ts`, where they are
 // also testable.
 //
-// Both branches are still decorated, for two reasons and neither is
-// belt-and-braces: the plugin-advertised branch is where the override DOES take
-// effect end to end, and on the config-declared branch the decoration is what
-// makes the count in the report honest. What makes the config-declared branch
-// safe is not the decoration but the LOG LINE: a silent no-op is the one
-// failure mode this slice cannot afford, so the plugin says which route it took
-// and how many rows the host will drop, with the remedy.
+// Both branches are still decorated, and the reason is NOT the one an earlier
+// head of this comment gave. That head said the decoration "is what makes the
+// count in the report honest" -- which is FALSE, measured: the count is
+// `explicit.models.length`, read below and entirely independent of
+// `decorateModelRows`, and `sessionAffinityOverrideReport` derives `effective`
+// from the route alone. Undecorating this branch leaves R1/R2/R3 green. A
+// reviewer caught it by mutation. Recording the correction rather than quietly
+// swapping the sentence, because this slice's two previous failures were
+// failures of RATIONALE rather than of code, and a fresh false rationale in the
+// commit that fixes the last one would reopen the question.
+//
+// The two true reasons:
+//   (a) the plugin-advertised branch is where the override DOES take effect end
+//       to end, so it has to be decorated;
+//   (b) on the config-declared branch the decoration is what makes arm H2 a
+//       NON-VACUOUS assertion of the host defect. H2 asserts the flag is absent
+//       after the host merge. Undecorate this branch and H2 still passes --
+//       while proving nothing, because the flag was never there to be dropped.
+//       That single arm is the whole difference between this round and round 2,
+//       whose battery observed upstream of the drop. The decoration is itself
+//       pinned by B1/B2/B4/B6/B7, so it cannot be removed silently either.
+//
+// What makes the config-declared branch SAFE is neither of those: it is the LOG
+// LINE. A silent no-op is the one failure mode this slice cannot afford, so the
+// plugin says which route it took, how many rows the host will drop, and the
+// remedy.
 const SESSION_AFFINITY_COMPAT = { sendSessionAffinityHeaders: true } as const;
 
 // Ours is merged LAST, so it wins over a pre-existing value. Deliberate: the

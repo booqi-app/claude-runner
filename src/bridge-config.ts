@@ -1014,9 +1014,14 @@ export type ExtensionBridgeOptions = Omit<BridgeConfig, "workDir">;
  *           : implicit.models,       // what this plugin returned
  *     };
  *
- * `existing` is resolved (`:447-459` -> `:326-339`) from
+ * `existing` is resolved at `:449-459` as
+ * `discovered[providerId] ?? resolveExistingImplicitProviderFromContext(...)`,
+ * and that fallback (`:326-339`) reads
  * `ctx.explicitProviders ?? ctx.config.models.providers` -- the SAME object the
- * plugin reads to decide its first branch. So the condition that selects the
+ * plugin reads to decide its first branch. The `discovered[providerId]` limb is
+ * an earlier plugin's result for the same provider id; it does not apply to the
+ * measured cell, and naming it matters only so the next reader does not think
+ * the chain is shorter than it is. So the condition that selects the
  * config-declared branch is logically the same condition that makes
  * `existing.models` win. On that branch the decorated array is discarded
  * wholesale, and the config array cannot carry the key: per-model `compat` in
