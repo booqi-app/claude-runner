@@ -40,13 +40,21 @@ const config: BridgeConfig = {
   queueMaxDelayMs: 0,
 };
 
-/** The options object the fake `query()` was handed, per call. */
-type Captured = { options: Record<string, any> };
+/**
+ * What the fake `query()` was handed, per call.
+ *
+ * `prompt` is captured as well as `options` because, since
+ * booqi-app/infra#333, the system prompt of an `"append"`-mode session travels
+ * as CONTENT on the first turn -- there is no usable system-prompt option on
+ * this SDK. A test that only reads `options` cannot see it, and the mutant
+ * that drops the instructions block would stay green.
+ */
+type Captured = { options: Record<string, any>; prompt: unknown };
 
-/** A fake `query()` that records its options and then behaves as told. */
+/** A fake `query()` that records its arguments and then behaves as told. */
 function fakeQuery(captured: Captured[], behaviour: "success" | "fail"): QueryFn {
-  return (({ options }: any) => {
-    captured.push({ options });
+  return (({ prompt, options }: any) => {
+    captured.push({ options, prompt });
     return (async function* () {
       if (behaviour === "fail") {
         // A non-transient SDK failure, before anything reaches the client.
@@ -197,23 +205,79 @@ for (const stream of [false, true]) {
     );
   });
 
-  test(`systemPromptMode append sends the preset form through the transport (${via})`, async () => {
-    __testing.initialiseStores(config);
-    const captured: Captured[] = [];
-    __testing.setQuery(fakeQuery(captured, "success"));
+  // ── booqi-app/infra#333: append mode delivers the prompt as CONTENT ──
+  //
+  // On @anthropic-ai/claude-agent-sdk@0.3.263 there is no system-prompt option
+  // that is both first-party and honoured: anything that replaces the preset
+  // (a plain string, or `{ type: "preset", preset: "claude_code", append }`)
+  // makes Anthropic answer `400 Third-party apps now draw from your extra
+  // usage, not your plan limits.`, and `appendSystemPrompt` is not an
+  // `Options` key, so it is discarded and delivers nothing. So append mode
+  // sends NO option and puts the instructions in the first user turn instead.
 
-    try {
-      await executeWithRetries(
-        "hello", "claude-opus-4-6", "P", `conv-append-${via}`, stream, fakeRes(), "req-2",
-        { ...config, systemPromptMode: "append" },
-      );
-    } finally {
-      __testing.setQuery(undefined);
-    }
-
-    assert.deepEqual(captured[0].options.systemPrompt, {
-      type: "preset", preset: "claude_code", append: "P",
+  test(`append mode on a FRESH session wraps the prompt in instructions (${via})`, async () => {
+    // KILLS the mutant that leaves `prompt` at the buildQueryOptions call
+    // sites: nothing but the dispatched prompt observes the instructions.
+    const { captured } = await run({
+      systemPrompt: "BE A BOOKKEEPER",
+      behaviour: "success",
+      stream,
+      bridgeConfig: { ...config, systemPromptMode: "append" },
     });
+
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].options.resume, undefined, "precondition: this is a fresh session");
+
+    const sent = String(captured[0].prompt);
+    assert.match(sent, /<agent-instructions>/);
+    assert.match(sent, /<\/agent-instructions>/);
+    assert.ok(sent.includes("BE A BOOKKEEPER"), "the instructions never reached the model");
+    assert.ok(sent.endsWith("hello"), "the caller's own turn was lost");
+
+    // And no option of either spelling: the one is a 400, the other a no-op.
+    assert.equal("systemPrompt" in captured[0].options, false);
+    assert.equal("appendSystemPrompt" in captured[0].options, false);
+  });
+
+  test(`append mode on a RESUMED session does not resend the instructions (${via})`, async () => {
+    // KILLS the mutant that drops the `!resumeSessionId` guard. `--resume`
+    // replays the SDK transcript, which already contains the first turn's
+    // instructions block, so resending it would repeat 59k of system prompt on
+    // every single turn.
+    const { captured } = await run({
+      systemPrompt: "BE A BOOKKEEPER",
+      resumeSessionId: "sdk-session-9",
+      behaviour: "success",
+      stream,
+      bridgeConfig: { ...config, systemPromptMode: "append" },
+    });
+
+    assert.equal(captured[0].options.resume, "sdk-session-9", "precondition: this is a resumed turn");
+    assert.equal(captured[0].prompt, "hello", "the instructions were resent on a resumed turn");
+    assert.equal("systemPrompt" in captured[0].options, false);
+    assert.equal("appendSystemPrompt" in captured[0].options, false);
+  });
+
+  test(`replace mode sends the plain string option and an untouched prompt (${via})`, async () => {
+    // The other half of the pair: append mode must not have leaked into the
+    // default path. The prompt is the caller's, verbatim, and the agent's
+    // prompt is the whole system prompt.
+    for (const resumeSessionId of [undefined, "sdk-session-9"]) {
+      const { captured } = await run({
+        systemPrompt: "BE A BOOKKEEPER",
+        resumeSessionId,
+        behaviour: "success",
+        stream,
+        bridgeConfig: { ...config, systemPromptMode: "replace" },
+      });
+
+      assert.equal(captured[0].options.systemPrompt, "BE A BOOKKEEPER", `resume=${resumeSessionId}`);
+      assert.equal(captured[0].prompt, "hello", `resume=${resumeSessionId}`);
+      assert.ok(
+        !String(captured[0].prompt).includes("agent-instructions"),
+        "replace mode wrapped the prompt -- the instructions block belongs to append mode only",
+      );
+    }
   });
 }
 
@@ -878,8 +942,8 @@ test("a derived id reaches the SDK as no hint at all, end to end", async () => {
  */
 function fakeQueryFailingOnce(captured: Captured[]): QueryFn {
   let calls = 0;
-  return (({ options }: any) => {
-    captured.push({ options });
+  return (({ prompt, options }: any) => {
+    captured.push({ options, prompt });
     calls += 1;
     const failThis = calls === 1;
     return (async function* () {
@@ -986,8 +1050,8 @@ test("an SDK error quoting the hinted URL does not discard the conversation", as
   sessionStore.record("conv-1", "live-sdk-session");
 
   const captured: Captured[] = [];
-  __testing.setQuery((({ options }: any) => {
-    captured.push({ options });
+  __testing.setQuery((({ prompt, options }: any) => {
+    captured.push({ options, prompt });
     return (async function* () {
       // The shape an MCP transport failure takes: the URL, verbatim, hint and all.
       throw new Error(`MCP server "booqi" failed to connect: GET ${MCP_URL}?session=chat-7 ECONNREFUSED`);

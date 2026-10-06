@@ -42,6 +42,8 @@ import {
   DEFAULT_TOOLS_WHEN_ABSENT,
   unusableToolsMessage,
   resolveSystemPrompt,
+  wrapSystemPromptAsInstructions,
+  AGENT_INSTRUCTIONS_TAG,
   SDK_OPTION_NAMES,
   summariseMcpServers,
   type BridgeConfig,
@@ -602,13 +604,38 @@ test("systemPromptMode defaults to replace -- the agent's prompt, not the coding
   }
 });
 
-test("systemPromptMode append is still available and sends the preset form", () => {
-  const opts = buildQueryOptions(
-    "claude-opus-4-6", "P", undefined, "session-1",
-    baseConfig({ systemPromptMode: "append" }), new AbortController(), {},
-  );
+test("systemPromptMode append sets NO system-prompt option of any kind", () => {
+  // booqi-app/infra#333. Measured on @anthropic-ai/claude-agent-sdk@0.3.263:
+  // `{ type: "preset", preset: "claude_code", append }` is billed as a
+  // third-party app exactly like a plain replacing string and fails the call
+  // with `400 Third-party apps now draw from your extra usage, not your plan
+  // limits.`, while `appendSystemPrompt` is still not an `Options` key and is
+  // discarded -- on 0.3.263 that discard leaves the preset intact, so it bills
+  // fine and delivers nothing at all. So append mode sends nothing here and
+  // the transport delivers the prompt as first-turn content instead.
+  for (const resume of [undefined, "sdk-session-9"]) {
+    const opts = buildQueryOptions(
+      "claude-opus-4-6", "P", resume, resume ? undefined : "session-1",
+      baseConfig({ systemPromptMode: "append" }), new AbortController(), {},
+    );
 
-  assert.deepEqual(opts.systemPrompt, { type: "preset", preset: "claude_code", append: "P" });
+    // `in`, not a truthiness check: `systemPrompt: ""` is a present, empty
+    // prompt to this SDK and suppresses the preset, which is the whole
+    // billing problem back again.
+    assert.equal("systemPrompt" in opts, false, `resume=${resume}`);
+    assert.equal("appendSystemPrompt" in opts, false, `resume=${resume}`);
+  }
+});
+
+test("append mode's instructions block wraps the prompt, and only the prompt", () => {
+  assert.equal(
+    wrapSystemPromptAsInstructions("BE A BOOKKEEPER", "what is 2+2?"),
+    "<agent-instructions>\nBE A BOOKKEEPER\n</agent-instructions>\n\nwhat is 2+2?",
+  );
+  // The caller's turn survives verbatim -- the instructions are a prefix, not
+  // a replacement, so a mutant that drops `prompt` is caught.
+  assert.ok(wrapSystemPromptAsInstructions("I", "USER-TURN").endsWith("USER-TURN"));
+  assert.equal(AGENT_INSTRUCTIONS_TAG, "agent-instructions");
 });
 
 test("an unrecognised systemPromptMode falls back to the default, and is reported", () => {
@@ -711,12 +738,35 @@ test("the bridge takes its per-turn system prompt from resolveSystemPrompt, unco
 
   assert.match(bridge, /=\s*resolveSystemPrompt\s*\(/);
 
-  // The exact shape of the reverted bug: a system prompt gated on there being
-  // no resume id.
+  // The exact shape of the reverted bug: the system prompt gated on there
+  // being no resume id.
+  //
+  // This used to forbid `if (!resumeSessionId)` anywhere in the file, which is
+  // no longer the right rule: booqi-app/infra#333 made `"append"` mode deliver
+  // the prompt as first-turn CONTENT, and a content block MUST be gated that
+  // way because the SDK's transcript -- which `--resume` replays -- already
+  // carries it from turn 2. So the guard is narrowed rather than dropped:
+  // every `!resumeSessionId` branch must be that content block, and nothing
+  // may make the system-prompt VALUE depend on the resume id.
+  for (const guard of bridge.match(/if\s*\(\s*!\s*resumeSessionId\s*\)[\s\S]{0,300}/g) ?? []) {
+    assert.match(
+      guard, /wrapSystemPromptAsInstructions/,
+      "claude-bridge.ts gates something other than the append-mode instructions block on "
+        + "`!resumeSessionId` -- if that is the system prompt, every resumed turn runs with an "
+        + "empty one (booqi-app/infra#202)",
+    );
+  }
   assert.equal(
-    /if\s*\(\s*!\s*resumeSessionId\s*\)/.test(bridge), false,
-    "claude-bridge.ts gates something on `!resumeSessionId` again -- if that is the system prompt, "
-      + "every resumed turn runs with an empty one (booqi-app/infra#202)",
+    /(?:effectiveSystemPrompt|systemPrompt)\s*=\s*[^;]*\bresumeSessionId\s*\?/.test(bridge), false,
+    "claude-bridge.ts makes the system prompt a ternary on resumeSessionId again "
+      + "(booqi-app/infra#202)",
+  );
+  // The replace path still goes out unconditionally: the one legitimate reason
+  // to clear it is append mode, which replaces it with content.
+  assert.match(
+    bridge, /normaliseSystemPromptMode\s*\(\s*config\.systemPromptMode\s*\)\s*===\s*"append"/,
+    "nothing in the transport distinguishes append mode, so either the content path is gone or "
+      + "the replace path has been cleared for every mode (booqi-app/infra#333)",
   );
   assert.equal(
     /\bappendSystemPrompt\b/.test(bridge), false,
