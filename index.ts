@@ -147,6 +147,20 @@ const MODELS = [
 //     synthetic manifest provider. An earlier attempt did exactly that and was
 //     inert; the full record is on booqi-app/infra#327.
 //
+// 🔴 THE HOST DISCARDS THIS DECORATION ON THE CONFIG-DECLARED BRANCH, AND THE
+// `normalizeResolvedModel` HOOK BELOW IS WHAT MAKES THE OVERRIDE REACH THE
+// REQUEST ANYWAY. Two heads of this comment have now been wrong about the same
+// thing in opposite directions: the first said the discovery return was enough,
+// the second said nothing in this repository could work on the branch the cell
+// takes. Both were exhaustive over the `models-config` merge layer; neither
+// looked at the provider-runtime hook layer beneath it. The hook, every hop
+// measured in the installed OpenClaw 2026.7.1-beta.5 tree, is documented at
+// `sessionAffinityOverrideReport` in `src/bridge-config.ts` and registered at
+// `normalizeResolvedModel` further down this file. What remains `ONGEMETEN` is
+// that no LIVE run has been observed: structural reachability is not an executed
+// path, and the hook only fires if this plugin is in the gateway's LOADED plugin
+// registry.
+//
 // 🔴 WHICH BRANCH, AND WHAT THE HOST DOES WITH IT. The reference cell's
 // `openclaw.json` was read directly on the dev host at 2026-10-06T09:07Z:
 // `models.providers["claude-runner"]` exists and declares 3 model rows
@@ -216,6 +230,51 @@ function decorateModelRows(rows: readonly unknown[]): unknown[] {
       ? withSessionAffinityCompat(row as { compat?: Record<string, unknown> })
       : row,
   );
+}
+
+/**
+ * The provider-runtime hook that makes route A work on the branch the reference
+ * cell takes.
+ *
+ * MEASURED (installed OpenClaw 2026.7.1-beta.5; every hop cited at
+ * `sessionAffinityOverrideReport` in `src/bridge-config.ts`):
+ *   * declared `src/plugins/types.ts:1346-1355`, context `:548-555`;
+ *   * survives registration verbatim (`provider-validation.ts:378-401` spreads
+ *     `...restProvider` and destructures out only wizard/docsPath/aliases/
+ *     envVars/catalog/discovery);
+ *   * found for a NON-BUNDLED plugin (`provider-hook-runtime.ts:178-193` has no
+ *     `origin === "bundled"` filter, unlike the `normalizeConfig` surface);
+ *   * invoked at `embedded-agent-runner/model.ts:937` (source "configured") and
+ *     `:994` (source "registry"), i.e. DOWNSTREAM of
+ *     `mergeImplicitProviderConfig`, which is the hop that discards the
+ *     decorated discovery return;
+ *   * its return is in-memory and never zod-validated, so the key is legal here
+ *     for exactly the reason it is legal on the discovery return and FATAL on
+ *     `configPatch` (exit 78).
+ *
+ * `trim().toLowerCase()`, deliberately, matching `normalizeProviderId`
+ * (`packages/model-catalog-core/src/provider-id.ts:6-8`) and the branch lookup
+ * in `discovery.run` below. An exact-string comparison here would reintroduce
+ * the divergence arm R4 exists to pin.
+ *
+ * Returning `undefined` means "no change": `provider-runtime.ts:325-347` does
+ * `?? undefined`, so a nullish return is indistinguishable from an absent hook.
+ * Any other provider id is therefore handed back untouched -- this hook must
+ * never decorate a model that is not ours, and arm H5 pins that.
+ */
+function normalizeResolvedClaudeRunnerModel(ctx: {
+  provider: string;
+  modelId: string;
+  model: { compat?: Record<string, unknown> };
+}): unknown {
+  if (typeof ctx?.provider !== "string") return undefined;
+  if (ctx.provider.trim().toLowerCase() !== PROVIDER_ID) return undefined;
+  const model = ctx.model;
+  // A non-object model is handed back as "no change" rather than spread into
+  // garbage -- the same defence as `decorateModelRows`, for the same reason:
+  // this runs on whatever the host resolved, not on a value this file built.
+  if (model === null || typeof model !== "object") return undefined;
+  return withSessionAffinityCompat(model);
 }
 
 /**
@@ -407,6 +466,13 @@ const claudeRunnerPlugin = {
           },
         },
       ],
+      // Registered at the TOP level of the provider object, next to `discovery`,
+      // because that is the object `normalizeRegisteredProvider` spreads
+      // (`provider-validation.ts:378-401`) and the object
+      // `findProviderRuntimePluginInRegistry` looks this key up on
+      // (`provider-hook-runtime.ts:178-193`). Inside `discovery` it would be
+      // destructured away and silently never called.
+      normalizeResolvedModel: normalizeResolvedClaudeRunnerModel,
       discovery: {
         order: "late",
         run: async (ctx: ProviderDiscoveryContext) => {

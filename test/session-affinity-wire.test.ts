@@ -56,7 +56,7 @@ const PROVIDER_ID = "claude-runner";
 const AFFINITY_HEADERS = ["session_id", "x-client-request-id", "x-session-affinity"] as const;
 
 /** Every arm asserts; this is the count the self-check at the bottom enforces. */
-const EXPECTED_ARMS = 32;
+const EXPECTED_ARMS = 35;
 let armsRun = 0;
 const arm = (name: string, fn: () => void | Promise<void>) =>
   test(name, async () => {
@@ -578,6 +578,78 @@ const cellConfig = () => ({
   plugins: { entries: { "claude-runner": { enabled: true } } },
 });
 
+/**
+ * `provider-validation.ts:378-401` -- `normalizeRegisteredProvider` destructures
+ * out exactly these six keys and spreads the rest. Reproduced so that a hook
+ * registered in the WRONG place (inside `discovery`, say) cannot pass H6.
+ */
+function hostNormalizeRegisteredProvider(provider: AnyRec): AnyRec {
+  const { wizard, docsPath, aliases, envVars, catalog, discovery, ...restProvider } = provider;
+  void wizard;
+  void docsPath;
+  void aliases;
+  void envVars;
+  void catalog;
+  void discovery;
+  return { ...restProvider };
+}
+
+/**
+ * `provider-hook-runtime.ts:178-193` -- the registry lookup, matching by
+ * provider id over `registry.providers` with NO `origin === "bundled"` filter.
+ * The absent filter is the whole reason this surface is available to a
+ * path-loaded plugin, so it is reproduced rather than assumed.
+ */
+function hostFindProviderRuntimePlugin(
+  registry: { providers: Array<{ pluginId: string; provider: AnyRec; origin?: string }> },
+  provider: string,
+): AnyRec | undefined {
+  const normalized = provider.trim().toLowerCase();
+  return registry.providers
+    .map((entry) => Object.assign({}, entry.provider, { pluginId: entry.pluginId }))
+    .find((plugin) => String(plugin.id ?? "").trim().toLowerCase() === normalized);
+}
+
+/**
+ * `provider-model-compat.ts:115-119` -- a SPREAD over the model's own `compat`,
+ * which is why a key it does not itself know survives it. Reached from
+ * `model.provider-normalization.ts:10-12`.
+ */
+function hostNormalizeModelCompat(model: AnyRec): AnyRec {
+  const compat = model.compat;
+  if (!compat) return model;
+  return {
+    ...model,
+    compat: {
+      ...compat,
+      supportsDeveloperRole: false,
+      ...("supportsUsageInStreaming" in compat ? {} : { supportsUsageInStreaming: false }),
+    },
+  };
+}
+
+/**
+ * `provider-runtime.ts:325-347` + `model.ts:272-285`: resolve the plugin for the
+ * provider, call `normalizeResolvedModel`, treat a nullish return as "no
+ * change", and run the result through the compat normalization the host runs
+ * next. This is the hop every previous battery on this slice sat UPSTREAM of.
+ */
+function hostRunNormalizeResolvedModel(params: {
+  registeredProvider: AnyRec;
+  provider: string;
+  model: AnyRec;
+}): AnyRec {
+  const asRegistered = hostNormalizeRegisteredProvider(params.registeredProvider);
+  const registry = { providers: [{ pluginId: PROVIDER_ID, provider: asRegistered }] };
+  const plugin = hostFindProviderRuntimePlugin(registry, params.provider);
+  const normalized = plugin?.normalizeResolvedModel?.({
+    provider: params.provider,
+    modelId: params.model.id,
+    model: params.model,
+  }) ?? undefined;
+  return hostNormalizeModelCompat((normalized ?? params.model) as AnyRec);
+}
+
 arm("H1 plugin-advertised route: the flag survives the host merge and reaches the wire", async () => {
   const config = { plugins: { entries: { "claude-runner": { enabled: true } } } };
   const out = await runDiscovery(config);
@@ -597,12 +669,27 @@ arm("H1 plugin-advertised route: the flag survives the host merge and reaches th
   }
 });
 
-arm("H2 config-declared route: the host DISCARDS the flag and nothing reaches the wire", async () => {
-  // This arm asserts the DEFECT, measured. It is red if the host merge ever
-  // stops preferring the config array -- which is the day this slice's
-  // config-declared branch starts working and the log line has to change.
+arm("H2 config-declared route: the host discards the decoration AND the registered normalizeResolvedModel hook restores it, so all three headers reach the wire", async () => {
+  // THIS ARM WAS INVERTED on 2026-10-06. Until this commit it asserted that the
+  // flag is ABSENT after the host merge and that nothing reaches the wire --
+  // which was true of the DISCOVERY RETURN alone and is the reason round 2 of
+  // this slice could be green over a defect. The merge still discards the
+  // decorated array; the point is that `normalizeResolvedModel` runs after it.
+  // An arm that stopped at the merge would be blind to the hook, which is
+  // exactly how the previous two rounds passed.
   const config = cellConfig();
-  const out = await runDiscovery(config);
+  const reg = await registerPlugin();
+  const { logger } = makeLogger();
+  let out: AnyRec | null = null;
+  try {
+    out = (await reg.provider.discovery.run({
+      config,
+      logger,
+      workspaceDir: join(REPO, ".test-workspace"),
+    })) as AnyRec | null;
+  } finally {
+    for (const svc of reg.services) await svc.stop?.({ logger: silentLogger });
+  }
   const mergedProvider = hostMergeImplicitProvider({
     providerId: PROVIDER_ID,
     existing: config.models.providers[PROVIDER_ID],
@@ -611,16 +698,123 @@ arm("H2 config-declared route: the host DISCARDS the flag and nothing reaches th
   const models = mergedProvider.models as AnyRec[];
   assert.equal(models.length, 3, "the cell's three rows should come through the merge");
   for (const m of models) {
+    // (a) the measured drop is still real: this is the row the cell declared.
     assert.equal(
       m.compat?.sendSessionAffinityHeaders,
       undefined,
-      `${m.id} unexpectedly kept the flag: re-read implicit.ts:287-294`,
+      `${m.id}: the host merge no longer discards the decoration -- re-read implicit.ts:287-294`,
     );
-    const received = await overTheWire(wireHeadersFor(m, SESSION));
+    // (b) and the hook, found and called the way the host finds and calls it,
+    //     puts it back downstream of that drop.
+    const resolved = hostRunNormalizeResolvedModel({
+      registeredProvider: reg.provider,
+      provider: PROVIDER_ID,
+      model: m,
+    });
+    assert.equal(
+      resolved.compat?.sendSessionAffinityHeaders,
+      true,
+      `${m.id}: normalizeResolvedModel did not restore the flag after the merge`,
+    );
+    // (c) and it is on the WIRE, over a real socket, on the route the cell takes.
+    const received = await overTheWire(wireHeadersFor(resolved, SESSION));
     for (const h of AFFINITY_HEADERS) {
-      assert.equal(received[h], undefined, `${m.id}: ${h} arrived after all`);
+      assert.equal(received[h], SESSION, `${m.id}: header ${h} never arrived on the cell's route`);
     }
   }
+});
+
+arm("H5 the hook is a no-op for any other provider and for a non-object model", async () => {
+  // Without this, a hook that decorated everything would pass H2. Returning
+  // `undefined` is "no change" (`provider-runtime.ts:325-347` does `?? undefined`).
+  const reg = await registerPlugin();
+  const hook = hostNormalizeRegisteredProvider(reg.provider).normalizeResolvedModel as (
+    ctx: AnyRec,
+  ) => unknown;
+  assert.equal(typeof hook, "function", "the hook did not survive registration");
+  const foreign = { id: "gpt-5", compat: { somethingElse: true } };
+  assert.equal(
+    hook({ provider: "openai", modelId: "gpt-5", model: foreign }),
+    undefined,
+    "the hook decorated a model belonging to another provider",
+  );
+  assert.equal(
+    hook({ provider: PROVIDER_ID, modelId: "x", model: null }),
+    undefined,
+    "a null model was spread instead of handed back",
+  );
+  // trim().toLowerCase(), the way the host normalizes a provider id
+  // (`provider-id.ts:6-8`). An exact-string hook would silently never fire for a
+  // cell whose config key has different case or stray whitespace -- the same
+  // divergence arm R4 pins on the discovery branch.
+  const variant = hook({
+    provider: "  Claude-Runner ",
+    modelId: "claude-opus-4-6",
+    model: { id: "x" },
+  }) as AnyRec | undefined;
+  assert.equal(
+    variant?.compat?.sendSessionAffinityHeaders,
+    true,
+    "a case/whitespace variant of our own provider id was not recognised",
+  );
+});
+
+arm("H6 the hook survives the host's registration destructure and the registry lookup finds it", async () => {
+  // `provider-validation.ts:378-401` strips exactly six keys. A hook registered
+  // inside `discovery` -- the plausible mistake -- would be destructured away and
+  // silently never called, and the headers would be missing with every other
+  // assertion in this file still green.
+  const reg = await registerPlugin();
+  assert.equal(
+    typeof reg.provider.normalizeResolvedModel,
+    "function",
+    "the plugin does not register normalizeResolvedModel at the provider top level",
+  );
+  const asRegistered = hostNormalizeRegisteredProvider(reg.provider);
+  assert.equal(
+    typeof asRegistered.normalizeResolvedModel,
+    "function",
+    "the hook was destructured away by normalizeRegisteredProvider",
+  );
+  assert.equal(asRegistered.discovery, undefined, "the destructure fixture is not faithful");
+  const found = hostFindProviderRuntimePlugin(
+    { providers: [{ pluginId: PROVIDER_ID, provider: asRegistered }] },
+    PROVIDER_ID,
+  );
+  assert.equal(
+    typeof found?.normalizeResolvedModel,
+    "function",
+    "the registry lookup did not find the hook for a non-bundled plugin",
+  );
+  assert.equal(
+    hostFindProviderRuntimePlugin(
+      { providers: [{ pluginId: PROVIDER_ID, provider: asRegistered }] },
+      "openai",
+    ),
+    undefined,
+    "the lookup fixture matches any provider, so H6 proves nothing",
+  );
+});
+
+arm("H7 the hook's result survives the compat normalization the host runs next", async () => {
+  // `model.ts:272-285` hands the hook's return to the transport pass and then to
+  // `normalizeResolvedProviderModel` = `normalizeModelCompat`
+  // (`provider-model-compat.ts:115-119`). That is a spread, so our key survives
+  // -- but it ALSO writes keys of its own, and a reader should see that proved
+  // rather than assumed.
+  const reg = await registerPlugin();
+  const resolved = hostRunNormalizeResolvedModel({
+    registeredProvider: reg.provider,
+    provider: PROVIDER_ID,
+    model: { id: "claude-opus-4-6", compat: { supportsStrictMode: true } },
+  });
+  assert.equal(resolved.compat?.sendSessionAffinityHeaders, true, "the flag did not survive");
+  assert.equal(resolved.compat?.supportsStrictMode, true, "an operator's own compat key was lost");
+  assert.equal(
+    resolved.compat?.supportsDeveloperRole,
+    false,
+    "the compat-normalization fixture did not run, so H7 proves nothing",
+  );
 });
 
 arm("H3 the wildcard path is a second, independent drop", async () => {
@@ -658,19 +852,32 @@ arm("H4 the host-merge fixture is not vacuous: with no config rows the implicit 
 // R. the plugin REPORTS the route rather than failing silently
 // ---------------------------------------------------------------------------
 
-arm("R1 config-declared route logs on the ERROR channel, with 0 effective and the remedy", async () => {
+arm("R1 config-declared route reports the runtime-hook mechanism, with the discard count intact", async () => {
+  // This arm was rewritten with H2. The old version required "WILL BE
+  // DISCARDED" and `0 effective` on the ERROR channel, which was the honest
+  // verdict while the plugin had no surface downstream of the merge. Claiming a
+  // discard now would be the SAME silent-reassurance failure in the opposite
+  // direction: it would send the next person debugging an empty tools/list to
+  // edit the cell's openclaw.json, which is the action that can take the cell
+  // DOWN (exit 78 == SYSTEMD_NO_RESTART_EXIT_STATUS).
   const { logs } = await runDiscoveryLogged(cellConfig());
-  const line = logs.error.find((l) => l.includes("session-affinity override"));
-  assert.ok(line, `no session-affinity verdict on the error channel; got ${JSON.stringify(logs)}`);
-  assert.match(line!, /WILL BE DISCARDED/);
-  assert.match(line!, /examined 3 model rows: 0 effective, 3 discarded-by-host\./);
-  assert.match(line!, /REMEDY: set that provider entry's "models" to an EMPTY ARRAY/);
-  assert.match(line!, /do NOT delete the key/);
-  assert.match(line!, /exits 78/);
+  const line = logs.info.find((l) => l.includes("session-affinity override"));
+  assert.ok(line, `no session-affinity verdict on the info channel; got ${JSON.stringify(logs)}`);
+  assert.match(line!, /ACTIVE via the normalizeResolvedModel runtime hook/);
+  // The discard is still reported, because it is still true of the discovery
+  // return and it is the number that says WHICH surface is load-bearing here.
+  assert.match(
+    line!,
+    /examined 3 model rows: 3 effective \(0 via the advertised catalog, 3 via the normalizeResolvedModel runtime hook\), 3 discovery-return-discarded-by-host\./,
+  );
+  assert.match(line!, /models-config\.providers\.implicit\.ts:287-294/);
+  assert.match(line!, /model\.ts:937 and :994/);
+  // The second condition on the same emission, so the line is not a half-truth.
+  assert.match(line!, /cacheRetention/);
   assert.equal(
-    logs.info.some((l) => l.includes("session-affinity override ACTIVE")),
+    logs.error.some((l) => l.includes("session-affinity override")),
     false,
-    "it also claimed the override was active",
+    "the error channel fired on a route where the override now works",
   );
 });
 
@@ -683,7 +890,10 @@ arm("R2 plugin-advertised route logs on the INFO channel and leaves the error ch
   assert.ok(line, `no session-affinity verdict on the info channel; got ${JSON.stringify(logs)}`);
   assert.match(line!, /ACTIVE on the plugin-advertised model catalog/);
   assert.ok(
-    line!.includes(`examined ${count} model rows: ${count} effective, 0 discarded-by-host.`),
+    line!.includes(
+      `examined ${count} model rows: ${count} effective (${count} via the advertised catalog,`
+      + ` 0 via the normalizeResolvedModel runtime hook), 0 discovery-return-discarded-by-host.`,
+    ),
     `count disagrees with the advertised catalog (${count}): ${line}`,
   );
   assert.equal(
@@ -710,7 +920,7 @@ arm("R4 a case-variant provider key is resolved the way the HOST resolves it", a
     "the variant key was not resolved, so the plugin took the wrong branch",
   );
   assert.ok(
-    logs.error.some((l) => l.includes("WILL BE DISCARDED")),
+    logs.info.some((l) => l.includes("ACTIVE via the normalizeResolvedModel runtime hook")),
     `reported the wrong route for a variant key: ${JSON.stringify(logs)}`,
   );
   assert.equal(
@@ -725,7 +935,7 @@ arm("R3 the verdict counts the rows the HOST will use, not the rows the plugin k
   // catalog would say 4 and be wrong about the cell.
   const { out, logs } = await runDiscoveryLogged(cellConfig());
   assert.equal((out!.provider.models as AnyRec[]).length, 3);
-  const line = logs.error.find((l) => l.includes("session-affinity override"))!;
+  const line = logs.info.find((l) => l.includes("session-affinity override"))!;
   assert.match(line, /examined 3 model rows/);
   const advertised = await runDiscovery({ plugins: { entries: { "claude-runner": { enabled: true } } } });
   assert.notEqual(
@@ -736,9 +946,13 @@ arm("R3 the verdict counts the rows the HOST will use, not the rows the plugin k
 });
 
 // ---------------------------------------------------------------------------
-// V. THE REMEDY IS VALIDATED AGAINST THE HOST'S OWN RULE
+// V. THE CELL-SIDE TRAP STAYS ASSERTED EVEN THOUGH NOTHING PRINTS IT
 //
-// An earlier head of this PR printed "delete the models array". Measured:
+// An earlier head of this PR printed "delete the models array", and the head
+// before this one printed a `"models": []` remedy. Neither is printed now: the
+// runtime hook makes the config-declared route work, so there is nothing for an
+// operator to fix and advising an edit would be a NEW way to take the cell down.
+// The knowledge is kept here and asserted. Measured:
 // `ModelProvidersSchema.superRefine` (`src/config/zod-schema.core.ts:559-567`)
 // raises "custom model providers must declare models" for any provider not in
 // `BUILT_IN_MODEL_PROVIDER_OVERLAY_IDS` (`:435-515`), and `claude-runner` is
@@ -754,34 +968,40 @@ function hostAcceptsProviderEntry(entry: AnyRec): boolean {
   return typeof entry.baseUrl === "string" && Array.isArray(entry.models);
 }
 
-arm("V1 the printed remedy produces a config the host ACCEPTS", async () => {
-  const entry = structuredClone(CELL_PROVIDER_ENTRY) as AnyRec;
-  entry.models = []; // what the line now tells the operator to do
-  assert.equal(hostAcceptsProviderEntry(entry), true, "the remedy yields an invalid config");
+arm("V1 the verdict never tells the operator to touch the cell's models array at all", async () => {
+  // The remedy string is GONE, because the runtime hook removes the need for it.
+  // This arm is the regression guard on that: an earlier head of this PR printed
+  // "delete the models array", which is the one action that takes the cell DOWN
+  // rather than crash-looping it. The absence is asserted rather than trusted.
+  const { logs } = await runDiscoveryLogged(cellConfig());
+  const line = [...logs.info, ...logs.error].find((l) => l.includes("session-affinity override"))!;
+  assert.ok(line, "no verdict at all");
+  assert.equal(/delete the/i.test(line), false, "the line tells the operator to delete the key");
+  assert.equal(/REMEDY/.test(line), false, "the line still prints an operator remedy");
 });
 
-arm("V2 the remedy the line explicitly warns against would be REJECTED", async () => {
-  // The negative control on V1. Without it V1 could pass against a predicate
-  // that accepts everything.
-  const entry = structuredClone(CELL_PROVIDER_ENTRY) as AnyRec;
-  delete entry.models; // the advice an earlier head of this PR printed
+arm("V2 the deletion that an earlier head advised would still be REJECTED by the host", async () => {
+  // Keeps the measured knowledge asserted now that nothing prints it:
+  // `zod-schema.core.ts:559-567` raises "custom model providers must declare
+  // models" for a provider outside BUILT_IN_MODEL_PROVIDER_OVERLAY_IDS, and
+  // EXIT_CONFIG_ERROR 78 is also SYSTEMD_NO_RESTART_EXIT_STATUS.
+  const emptied = structuredClone(CELL_PROVIDER_ENTRY) as AnyRec;
+  emptied.models = [];
+  assert.equal(hostAcceptsProviderEntry(emptied), true, '"models": [] should be accepted');
+  const deleted = structuredClone(CELL_PROVIDER_ENTRY) as AnyRec;
+  delete deleted.models;
   assert.equal(
-    hostAcceptsProviderEntry(entry),
+    hostAcceptsProviderEntry(deleted),
     false,
     "deleting the key is accepted after all -- re-read zod-schema.core.ts:559-567",
   );
-  const { logs } = await runDiscoveryLogged(cellConfig());
-  const line = logs.error.find((l) => l.includes("session-affinity override"))!;
-  assert.equal(
-    /REMEDY: delete the/.test(line),
-    false,
-    "the line still tells the operator to delete the key",
-  );
 });
 
-arm("V3 the remedy actually routes to the branch where the override works", async () => {
-  // End to end on the remedy itself: apply it, run the real discovery.run, run
-  // the measured host merge, and require the flag on the wire.
+arm("V3 the plugin-advertised route still works WITHOUT the hook, so the two surfaces are independent", async () => {
+  // The hook must not have become load-bearing for the route that already
+  // worked: if the host's registry lookup ever fails to find this plugin, the
+  // advertised-catalog route has to keep carrying the flag on its own. The hook
+  // is deliberately NOT applied here.
   const entry = structuredClone(CELL_PROVIDER_ENTRY) as AnyRec;
   entry.models = [];
   const config = {
@@ -791,7 +1011,7 @@ arm("V3 the remedy actually routes to the branch where the override works", asyn
   const { out, logs } = await runDiscoveryLogged(config);
   assert.ok(
     logs.info.some((l) => l.includes("ACTIVE on the plugin-advertised model catalog")),
-    `the remedy did not route to the working branch: ${JSON.stringify(logs)}`,
+    `an empty config array did not route to the advertised catalog: ${JSON.stringify(logs)}`,
   );
   const merged = hostMergeImplicitProvider({
     providerId: PROVIDER_ID,
@@ -803,7 +1023,7 @@ arm("V3 the remedy actually routes to the branch where the override works", asyn
   for (const m of models) {
     const received = await overTheWire(wireHeadersFor(m, SESSION));
     for (const h of AFFINITY_HEADERS) {
-      assert.equal(received[h], SESSION, `after the remedy, ${m.id}: ${h} never arrived`);
+      assert.equal(received[h], SESSION, `without the hook, ${m.id}: ${h} never arrived`);
     }
   }
 });

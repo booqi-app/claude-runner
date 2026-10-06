@@ -1036,15 +1036,84 @@ export type ExtensionBridgeOptions = Omit<BridgeConfig, "workDir">;
  * provider say "keep the implicit models", is a HOST-SIDE table containing only
  * `ollama`; a plugin cannot register into it from this repository.
  *
- * So on the config-declared route this plugin CANNOT make the override take
- * effect, and the failure is silent: the gateway starts, the models work, and
- * the request simply goes out without the headers. That is the one failure mode
- * this slice cannot afford, so it is reported instead of hoped about -- the same
- * discipline as the S1 affinity line, which reports what it EXAMINED rather
- * than asserting an outcome.
+ * 🔴 EVERYTHING ABOVE IS STILL TRUE OF THE DISCOVERY RETURN, AND IT IS NO
+ * LONGER THE WHOLE STORY. An earlier head of this file concluded from it that
+ * "on the config-declared route this plugin CANNOT make the override take
+ * effect". That conclusion was exhaustive over the `models-config` MERGE layer
+ * and never looked at the provider-runtime HOOK layer beneath it. Measured in
+ * the installed OpenClaw `2026.7.1-beta.5` tree, every hop:
  *
- * 🔴 AND THE REMEDY IS NARROW, measured. The remedy is `"models": []`, NOT the
- * deletion of the key. `ModelProvidersSchema.superRefine`
+ *   src/plugins/types.ts:1346-1355      `normalizeResolvedModel?: (ctx) =>
+ *                                        ProviderRuntimeModel | null | undefined`,
+ *                                        docstring: "rewrite a resolved model
+ *                                        without forking the generic runner:
+ *                                        swap API ids, update base URLs, or
+ *                                        adjust compat flags for a provider's
+ *                                        transport quirks."
+ *   src/plugins/types.ts:548-555        the context: six fields, three optional
+ *                                        (`config`, `agentDir`, `workspaceDir`),
+ *                                        plus `provider`, `modelId`, `model`.
+ *   src/plugins/provider-validation.ts
+ *     :378-401                          `normalizeRegisteredProvider`
+ *                                        destructures out only wizard/docsPath/
+ *                                        aliases/envVars/catalog/discovery and
+ *                                        spreads `...restProvider`, so the hook
+ *                                        survives registration VERBATIM.
+ *   src/plugins/provider-hook-runtime.ts
+ *     :178-193                          `findProviderRuntimePluginInRegistry`
+ *                                        matches over `registry.providers` by
+ *                                        provider id with NO
+ *                                        `origin === "bundled"` filter -- unlike
+ *                                        the `normalizeConfig` surface, which is
+ *                                        gated. A path-loaded plugin qualifies.
+ *   src/plugins/provider-runtime.ts
+ *     :325-347                          `normalizeProviderResolvedModelWithPlugin`
+ *                                        calls it and `?? undefined`s a nullish
+ *                                        return, so returning `undefined` means
+ *                                        "no change".
+ *   src/agents/embedded-agent-runner/model.ts
+ *     :272-285                          the hook runs FIRST inside the local
+ *                                        `normalizeResolvedModel`, and its
+ *                                        result is what the transport pass and
+ *                                        `normalizeResolvedProviderModel` see.
+ *     :937  (source "configured")        invoked on the configured-model path --
+ *     :994  (source "registry")           i.e. DOWNSTREAM of
+ *                                        `mergeImplicitProviderConfig`, after the
+ *                                        config array has already replaced ours.
+ *     :88-104, :136-150                  the hook is live in
+ *                                        TARGET/DEFAULT/SKIP_AGENT_DISCOVERY
+ *                                        hook sets. It is a no-op ONLY in
+ *                                        STATIC_PROVIDER_RUNTIME_HOOKS, reached
+ *                                        only via `skipProviderRuntimeHooks:
+ *                                        true`, whose sole non-test callers are
+ *                                        `src/agents/tools/image-tool.ts:516`
+ *                                        and `src/media-understanding/image.ts:161`
+ *                                        -- not the chat path.
+ *   src/agents/embedded-agent-runner/model.provider-normalization.ts:10-12
+ *                                       is `normalizeModelCompat`, and
+ *                                       `src/plugins/provider-model-compat.ts:115-119`
+ *                                       is a spread, so a `compat` key it does
+ *                                       not itself carry survives it.
+ *
+ * The hook's return is IN-MEMORY and never zod-validated -- the same argument
+ * that makes the discovery return safe -- so the unknown key is legal there and
+ * the exit-78 trap above does not apply to it. What is `ONGEMETEN`: no LIVE run
+ * was observed. Structural reachability is not an executed path, and
+ * `resolveProviderRuntimePlugin` still has to find a LOADED plugin registry in
+ * the gateway process. Both are stated on booqi-app/infra#327 rather than
+ * assumed away here.
+ *
+ * So the verdict below reports which MECHANISM carries the override on the route
+ * taken, and the counts distinguish the rows whose discovery-return decoration
+ * the host discards from the rows the runtime hook re-decorates. The failure
+ * this slice cannot afford is still a SILENT one, so the line still reports what
+ * it EXAMINED rather than asserting an outcome.
+ *
+ * 🔴 AND IF ANYONE EVER DOES EDIT THE CELL: the shape is `"models": []`, NOT
+ * the deletion of the key. No remedy is PRINTED any more -- the runtime hook
+ * removes the need for one -- but the trap is kept here and asserted by arms
+ * V1/V2, because the knowledge is what stops the next person from taking the
+ * cell down. `ModelProvidersSchema.superRefine`
  * (`src/config/zod-schema.core.ts:559-567`) raises "custom model providers must
  * declare models" for any provider that is not in
  * `BUILT_IN_MODEL_PROVIDER_OVERLAY_IDS` (`:435-515`), and `claude-runner` is not
@@ -1064,8 +1133,18 @@ export interface SessionAffinityOverrideReport {
   examined: number;
   /** Rows on which the override will actually reach the request. */
   effective: number;
-  /** Rows whose override the host replaces with the config row. */
-  discardedByHost: number;
+  /**
+   * Rows whose DISCOVERY-RETURN decoration the host replaces with the config
+   * row (`implicit.ts:287-294`). This is NOT a count of rows that lose the
+   * override: `normalizeResolvedModel` re-applies it downstream of that merge.
+   * It is kept, and named for what it measures, because it is the number that
+   * says which mechanism is load-bearing on this route.
+   */
+  discoveryReturnDiscardedByHost: number;
+  /** Rows carried by the plugin's own advertised catalog. */
+  effectiveViaCatalog: number;
+  /** Rows carried by the `normalizeResolvedModel` runtime hook. */
+  effectiveViaRuntimeHook: number;
 }
 
 export function sessionAffinityOverrideReport(params: {
@@ -1078,12 +1157,19 @@ export function sessionAffinityOverrideReport(params: {
     Number.isFinite(params.modelCount) && params.modelCount > 0
       ? Math.floor(params.modelCount)
       : 0;
-  const effective = params.route === "plugin-advertised" ? examined : 0;
+  // Every examined row is effective on BOTH routes now, by two different
+  // mechanisms. The split is what makes the line diagnostic rather than
+  // reassuring: on the config-declared route the discovery-return decoration IS
+  // discarded, and saying so is what tells the next reader which surface to go
+  // look at when the headers are missing.
+  const viaCatalog = params.route === "plugin-advertised" ? examined : 0;
   return {
     route: params.route,
     examined,
-    effective,
-    discardedByHost: examined - effective,
+    effective: examined,
+    discoveryReturnDiscardedByHost: examined - viaCatalog,
+    effectiveViaCatalog: viaCatalog,
+    effectiveViaRuntimeHook: examined - viaCatalog,
   };
 }
 
@@ -1094,7 +1180,10 @@ export function sessionAffinityOverrideReport(params: {
 export function sessionAffinityOverrideMessage(report: SessionAffinityOverrideReport): string {
   const tail =
     `examined ${report.examined} ${plural(report.examined, "model row", "model rows")}:`
-    + ` ${report.effective} effective, ${report.discardedByHost} discarded-by-host`;
+    + ` ${report.effective} effective`
+    + ` (${report.effectiveViaCatalog} via the advertised catalog,`
+    + ` ${report.effectiveViaRuntimeHook} via the normalizeResolvedModel runtime hook),`
+    + ` ${report.discoveryReturnDiscardedByHost} discovery-return-discarded-by-host`;
 
   if (report.route === "plugin-advertised") {
     return (
@@ -1103,18 +1192,17 @@ export function sessionAffinityOverrideMessage(report: SessionAffinityOverrideRe
     );
   }
   return (
-    `Claude Runner: session-affinity override WILL BE DISCARDED by the host.`
-    + ` openclaw.json declares models.providers."claude-runner".models, and OpenClaw's`
+    `Claude Runner: session-affinity override ACTIVE via the normalizeResolvedModel runtime`
+    + ` hook. openclaw.json declares models.providers."claude-runner".models, so OpenClaw's`
     + ` implicit-provider merge replaces the discovered models array with the config one`
-    + ` (models-config.providers.implicit.ts:287-294), so compat.sendSessionAffinityHeaders`
-    + ` never reaches the request and the cell gateway will keep answering tools/list with`
-    + ` an empty list. REMEDY: set that provider entry's "models" to an EMPTY ARRAY`
-    + ` ("models": []) in openclaw.json -- do NOT delete the key. An empty array routes`
-    + ` this plugin to its own advertised catalog, where the override does take effect.`
-    + ` DELETING the key fails config validation ("custom model providers must declare`
-    + ` models"), because claude-runner is not a bundled provider overlay, and the gateway`
-    + ` then exits 78 -- which is also systemd's no-restart status, so the cell stays DOWN`
-    + ` until a human intervenes. ${tail}.`
+    + ` (models-config.providers.implicit.ts:287-294) and the decoration on the discovery`
+    + ` return is discarded. The provider's normalizeResolvedModel hook re-applies`
+    + ` compat.sendSessionAffinityHeaders DOWNSTREAM of that merge`
+    + ` (src/agents/embedded-agent-runner/model.ts:937 and :994), so the override does reach`
+    + ` the request on this route. If the three session-affinity headers are nevertheless`
+    + ` absent, the hook did not fire: check that this plugin is in the gateway's LOADED`
+    + ` plugin registry (plugins.load.paths) -- and check cacheRetention, which is the`
+    + ` second condition on the same emission. ${tail}.`
   );
 }
 
