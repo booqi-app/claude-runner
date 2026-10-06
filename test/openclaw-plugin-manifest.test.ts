@@ -18,7 +18,7 @@ import { test } from "node:test";
  *      per-model object ends in `.strict()`, with `compat: ModelCompatSchema`
  *      at src/config/zod-schema.core.ts:416. ModelCompatSchema is defined at
  *      src/config/zod-schema.core.ts:221-250, is `.strict()` at :250, and
- *      enumerates 27 compat fields - `sendSessionAffinityHeaders` is NOT one
+ *      enumerates 24 compat fields - `sendSessionAffinityHeaders` is NOT one
  *      of them. An unrecognized key on a `.strict()` zod object is a
  *      validation ERROR, which is why putting this flag on a model entry in
  *      `openclaw.json` makes the gateway exit 78 and crash-loop (measured in
@@ -34,10 +34,31 @@ import { test } from "node:test";
  *      `modelCatalog` does not appear in zod-schema.core.ts at all.
  *
  * So the flag is legal in `openclaw.plugin.json` and illegal in
- * `openclaw.json`. That asymmetry is the whole reason route A is a manifest
- * change and needs no patch to OpenClaw itself.
+ * `openclaw.json`. That asymmetry is why the declaration below LOADS at all,
+ * and why it needs no patch to OpenClaw itself.
  *
- * The flag is what makes the session hint reach the wire. For an
+ * ---------------------------------------------------------------------------
+ * READ THIS BEFORE TRUSTING A GREEN RUN HERE.
+ *
+ * Loading is NOT the same as taking effect. Two independent reviews of this
+ * change established that for THIS plugin the declaration below does not
+ * currently reach a request, for a reason no arm in this file can see:
+ * `index.ts` registers a live `discovery.run` hook, so
+ * src/plugins/provider-discovery.runtime.ts:510-523 loads the REAL plugin
+ * provider and DISCARDS the synthetic provider built from this manifest.
+ * `resolvePluginProviders` wins; the manifest catalog loses.
+ *
+ * These arms are therefore MANIFEST-LEVEL only. They prove the declaration is
+ * present, well-formed, owned by this manifest, dimensioned, and able to
+ * survive `normalizeModelCatalog`. They prove NOTHING about a header on the
+ * wire. The measured next step is to carry the flag on the provider RETURN in
+ * index.ts (which is in-memory and never zod-validated) rather than through
+ * `configPatch`, which lands in `openclaw.json` and would be rejected at
+ * src/config/validation.ts:1055 - the b1005-3 exit-78 crash. See
+ * booqi-app/infra#327.
+ * ---------------------------------------------------------------------------
+ *
+ * The flag is what gates the headers at the transport. For an
  * `openai-completions` provider (which is what this plugin registers - see
  * index.ts, `api: "openai-completions"`) the consumer is
  * packages/ai/src/providers/openai-completions.ts:620-624:
@@ -99,7 +120,7 @@ const NORMALIZER_BOOLEAN_ALLOWLIST = new Set([
 ]);
 
 /**
- * The 27 compat keys the STRICT openclaw.json schema accepts
+ * The 24 compat keys the STRICT openclaw.json schema accepts
  * (src/config/zod-schema.core.ts:221-249). Anything we declare that is NOT in
  * here would be fatal on that path - which is why this manifest must never be
  * copied into openclaw.json wholesale.
@@ -389,11 +410,76 @@ arm("AC-2.4b: the catalog baseUrl matches DEFAULT_PORT in src/bridge-config.ts",
 });
 
 // ---------------------------------------------------------------------------
-// The battery asserts its own arm total, so a malformed file that yields zero
-// assertions cannot read as "0 failed".
+// AC-2.5: a model row without BOTH contextWindow and maxTokens is dropped.
+//
+// `modelDefinitionFromManifestRow` (src/plugins/provider-discovery.runtime.ts:163-188)
+// opens with:
+//
+//     if (!row.contextWindow || !row.maxTokens) {
+//       return undefined;
+//     }
+//
+// at :166-168. Every dropped row shrinks the `models` array, and
+// `providerConfigFromManifestRows` then returns undefined once it is empty
+// (:201-203), so the provider is never built. The first version of this slice
+// declared only `id` + `compat` and was INERT for exactly this reason - caught
+// in review, not by these arms, which is why the arm now exists.
 // ---------------------------------------------------------------------------
 
-const EXPECTED_ARMS = 12;
+arm("AC-2.5: every model row declares contextWindow and maxTokens, or it is dropped", () => {
+  for (const model of manifest.modelCatalog.providers[PROVIDER_ID].models) {
+    assert.ok(
+      typeof model.contextWindow === "number" && model.contextWindow > 0,
+      `model "${model.id}" has no positive contextWindow; ` +
+        "provider-discovery.runtime.ts:166-168 drops the row.",
+    );
+    assert.ok(
+      typeof model.maxTokens === "number" && model.maxTokens > 0,
+      `model "${model.id}" has no positive maxTokens; ` +
+        "provider-discovery.runtime.ts:166-168 drops the row.",
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// AC-2.6: `discovery` must not mark this provider runtime/refreshable.
+//
+// resolveManifestModelCatalogProviders skips an entry whose discovery mode is
+// "runtime" or "refreshable" (src/plugins/provider-discovery.runtime.ts:220-226),
+// which would close the only route this manifest has. A reviewer demonstrated a
+// mutant adding `"discovery": {"claude-runner": "runtime"}` that passed every
+// other arm while silently disabling the override - same silent-drop family as
+// AC-2.2 and AC-2.4.
+// ---------------------------------------------------------------------------
+
+arm("AC-2.6: discovery does not mark this provider runtime/refreshable", () => {
+  const discovery = manifest.modelCatalog?.discovery ?? {};
+  for (const [provider, mode] of Object.entries(discovery)) {
+    assert.ok(
+      !(provider === PROVIDER_ID && (mode === "runtime" || mode === "refreshable")),
+      `modelCatalog.discovery["${provider}"] = "${mode}" makes ` +
+        "resolveManifestModelCatalogProviders skip this provider " +
+        "(provider-discovery.runtime.ts:220-226), silently disabling the override.",
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The battery asserts its own arm total, so a malformed file that yields zero
+// assertions cannot read as "0 failed".
+//
+// NOTE on what this battery does and does not establish. These arms are
+// MANIFEST-LEVEL: they prove the declaration is present, well-formed, owned,
+// and survives `normalizeModelCatalog`. They do NOT prove the flag reaches a
+// request. Two independent reviews established that for THIS plugin it
+// currently does not: `index.ts` registers a live `discovery.run` hook, so
+// provider-discovery.runtime.ts:510-523 loads the real plugin provider and
+// DISCARDS the synthetic provider built from this manifest. Do not read a green
+// run here as evidence that the session-affinity header is on the wire.
+// See booqi-app/infra#327.
+// ---------------------------------------------------------------------------
+
+const EXPECTED_ARMS = 14;
 
 test("battery self-check: all S2 manifest arms ran", () => {
   assert.equal(
