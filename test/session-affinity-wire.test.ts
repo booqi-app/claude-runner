@@ -716,6 +716,22 @@ arm("H2 config-declared route: the host discards the decoration AND the register
       true,
       `${m.id}: normalizeResolvedModel did not restore the flag after the merge`,
     );
+    // The hook's return BECOMES the resolved model (`model.ts:310-313` returns
+    // `fallbackTransportNormalized ?? pluginNormalized ?? normalizedInputModel`),
+    // so a return that carries only `compat` would set the headers perfectly on
+    // a request that cannot be made. Until an independent reviewer wrote the
+    // mutant, every arm here projected the resolved model onto `compat` alone and
+    // a hook that dropped the other 11 fields passed all 35 arms -- the same
+    // wrong-layer blindness as rounds 1-3, one layer further down. Assert the
+    // model is handed back WHOLE, field by field, not just decorated.
+    for (const key of Object.keys(m)) {
+      if (key === "compat") continue;
+      assert.deepEqual(
+        resolved[key],
+        m[key],
+        `${m.id}: the hook dropped or altered ${key} from the resolved model`,
+      );
+    }
     // (c) and it is on the WIRE, over a real socket, on the route the cell takes.
     const received = await overTheWire(wireHeadersFor(resolved, SESSION));
     for (const h of AFFINITY_HEADERS) {
@@ -803,13 +819,44 @@ arm("H7 the hook's result survives the compat normalization the host runs next",
   // -- but it ALSO writes keys of its own, and a reader should see that proved
   // rather than assumed.
   const reg = await registerPlugin();
+  // Deliberately carries the TRANSPORT fields: a hook that returned only `id`
+  // and `compat` would leave the cell with a model that has no baseUrl and no
+  // api, i.e. headers set perfectly on a request that goes nowhere. That is
+  // strictly worse than the bug this slice fixes, and before these assertions
+  // existed it passed the whole battery.
+  const input = {
+    id: "claude-opus-4-6",
+    name: "Claude Opus 4.6 (SDK)",
+    api: "openai-completions",
+    baseUrl: "http://127.0.0.1:7779/v1",
+    headers: { "x-operator": "kept" },
+    input: ["text", "image"],
+    reasoning: true,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200000,
+    maxTokens: 16384,
+    compat: { supportsStrictMode: true },
+  };
   const resolved = hostRunNormalizeResolvedModel({
     registeredProvider: reg.provider,
     provider: PROVIDER_ID,
-    model: { id: "claude-opus-4-6", compat: { supportsStrictMode: true } },
+    model: input,
   });
   assert.equal(resolved.compat?.sendSessionAffinityHeaders, true, "the flag did not survive");
   assert.equal(resolved.compat?.supportsStrictMode, true, "an operator's own compat key was lost");
+  for (const key of Object.keys(input)) {
+    if (key === "compat") continue;
+    assert.deepEqual(
+      resolved[key],
+      (input as AnyRec)[key],
+      `the hook dropped or altered ${key}; its return BECOMES the resolved model`,
+    );
+  }
+  assert.deepEqual(
+    Object.keys(resolved).sort(),
+    Object.keys(input).sort(),
+    "the hook added or removed a top-level field of the resolved model",
+  );
   assert.equal(
     resolved.compat?.supportsDeveloperRole,
     false,
@@ -863,7 +910,7 @@ arm("R1 config-declared route reports the runtime-hook mechanism, with the disca
   const { logs } = await runDiscoveryLogged(cellConfig());
   const line = logs.info.find((l) => l.includes("session-affinity override"));
   assert.ok(line, `no session-affinity verdict on the info channel; got ${JSON.stringify(logs)}`);
-  assert.match(line!, /ACTIVE via the normalizeResolvedModel runtime hook/);
+  assert.match(line!, /ACTIVE STRUCTURALLY \(no live run observed\) via the normalizeResolvedModel runtime hook/);
   // The discard is still reported, because it is still true of the discovery
   // return and it is the number that says WHICH surface is load-bearing here.
   assert.match(
@@ -920,7 +967,7 @@ arm("R4 a case-variant provider key is resolved the way the HOST resolves it", a
     "the variant key was not resolved, so the plugin took the wrong branch",
   );
   assert.ok(
-    logs.info.some((l) => l.includes("ACTIVE via the normalizeResolvedModel runtime hook")),
+    logs.info.some((l) => l.includes("ACTIVE STRUCTURALLY (no live run observed)")),
     `reported the wrong route for a variant key: ${JSON.stringify(logs)}`,
   );
   assert.equal(

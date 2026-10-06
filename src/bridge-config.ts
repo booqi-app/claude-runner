@@ -1076,10 +1076,16 @@ export type ExtensionBridgeOptions = Omit<BridgeConfig, "workDir">;
  *                                        `normalizeResolvedModel`, and its
  *                                        result is what the transport pass and
  *                                        `normalizeResolvedProviderModel` see.
- *     :937  (source "configured")        invoked on the configured-model path --
- *     :994  (source "registry")           i.e. DOWNSTREAM of
- *                                        `mergeImplicitProviderConfig`, after the
- *                                        config array has already replaced ours.
+ *     :937, :994, :1030, :1185,          SIX invocation sites, not the two the
+ *     :1338, :1760                        first draft of this comment named: all
+ *                                        three `kind: "resolved"` returns
+ *                                        (`:935`, `:988`, `:1028`) go through it,
+ *                                        plus the dynamic and registry paths. All
+ *                                        are DOWNSTREAM of
+ *                                        `mergeImplicitProviderConfig`, i.e. after
+ *                                        the config array has already replaced
+ *                                        ours. Counted by an independent reviewer;
+ *                                        the original claim under-reported it.
  *     :88-104, :136-150                  the hook is live in
  *                                        TARGET/DEFAULT/SKIP_AGENT_DISCOVERY
  *                                        hook sets. It is a no-op ONLY in
@@ -1097,11 +1103,29 @@ export type ExtensionBridgeOptions = Omit<BridgeConfig, "workDir">;
  *
  * The hook's return is IN-MEMORY and never zod-validated -- the same argument
  * that makes the discovery return safe -- so the unknown key is legal there and
- * the exit-78 trap above does not apply to it. What is `ONGEMETEN`: no LIVE run
- * was observed. Structural reachability is not an executed path, and
- * `resolveProviderRuntimePlugin` still has to find a LOADED plugin registry in
- * the gateway process. Both are stated on booqi-app/infra#327 rather than
- * assumed away here.
+ * the exit-78 trap above does not apply to it.
+ *
+ * 🔴 WHAT IS `ONGEMETEN`, AND EXACTLY WHERE IT CAN BREAK. No LIVE run was
+ * observed; structural reachability is not an executed path. The hook only fires
+ * if `resolveProviderRuntimePlugin` (`provider-hook-runtime.ts:229`) finds this
+ * plugin, and there are TWO concrete gates on that, both found by an independent
+ * reviewer and neither measured. Anyone debugging missing headers should start
+ * here rather than re-deriving the route:
+ *   * route (a), the loaded-registry path
+ *     (`findProviderRuntimePluginInLoadedRegistries:138-176` ->
+ *     `active-runtime-registry.ts:101-135`): at **`:124-126`**, if
+ *     `params.workspaceDir` is defined and differs from
+ *     `getActivePluginRegistryWorkspaceDir()`, this returns `undefined` and the
+ *     loaded registry is silently skipped. `model.ts` passes the agent's
+ *     `workspaceDir` straight through, so a workspaceDir mismatch is a silent
+ *     miss. This is the load-bearing route.
+ *   * route (b), the fallback (`providers.runtime.ts:320-373`): at
+ *     **`:357-368`**, `onlyPluginIds?.length === 0` yields an undefined registry
+ *     and an empty result. `onlyPluginIds` comes from the INSTALLED-plugin index
+ *     (`:272-281`), and a plugin mounted via `plugins.load.paths` is not
+ *     guaranteed to be in that index; `model.ts` passes no
+ *     `pluginMetadataSnapshot`. Genuinely doubtful.
+ * Both are recorded on booqi-app/infra#327 rather than assumed away here.
  *
  * So the verdict below reports which MECHANISM carries the override on the route
  * taken, and the counts distinguish the rows whose discovery-return decoration
@@ -1188,18 +1212,21 @@ export function sessionAffinityOverrideMessage(report: SessionAffinityOverrideRe
   if (report.route === "plugin-advertised") {
     return (
       `Claude Runner: session-affinity override ACTIVE on the plugin-advertised model catalog`
-      + ` -- compat.sendSessionAffinityHeaders reaches the request. ${tail}.`
+      + ` -- compat.sendSessionAffinityHeaders is set on every advertised row and the host`
+      + ` merge keeps it. Whether it reaches the request also needs a non-empty sessionId and`
+      + ` cacheRetention != "none", neither of which this plugin can observe. ${tail}.`
     );
   }
   return (
-    `Claude Runner: session-affinity override ACTIVE via the normalizeResolvedModel runtime`
-    + ` hook. openclaw.json declares models.providers."claude-runner".models, so OpenClaw's`
+    `Claude Runner: session-affinity override ACTIVE STRUCTURALLY (no live run observed)`
+    + ` via the normalizeResolvedModel runtime hook. openclaw.json declares models.providers."claude-runner".models, so OpenClaw's`
     + ` implicit-provider merge replaces the discovered models array with the config one`
     + ` (models-config.providers.implicit.ts:287-294) and the decoration on the discovery`
     + ` return is discarded. The provider's normalizeResolvedModel hook re-applies`
     + ` compat.sendSessionAffinityHeaders DOWNSTREAM of that merge`
     + ` (src/agents/embedded-agent-runner/model.ts:937 and :994), so the override does reach`
-    + ` the request on this route. If the three session-affinity headers are nevertheless`
+    + ` the request on this route -- every hop verified in the installed tree, none of them`
+    + ` executed. If the three session-affinity headers are nevertheless`
     + ` absent, the hook did not fire: check that this plugin is in the gateway's LOADED`
     + ` plugin registry (plugins.load.paths) -- and check cacheRetention, which is the`
     + ` second condition on the same emission. ${tail}.`
