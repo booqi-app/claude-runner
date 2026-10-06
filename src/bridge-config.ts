@@ -407,6 +407,16 @@ export interface SessionHintContext {
    * no entropy, so `?session=default` is guessed in one attempt.
    */
   chatSessionId?: string | undefined;
+  /**
+   * What the session-affinity header examination found, per header name.
+   *
+   * Carried so the ONE log line can report what it EXAMINED rather than only
+   * that it found nothing. Optional because `buildQueryOptions` has callers
+   * that never saw an HTTP request; an omitted report renders an explicit
+   * `UNAVAILABLE` marker rather than degrading to the pre-S1 string, and it
+   * never fabricates `ABSENT`.
+   */
+  affinityHeaders?: readonly AffinityHeaderExamination[] | undefined;
   /** Where the one line about the outcome goes. */
   log?: ((message: string) => void) | undefined;
 }
@@ -474,12 +484,86 @@ const CHAT_SESSION_ID = /^[A-Za-z0-9_-]{1,200}$/;
  * value; see `SessionHintContext.chatSessionId`.
  */
 export function chatSessionFromAgentSessionKey(value: unknown): string | undefined {
+  return examineAgentSessionKey(value).chatSessionId;
+}
+
+/**
+ * The five rules that can refuse a session-affinity header value.
+ *
+ * One member per `return undefined` path in the classifier below, counted out
+ * of the source rather than from prose. The rule NAME is the diagnostic; the
+ * value it refused is never part of it -- see {@link affinityExaminationSummary}.
+ *
+ *  - `not-a-string`              -- `normaliseChatSessionId`, non-string branch
+ *  - `blank`                     -- `normaliseChatSessionId`, empty-after-trim branch
+ *  - `not-an-agent-session-key`  -- `AGENT_SESSION_KEY` did not match
+ *  - `blank-tail`                -- matched, but the captured tail is whitespace
+ *  - `tail-not-a-chat-session-id`-- tail fails `CHAT_SESSION_ID`
+ */
+export type AffinityRefusalRule =
+  | "not-a-string"
+  | "blank"
+  | "not-an-agent-session-key"
+  | "blank-tail"
+  | "tail-not-a-chat-session-id";
+
+/**
+ * What one header name was found to be. THREE states, and `absent` is one.
+ *
+ * `absent` and `refused` are deliberately NOT the same member. Collapsing them
+ * is the defect this type exists to make unrepresentable: a header the host
+ * never sent and a header the host sent and we rejected have OPPOSITE remedies
+ * (make the host send one / relax the rule), and until now both produced the
+ * byte-identical log line `no usable chat-session identifier was available`.
+ */
+export type AffinityVerdict =
+  | { readonly kind: "absent" }
+  | { readonly kind: "accepted" }
+  | { readonly kind: "refused"; readonly rule: AffinityRefusalRule };
+
+/** One header name and the verdict reached on it. Never carries the value. */
+export interface AffinityHeaderExamination {
+  readonly header: string;
+  readonly verdict: AffinityVerdict;
+}
+
+/** The verdict on a value, plus the chat session it yielded when accepted. */
+export interface AgentSessionKeyExamination {
+  readonly chatSessionId: string | undefined;
+  readonly verdict: AffinityVerdict;
+}
+
+/**
+ * Classify a candidate session-affinity value, naming the rule that refused it.
+ *
+ * This is the ONLY place the five refusal paths exist.
+ * {@link chatSessionFromAgentSessionKey} is a projection of this function, so
+ * the reported rule and the routing decision cannot drift apart: a change that
+ * moved one without the other would have to delete the projection first.
+ *
+ * `undefined` in means `not-a-string`, which is NOT the same as `absent`: only
+ * the CALLER knows whether the header was sent at all. See
+ * {@link examineAffinityHeaders}.
+ */
+export function examineAgentSessionKey(value: unknown): AgentSessionKeyExamination {
+  if (typeof value !== "string") {
+    return { chatSessionId: undefined, verdict: { kind: "refused", rule: "not-a-string" } };
+  }
   const key = normaliseChatSessionId(value);
-  if (key === undefined) return undefined;
+  if (key === undefined) {
+    return { chatSessionId: undefined, verdict: { kind: "refused", rule: "blank" } };
+  }
   const match = AGENT_SESSION_KEY.exec(key);
-  if (match === null) return undefined;
+  if (match === null) {
+    return {
+      chatSessionId: undefined,
+      verdict: { kind: "refused", rule: "not-an-agent-session-key" },
+    };
+  }
   const tail = normaliseChatSessionId(match[1]);
-  if (tail === undefined) return undefined;
+  if (tail === undefined) {
+    return { chatSessionId: undefined, verdict: { kind: "refused", rule: "blank-tail" } };
+  }
   // The tail must be a chat session id the control plane would actually have
   // issued. This is checked against the real schema rather than by blacklisting
   // the shapes we happen to have thought of (review round 2):
@@ -510,8 +594,90 @@ export function chatSessionFromAgentSessionKey(value: unknown): string | undefin
   // the hint is dropped and one log line says so, the same branch a hintless
   // request already takes -- so it degrades to today's behaviour rather than to
   // a mis-route. The two must be changed together.
-  if (!CHAT_SESSION_ID.test(tail)) return undefined;
-  return tail;
+  if (!CHAT_SESSION_ID.test(tail)) {
+    return {
+      chatSessionId: undefined,
+      verdict: { kind: "refused", rule: "tail-not-a-chat-session-id" },
+    };
+  }
+  return { chatSessionId: tail, verdict: { kind: "accepted" } };
+}
+
+/**
+ * Examine every session-affinity header name and report a verdict for each.
+ *
+ * ALL names are examined, including the ones after the first acceptance: the
+ * routing decision is still "first that unwraps wins" (the caller takes the
+ * first `accepted`), but the REPORT is complete, because "the second header
+ * was also present and also refused" is exactly the fact that tells an
+ * operator whether the host is sending these at all.
+ *
+ * Absence is decided HERE and nowhere else, and it is decided by
+ * `Object.hasOwn` rather than by an `undefined` index lookup -- see the
+ * comment on the check itself for why the distinction is load-bearing. Node
+ * gives no value at all for a header it did not receive and never `undefined`
+ * for one it did (repeated headers of these names arrive joined with ", " into
+ * one string, and an empty one arrives as ""), so own-ness plus an
+ * `undefined`-value check is a sound absence test. It is the only thing that
+ * can tell `ABSENT` from {@link AffinityRefusalRule} `not-a-string`.
+ *
+ * @param names   the header names to examine, in priority order
+ * @param headers a lower-cased header bag (`IncomingMessage.headers`)
+ */
+export function examineAffinityHeaders(
+  names: readonly string[],
+  headers: Record<string, unknown>,
+): AffinityHeaderExamination[] {
+  return names.map((header) => {
+    // `Object.hasOwn`, not `headers[header] === undefined`. `IncomingMessage.headers`
+    // is NOT a null-prototype object, so a header name that collides with
+    // something on `Object.prototype` -- `constructor`, `toString`, `valueOf` --
+    // would read as PRESENT and be refused `not-a-string` while never having
+    // been sent. That is exactly the ABSENT/refused confusion this slice exists
+    // to remove, so it is closed here rather than left to the next person who
+    // adds a header name. (Review finding, b1006-1 loop F.)
+    if (!Object.hasOwn(headers, header)) {
+      return { header, verdict: { kind: "absent" } as AffinityVerdict };
+    }
+    const raw = headers[header];
+    if (raw === undefined) return { header, verdict: { kind: "absent" } as AffinityVerdict };
+    return { header, verdict: examineAgentSessionKey(raw).verdict };
+  });
+}
+
+/**
+ * The per-header report, as one log fragment. COUNTS AND RULES, NEVER VALUES.
+ *
+ * The values on these headers are session identifiers -- routing keys. The
+ * rule that refused one is a diagnostic; the identifier itself is a
+ * disclosure, and the same reasoning that keeps it out of
+ * {@link sessionHintMessage} keeps it out of here. Nothing derived from the
+ * value (no prefix, no suffix, no length) is rendered either: only the name of
+ * the header and the name of the rule, both of which are compile-time
+ * constants of this module.
+ *
+ * The aggregate counts come first so the line can be read at a glance, and the
+ * per-name verdicts follow so `ABSENT` can never be inferred from a total.
+ */
+export function affinityExaminationSummary(examined: readonly AffinityHeaderExamination[]): string {
+  const accepted = examined.filter((e) => e.verdict.kind === "accepted").length;
+  const refused = examined.filter((e) => e.verdict.kind === "refused").length;
+  const absent = examined.filter((e) => e.verdict.kind === "absent").length;
+  const perName = examined
+    .map((e) => {
+      const v = e.verdict;
+      const verdict = v.kind === "absent"
+        ? "ABSENT"
+        : v.kind === "accepted"
+          ? "accepted"
+          : `present-but-refused(${v.rule})`;
+      return `${JSON.stringify(e.header)}=${verdict}`;
+    })
+    .join(", ");
+  const noun = plural(examined.length, "name", "names");
+  return `examined ${examined.length} session-affinity header ${noun}:`
+    + ` ${accepted} accepted, ${refused} present-but-refused, ${absent} ABSENT`
+    + ` [${perName}]`;
 }
 
 /** What `applySessionHint` did, per server name. */
@@ -641,6 +807,7 @@ export function unhintedMcpServersMessage(
   unhinted: string[],
   haveIdentifier: boolean,
   hinted: string[] = [],
+  affinityHeaders: readonly AffinityHeaderExamination[] = [],
 ): string {
   const noun = plural(unhinted.length, "entry", "entries");
   const reason = haveIdentifier
@@ -649,6 +816,23 @@ export function unhintedMcpServersMessage(
   // What it examined, not just what went wrong: with one entry hinted and
   // another not, a line naming only the failure reads as if NOTHING was
   // hinted. The counts are the cheapest thing that cannot be misread.
+  // The hintless branch is the one the whole chain-head reading rests on, and
+  // on its own it cannot tell ABSENT from present-but-refused -- two worlds
+  // with opposite remedies. Appending the per-header examination is what
+  // separates them. Only rendered when there is no identifier: when the
+  // identifier came from a NON-affinity channel the affinity verdicts did not
+  // decide anything and reporting them would read as if they had.
+  // An EMPTY report renders as an explicit "unavailable", never as silence.
+  // Silence here would be byte-identical to a pre-S1 build, so an operator
+  // reading `docker logs` could not tell "the old image is still deployed"
+  // from "the new image is deployed and the report was not threaded through".
+  // This line is the measurement instrument for the whole infra#327 chain-head
+  // reading; it must not have a failure mode that looks like the old world.
+  const affinitySuffix = !haveIdentifier
+    ? (affinityHeaders.length > 0
+      ? ` ${affinityExaminationSummary(affinityHeaders)}.`
+      : " affinity-header examination UNAVAILABLE (no report was threaded to this log line).")
+    : "";
   const alsoHinted = hinted.length > 0
     ? ` ${hinted.length} other ${plural(hinted.length, "entry", "entries")} DID get the hint:`
       + ` ${quotedNames(hinted)}.`
@@ -656,7 +840,8 @@ export function unhintedMcpServersMessage(
   return `Claude Runner: no chat-session hint written for ${unhinted.length} mcpServers ${noun}:`
     + ` ${quotedNames(unhinted)} -- ${reason};`
     + " the URL goes to the SDK unchanged and the cell gateway will answer tools/list with an empty list."
-    + alsoHinted;
+    + alsoHinted
+    + affinitySuffix;
 }
 
 /**
@@ -858,6 +1043,7 @@ export function buildQueryOptions(
     if (outcome.unhinted.length > 0) {
       session.log?.(unhintedMcpServersMessage(
         outcome.unhinted, chatSessionId !== undefined, outcome.hinted,
+        session.affinityHeaders ?? [],
       ));
     } else if (outcome.hinted.length > 0) {
       session.log?.(sessionHintMessage(outcome.hinted));

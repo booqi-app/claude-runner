@@ -25,10 +25,12 @@ import type { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import {
   buildQueryOptions,
   chatSessionFromAgentSessionKey,
+  examineAffinityHeaders,
   normaliseChatSessionId,
   resolveSystemPrompt,
 } from "./bridge-config.ts";
-import type { BridgeConfig } from "./bridge-config.ts";
+import type { AffinityHeaderExamination, BridgeConfig } from "./bridge-config.ts";
+export type { AffinityHeaderExamination } from "./bridge-config.ts";
 
 export type { BridgeConfig, McpServerEntry } from "./bridge-config.ts";
 
@@ -399,20 +401,39 @@ const CHAT_SESSION_HEADER = "x-booqi-chat-session";
  * value is OpenClaw's own session id unless the run was keyed by the cell, and
  * only the keyed form names something `apps/cell` can resolve.
  */
-const SESSION_AFFINITY_HEADERS = ["session_id", "x-client-request-id", "x-session-affinity"] as const;
+export const SESSION_AFFINITY_HEADERS = ["session_id", "x-client-request-id", "x-session-affinity"] as const;
 
 /**
- * The chat session an OpenClaw session-affinity header names, if any.
+ * What the session-affinity headers carried, per name, plus the winner.
  *
- * First header that unwraps wins. All three carry the same value in the
- * measured host, so the order is only a tie-break for a host that diverges.
+ * First header that unwraps wins -- unchanged. All three carry the same value
+ * in the measured host, so the order is only a tie-break for a host that
+ * diverges.
+ *
+ * Every name is examined even once one has been accepted. That costs three
+ * regex runs and buys the only thing that makes the hintless log line
+ * readable: whether a name was ABSENT (the host sends nothing -- the remedy is
+ * route A, `compat.sendSessionAffinityHeaders`) or present-but-refused (the
+ * host sends something we reject -- the remedy is the rule). Before this, both
+ * produced the identical line and the two were indistinguishable.
  */
-function affinityChatSession(req: IncomingMessage): string | undefined {
-  for (const header of SESSION_AFFINITY_HEADERS) {
-    const unwrapped = chatSessionFromAgentSessionKey(req.headers[header]);
-    if (unwrapped !== undefined) return unwrapped;
+export function examineAffinityChatSession(req: IncomingMessage): {
+  chatSessionId: string | undefined;
+  examined: AffinityHeaderExamination[];
+} {
+  const headers = req.headers as unknown as Record<string, unknown>;
+  const examined = examineAffinityHeaders(SESSION_AFFINITY_HEADERS, headers);
+  let chatSessionId: string | undefined;
+  for (const entry of examined) {
+    if (entry.verdict.kind !== "accepted") continue;
+    // Re-derive the value from the header rather than carrying it on the
+    // verdict: the verdict is a logged object and must never hold the
+    // identifier. `examineAffinityHeaders` and `chatSessionFromAgentSessionKey`
+    // are projections of the same classifier, so this cannot disagree.
+    chatSessionId = chatSessionFromAgentSessionKey(headers[entry.header]);
+    if (chatSessionId !== undefined) break;
   }
-  return undefined;
+  return { chatSessionId, examined };
 }
 
 /** A request's conversation key, and whether anyone but us named it. */
@@ -430,6 +451,14 @@ export interface ResolvedConversation {
    * routing key. That is the fail-open form of this feature.
    */
   chatSessionId: string | undefined;
+  /**
+   * The per-header verdicts on the session-affinity headers.
+   *
+   * Always `SESSION_AFFINITY_HEADERS.length` long, including when a
+   * non-affinity channel named the session: "the affinity headers were absent
+   * anyway" is itself the measurement this field exists to carry.
+   */
+  affinityHeaders: AffinityHeaderExamination[];
 }
 
 /**
@@ -492,17 +521,23 @@ export function resolveConversation(
   // later channel. Before the affinity headers below existed that only lost the
   // hint, which is fail-closed; with them it handed the request to a DIFFERENT
   // chat session, which is not.
+  // Examined unconditionally, BEFORE the `??` chain, because the chain
+  // short-circuits: when an earlier channel names the session the affinity
+  // headers are never looked at, and "not looked at" would then be reported as
+  // if it were a finding. The examination has no side effects.
+  const affinity = examineAffinityChatSession(req);
   const named =
     normaliseChatSessionId(req.headers[CHAT_SESSION_HEADER]) ??
     normaliseChatSessionId(req.headers["x-session-id"]) ??
     normaliseChatSessionId(req.headers["x-conversation-id"]) ??
     normaliseChatSessionId(body.conversation_id) ??
     normaliseChatSessionId(body.metadata?.conversation_id) ??
-    affinityChatSession(req);
+    affinity.chatSessionId;
 
   return {
     conversationId: named ?? deriveConversationIdFromMessages(body.messages ?? []),
     chatSessionId: named,
+    affinityHeaders: affinity.examined,
   };
 }
 
@@ -533,7 +568,7 @@ async function handleCompletions(
 
   const prompt = extractPromptFromMessages(messages);
   const systemPrompt = extractSystemPrompt(messages);
-  const { conversationId, chatSessionId } = resolveConversation(req, body);
+  const { conversationId, chatSessionId, affinityHeaders } = resolveConversation(req, body);
 
   if (!prompt) {
     res.writeHead(400, { "Content-Type": "application/json" });
@@ -545,6 +580,7 @@ async function handleCompletions(
     await requestQueue.enqueue(async () => {
       await executeWithRetries(
         prompt, model, systemPrompt, conversationId, stream, res, requestId, config, chatSessionId,
+        affinityHeaders,
       );
     });
   } catch (err: any) {
@@ -571,6 +607,14 @@ export async function executeWithRetries(
    * Separate from `conversationId` on purpose; see `ResolvedConversation`.
    */
   chatSessionId?: string,
+  /**
+   * The per-header affinity verdicts, for the one log line. Defaulted so the
+   * unit suite's existing direct callers keep compiling. An empty report is
+   * rendered as an explicit `UNAVAILABLE` marker -- deliberately NOT as the
+   * pre-S1 string, so a missing report cannot impersonate an undeployed
+   * build -- and never as a fabricated `ABSENT`.
+   */
+  affinityHeaders: readonly AffinityHeaderExamination[] = [],
 ): Promise<void> {
   const maxRetries = config.maxRetries ?? MAX_RETRIES;
   let lastError = "";
@@ -617,12 +661,12 @@ export async function executeWithRetries(
         if (stream) {
           await handleStreamingResponse(
             prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
-            res, requestId, config, chatSessionId, hintLog,
+            res, requestId, config, chatSessionId, hintLog, affinityHeaders,
           );
         } else {
           await handleNonStreamingResponse(
             prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
-            res, requestId, config, chatSessionId, hintLog,
+            res, requestId, config, chatSessionId, hintLog, affinityHeaders,
           );
         }
         summaryDelivered = true;
@@ -704,11 +748,12 @@ async function handleStreamingResponse(
   config: BridgeConfig,
   chatSessionId: string | undefined,
   hintLog: (message: string) => void,
+  affinityHeaders: readonly AffinityHeaderExamination[],
 ): Promise<void> {
   const abortController = new AbortController();
   const options = buildQueryOptions(
     model, systemPrompt, resumeSessionId, newSessionId, config, abortController,
-    { chatSessionId, log: hintLog },
+    { chatSessionId, affinityHeaders, log: hintLog },
   );
 
   const q = (await getQuery())({ prompt, options });
@@ -866,11 +911,12 @@ async function handleNonStreamingResponse(
   config: BridgeConfig,
   chatSessionId: string | undefined,
   hintLog: (message: string) => void,
+  affinityHeaders: readonly AffinityHeaderExamination[],
 ): Promise<void> {
   const abortController = new AbortController();
   const options = buildQueryOptions(
     model, systemPrompt, resumeSessionId, newSessionId, config, abortController,
-    { chatSessionId, log: hintLog },
+    { chatSessionId, affinityHeaders, log: hintLog },
   );
 
   const q = (await getQuery())({ prompt, options });
@@ -1058,6 +1104,17 @@ export const __testing = {
   setLog(fn: ((message: string) => void) | undefined): void {
     logOverride = fn;
   },
+  /**
+   * The real HTTP entry point, exposed so the JOIN can be tested.
+   *
+   * `handleCompletions` is the ONLY place in production where
+   * `resolveConversation().affinityHeaders` reaches `executeWithRetries`.
+   * Before this was exposed, deleting that one argument left all arms green
+   * while the deployed log line silently reverted to the pre-S1 string -- a
+   * surviving mutant on the entire purpose of the slice, catchable only by the
+   * deploy-and-read step it exists to serve. (Review finding, b1006-1 loop F.)
+   */
+  handleCompletions,
 };
 
 export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<typeof createServer>> {
