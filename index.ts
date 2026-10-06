@@ -29,6 +29,8 @@ import {
   isUnknownSystemPromptMode,
   normaliseSystemPromptMode,
   summariseMcpServers,
+  sessionAffinityOverrideMessage,
+  sessionAffinityOverrideReport,
 } from "./src/bridge-config.js";
 import type { ExtensionBridgeOptions } from "./src/bridge-config.js";
 
@@ -92,6 +94,207 @@ const MODELS = [
     maxTokens: 8_192,
   },
 ];
+
+// ---------------------------------------------------------------------------
+// Session-affinity override (slice S2' of booqi-app/infra#327, route A)
+//
+// MEASURED PROBLEM. The OpenClaw host sends NO session-affinity header on the
+// model-fetch request. Read in the reference cell at 2026-10-06T07:13:42Z:
+//   examined 3 session-affinity header names: 0 accepted, 0 present-but-refused,
+//   3 ABSENT ["session_id"=ABSENT, "x-client-request-id"=ABSENT,
+//   "x-session-affinity"=ABSENT]
+// `0 present-but-refused` means there was nothing to refuse, so the cell
+// gateway answers tools/list with an empty list and the demo canvas stays
+// empty. The three names are emitted together by the openai-completions
+// provider, gated on ONE flag that defaults to false.
+//
+// MEASURED CONSUMER (OpenClaw 2026.7.1-beta.5):
+//   packages/ai/src/providers/openai-completions.ts
+//     :1389        default                    sendSessionAffinityHeaders: false
+//     :1426-1427   resolution  model.compat.sendSessionAffinityHeaders ?? detected
+//     :620-624     emission    if (sessionId && compat.sendSessionAffinityHeaders)
+//                                headers.session_id = sessionId;
+//                                headers["x-client-request-id"] = sessionId;
+//                                headers["x-session-affinity"] = sessionId;
+//   and those headers become the OpenAI client's `defaultHeaders` at :644, i.e.
+//   they go on the wire.
+//
+//   It is NOT the whole switch, and the first version of this comment said it
+//   was. There is a second condition: :170-171 passes
+//   `cacheRetention === "none" ? undefined : options?.sessionId` as the session
+//   id, so a `cacheRetention: "none"` kills the headers with the flag still
+//   true. The default is "short"
+//   (`packages/ai/src/providers/cache-retention.ts:7-15`), so the gate is
+//   normally open -- but anyone debugging an empty tools/list has to check both.
+//
+// WHY IT GOES ON THE PROVIDER RETURN AND NOWHERE ELSE.
+//   * The provider RETURN of `discovery.run` below is in-memory. It is never
+//     zod-validated (the config schema is applied only to the loaded config
+//     FILE, at src/config/validation.ts:1055), and it is exactly the object
+//     that src/plugins/provider-discovery.runtime.ts:510-523 keeps in
+//     PREFERENCE to any manifest-derived provider. Its models[].compat reaches
+//     discoveredModel.compat at
+//     src/agents/embedded-agent-runner/model.ts:788.
+//   * 🔴 It must NOT go on `configPatch.models.providers[...]` in the auth flow
+//     above. That lands in `openclaw.json`, which IS validated: the per-model
+//     `compat` object is `ModelCompatSchema`, `.strict()` over 24 enumerated
+//     keys, and `sendSessionAffinityHeaders` is not one of them. An unknown key
+//     there fails validation and the gateway exits 78 in a crash-loop. That is
+//     a measured incident, not a hypothesis.
+//   * 🔴 It must NOT go in `openclaw.plugin.json`'s `modelCatalog` either. That
+//     shape loads and normalises cleanly and then changes nothing, because the
+//     live `discovery.run` registered below makes :510-523 discard the
+//     synthetic manifest provider. An earlier attempt did exactly that and was
+//     inert; the full record is on booqi-app/infra#327.
+//
+// 🔴 THE HOST DISCARDS THIS DECORATION ON THE CONFIG-DECLARED BRANCH, AND THE
+// `normalizeResolvedModel` HOOK BELOW IS WHAT MAKES THE OVERRIDE REACH THE
+// REQUEST ANYWAY. Two heads of this comment have now been wrong about the same
+// thing in opposite directions: the first said the discovery return was enough,
+// the second said nothing in this repository could work on the branch the cell
+// takes. Both were exhaustive over the `models-config` merge layer; neither
+// looked at the provider-runtime hook layer beneath it. The hook, every hop
+// measured in the installed OpenClaw 2026.7.1-beta.5 tree, is documented at
+// `sessionAffinityOverrideReport` in `src/bridge-config.ts` and registered at
+// `normalizeResolvedModel` further down this file. What remains `ONGEMETEN` is
+// that no LIVE run has been observed: structural reachability is not an executed
+// path, and the hook only fires if this plugin is in the gateway's LOADED plugin
+// registry.
+//
+// 🔴 WHICH BRANCH, AND WHAT THE HOST DOES WITH IT. The reference cell's
+// `openclaw.json` was read directly on the dev host at 2026-10-06T09:07Z:
+// `models.providers["claude-runner"]` exists and declares 3 model rows
+// (`claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`), none carrying
+// `compat`. So the cell takes the FIRST branch below -- and on that branch the
+// host DISCARDS this override. The mechanism, the two independent drops and the
+// absence of any escape hatch are documented at
+// `sessionAffinityOverrideReport` in `src/bridge-config.ts`, where they are
+// also testable.
+//
+// Both branches are still decorated, and the reason is NOT the one an earlier
+// head of this comment gave. That head said the decoration "is what makes the
+// count in the report honest" -- which is FALSE, measured: the count is
+// `explicit.models.length`, read below and entirely independent of
+// `decorateModelRows`, and `sessionAffinityOverrideReport` derives `effective`
+// from the route alone. Undecorating this branch leaves R1/R2/R3 green. A
+// reviewer caught it by mutation. Recording the correction rather than quietly
+// swapping the sentence, because this slice's two previous failures were
+// failures of RATIONALE rather than of code, and a fresh false rationale in the
+// commit that fixes the last one would reopen the question.
+//
+// The two true reasons:
+//   (a) the plugin-advertised branch is where the override DOES take effect end
+//       to end, so it has to be decorated;
+//   (b) on the config-declared branch the decoration is what makes arm H2 a
+//       NON-VACUOUS assertion of the host defect. H2 asserts the flag is absent
+//       after the host merge. Undecorate this branch and H2 still passes --
+//       while proving nothing, because the flag was never there to be dropped.
+//       That single arm is the whole difference between this round and round 2,
+//       whose battery observed upstream of the drop. The decoration is itself
+//       pinned by B1/B2/B4/B6/B7, so it cannot be removed silently either.
+//
+// What makes the config-declared branch SAFE is neither of those: it is the LOG
+// LINE. A silent no-op is the one failure mode this slice cannot afford, so the
+// plugin says which route it took, how many rows the host will drop, and the
+// remedy.
+const SESSION_AFFINITY_COMPAT = { sendSessionAffinityHeaders: true } as const;
+
+// Ours is merged LAST, so it wins over a pre-existing value. Deliberate: the
+// only way an operator could have set this key in `openclaw.json` is the strict
+// path, which crashes the gateway before this code runs, so a value found here
+// cannot be a considered operator choice. Any OTHER compat key the operator did
+// set is preserved.
+function withSessionAffinityCompat<T extends { compat?: Record<string, unknown> }>(
+  model: T,
+): T & { compat: Record<string, unknown> } {
+  // Read `compat` ONCE. `{ ...model }` already reads every own enumerable
+  // property, so a second `model.compat` would invoke a getter twice and let
+  // the later read win. The spread is also SHALLOW by design: nested objects
+  // (`cost`, `input`, `headers`) stay aliased into the caller's config, which
+  // is fine because nothing here writes through them -- but the next reader
+  // should not assume isolation.
+  const existing = model.compat;
+  return { ...model, compat: { ...(existing ?? {}), ...SESSION_AFFINITY_COMPAT } };
+}
+
+/**
+ * `ctx.config` has normally been through the host's config validation, which
+ * rejects a non-object model row -- but "normally" is not "always", and before
+ * this slice the array was passed through untouched, so a null row never got
+ * dereferenced on this path. A row that is not a plain object is handed back
+ * unchanged rather than turned into `{"0":"f","1":"o",compat:{...}}`.
+ */
+function decorateModelRows(rows: readonly unknown[]): unknown[] {
+  return rows.map((row) =>
+    row !== null && typeof row === "object"
+      ? withSessionAffinityCompat(row as { compat?: Record<string, unknown> })
+      : row,
+  );
+}
+
+/**
+ * The provider-runtime hook that makes route A work on the branch the reference
+ * cell takes.
+ *
+ * MEASURED (installed OpenClaw 2026.7.1-beta.5; every hop cited at
+ * `sessionAffinityOverrideReport` in `src/bridge-config.ts`):
+ *   * declared `src/plugins/types.ts:1346-1355`, context `:548-555`;
+ *   * survives registration verbatim (`provider-validation.ts:378-401` spreads
+ *     `...restProvider` and destructures out only wizard/docsPath/aliases/
+ *     envVars/catalog/discovery);
+ *   * found for a NON-BUNDLED plugin (`provider-hook-runtime.ts:178-193` has no
+ *     `origin === "bundled"` filter, unlike the `normalizeConfig` surface);
+ *   * invoked at `embedded-agent-runner/model.ts:937` (source "configured") and
+ *     `:994` (source "registry"), i.e. DOWNSTREAM of
+ *     `mergeImplicitProviderConfig`, which is the hop that discards the
+ *     decorated discovery return;
+ *   * its return is in-memory and never zod-validated, so the key is legal here
+ *     for exactly the reason it is legal on the discovery return and FATAL on
+ *     `configPatch` (exit 78).
+ *
+ * `trim().toLowerCase()`, deliberately, matching `normalizeProviderId`
+ * (`packages/model-catalog-core/src/provider-id.ts:6-8`) and the branch lookup
+ * in `discovery.run` below. An exact-string comparison here would reintroduce
+ * the divergence arm R4 exists to pin.
+ *
+ * Returning `undefined` means "no change": `provider-runtime.ts:325-347` does
+ * `?? undefined`, so a nullish return is indistinguishable from an absent hook.
+ * Any other provider id is therefore handed back untouched -- this hook must
+ * never decorate a model that is not ours, and arm H5 pins that.
+ */
+function normalizeResolvedClaudeRunnerModel(ctx: {
+  provider: string;
+  modelId: string;
+  model: { compat?: Record<string, unknown> };
+}): unknown {
+  if (typeof ctx?.provider !== "string") return undefined;
+  if (ctx.provider.trim().toLowerCase() !== PROVIDER_ID) return undefined;
+  const model = ctx.model;
+  // A non-object model is handed back as "no change" rather than spread into
+  // garbage -- the same defence as `decorateModelRows`, for the same reason:
+  // this runs on whatever the host resolved, not on a value this file built.
+  if (model === null || typeof model !== "object") return undefined;
+  return withSessionAffinityCompat(model);
+}
+
+/**
+ * Says which route was taken and how many rows the host will drop. `error`, not
+ * `info`, on the config-declared route: the consequence is a cell that starts
+ * clean, serves models, and answers `tools/list` with an empty list -- which is
+ * indistinguishable from a working one until someone asks it to do something.
+ * On the route where the override works this is `info`, so the error channel
+ * does not fire on a correct configuration.
+ */
+function reportSessionAffinityRoute(
+  ctx: { logger?: { info?: (v: string) => void; error?: (v: string) => void } },
+  route: "plugin-advertised" | "config-declared",
+  modelCount: number,
+) {
+  const report = sessionAffinityOverrideReport({ route, modelCount });
+  const message = sessionAffinityOverrideMessage(report);
+  if (report.effective > 0) ctx.logger?.info?.(message);
+  else ctx.logger?.error?.(message);
+}
 
 let bridgeServer: Awaited<ReturnType<typeof startBridgeServer>> | null = null;
 
@@ -263,12 +466,34 @@ const claudeRunnerPlugin = {
           },
         },
       ],
+      // Registered at the TOP level of the provider object, next to `discovery`,
+      // because that is the object `normalizeRegisteredProvider` spreads
+      // (`provider-validation.ts:378-401`) and the object
+      // `findProviderRuntimePluginInRegistry` looks this key up on
+      // (`provider-hook-runtime.ts:178-193`). Inside `discovery` it would be
+      // destructured away and silently never called.
+      normalizeResolvedModel: normalizeResolvedClaudeRunnerModel,
       discovery: {
         order: "late",
         run: async (ctx: ProviderDiscoveryContext) => {
-          const explicit = ctx.config.models?.providers?.[PROVIDER_ID];
+          // Resolved the way the HOST resolves it, not by exact key. OpenClaw
+          // finds the configured provider through `findNormalizedProviderValue`
+          // (`packages/model-catalog-core/src/provider-id.ts:6,15-28`), which is
+          // `trim().toLowerCase()`, reached via
+          // `models-config.providers.implicit.ts:326-339` and `:447-459`. An
+          // exact-key lookup here diverges on any case or whitespace variant:
+          // the plugin would take the plugin-advertised branch and report the
+          // override ACTIVE while the host took the discarding branch. That is
+          // the silent-reassurance failure this slice exists to prevent, so the
+          // two lookups are deliberately the same lookup.
+          const configuredProviders = ctx.config.models?.providers ?? {};
+          const explicitKey = Object.keys(configuredProviders).find(
+            (key) => key.trim().toLowerCase() === PROVIDER_ID,
+          );
+          const explicit = explicitKey ? configuredProviders[explicitKey] : undefined;
           if (explicit && Array.isArray(explicit.models) && explicit.models.length > 0) {
             await ensureBridgeRunning(ctx, bridgeOpts);
+            reportSessionAffinityRoute(ctx, "config-declared", explicit.models.length);
             return {
               provider: {
                 ...explicit,
@@ -276,6 +501,10 @@ const claudeRunnerPlugin = {
                 api: explicit.api ?? ("openai-completions" as const),
                 apiKey: explicit.apiKey ?? "claude-runner-local",
                 authHeader: false,
+                // The branch the reference cell takes. Decorated in memory and
+                // never written back -- writing it back would put an
+                // unrecognised key on the strict config path.
+                models: decorateModelRows(explicit.models),
               },
             };
           }
@@ -283,13 +512,16 @@ const claudeRunnerPlugin = {
           const pluginEnabled = ctx.config.plugins?.entries?.["claude-runner"];
           if (pluginEnabled) {
             await ensureBridgeRunning(ctx, bridgeOpts);
+            reportSessionAffinityRoute(ctx, "plugin-advertised", MODELS.length);
             return {
               provider: {
                 baseUrl: `http://127.0.0.1:${port}/v1`,
                 api: "openai-completions" as const,
                 apiKey: "claude-runner-local",
                 authHeader: false,
-                models: MODELS.map((m) => ({ ...m, api: "openai-completions" as const })),
+                models: MODELS.map((m) =>
+                  withSessionAffinityCompat({ ...m, api: "openai-completions" as const }),
+                ),
               },
             };
           }
