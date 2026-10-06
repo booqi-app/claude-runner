@@ -997,6 +997,104 @@ export type ExtensionBridgeOptions = Omit<BridgeConfig, "workDir">;
  * outside an OpenClaw install, which would otherwise leave the whole
  * configuration-to-bridge path proved by nothing but a regex over source text.
  */
+/**
+ * Session-affinity override reporting (slice S2' of booqi-app/infra#327).
+ *
+ * The override itself is one key. Whether it REACHES the request is decided by
+ * the host, and it depends entirely on which of `discovery.run`'s two branches
+ * fired. Measured in OpenClaw 2026.7.1-beta.5:
+ *
+ *   src/agents/models-config.providers.implicit.ts:287-294
+ *     return {
+ *       ...implicit,
+ *       ...existing,
+ *       models:
+ *         Array.isArray(existing.models) && existing.models.length > 0
+ *           ? existing.models        // the RAW openclaw.json array
+ *           : implicit.models,       // what this plugin returned
+ *     };
+ *
+ * `existing` is resolved (`:447-459` -> `:326-339`) from
+ * `ctx.explicitProviders ?? ctx.config.models.providers` -- the SAME object the
+ * plugin reads to decide its first branch. So the condition that selects the
+ * config-declared branch is logically the same condition that makes
+ * `existing.models` win. On that branch the decorated array is discarded
+ * wholesale, and the config array cannot carry the key: per-model `compat` in
+ * `openclaw.json` is `ModelCompatSchema`, `.strict()` over 24 enumerated keys,
+ * and this key is not one of them (an unknown key there exits 78).
+ *
+ * The `dynamicProviderModels` escape (`:282-286`) is not one either:
+ * `mergeProviderModels` (`src/agents/models-config.merge.ts:80-118`) rebuilds
+ * each row as `Object.assign({}, explicitModel, { input, reasoning }, ...token
+ * limits)` and copies nothing else off the implicit row. `compat` is not in
+ * that list. And `PROVIDER_IMPLICIT_MERGERS` (`:46-53`), which would let a
+ * provider say "keep the implicit models", is a HOST-SIDE table containing only
+ * `ollama`; a plugin cannot register into it from this repository.
+ *
+ * So on the config-declared route this plugin CANNOT make the override take
+ * effect, and the failure is silent: the gateway starts, the models work, and
+ * the request simply goes out without the headers. That is the one failure mode
+ * this slice cannot afford, so it is reported instead of hoped about -- the same
+ * discipline as the S1 affinity line, which reports what it EXAMINED rather
+ * than asserting an outcome.
+ */
+export type SessionAffinityRoute = "plugin-advertised" | "config-declared";
+
+export interface SessionAffinityOverrideReport {
+  route: SessionAffinityRoute;
+  examined: number;
+  /** Rows on which the override will actually reach the request. */
+  effective: number;
+  /** Rows whose override the host replaces with the config row. */
+  discardedByHost: number;
+}
+
+export function sessionAffinityOverrideReport(params: {
+  route: SessionAffinityRoute;
+  modelCount: number;
+}): SessionAffinityOverrideReport {
+  // Never negative and never NaN: a count that arrives broken must not silently
+  // become a reassuring zero in `discardedByHost`.
+  const examined =
+    Number.isFinite(params.modelCount) && params.modelCount > 0
+      ? Math.floor(params.modelCount)
+      : 0;
+  const effective = params.route === "plugin-advertised" ? examined : 0;
+  return {
+    route: params.route,
+    examined,
+    effective,
+    discardedByHost: examined - effective,
+  };
+}
+
+/**
+ * The verdicts are rendered per route AND per count, so the line can never read
+ * as reassuring while the count says otherwise. `0 effective` is the signal.
+ */
+export function sessionAffinityOverrideMessage(report: SessionAffinityOverrideReport): string {
+  const tail =
+    `examined ${report.examined} ${plural(report.examined, "model row", "model rows")}:`
+    + ` ${report.effective} effective, ${report.discardedByHost} discarded-by-host`;
+
+  if (report.route === "plugin-advertised") {
+    return (
+      `Claude Runner: session-affinity override ACTIVE on the plugin-advertised model catalog`
+      + ` -- compat.sendSessionAffinityHeaders reaches the request. ${tail}.`
+    );
+  }
+  return (
+    `Claude Runner: session-affinity override WILL BE DISCARDED by the host.`
+    + ` openclaw.json declares models.providers."claude-runner".models, and OpenClaw's`
+    + ` implicit-provider merge replaces the discovered models array with the config one`
+    + ` (models-config.providers.implicit.ts:287-294), so compat.sendSessionAffinityHeaders`
+    + ` never reaches the request and the cell gateway will keep answering tools/list with`
+    + ` an empty list. REMEDY: delete the "models" array from that provider entry in`
+    + ` openclaw.json and let this plugin advertise its catalog instead; the override takes`
+    + ` effect on that route. ${tail}.`
+  );
+}
+
 export function buildBridgeOptions(extConfig: Record<string, unknown>): ExtensionBridgeOptions {
   return {
     port: (extConfig.port as number) ?? DEFAULT_PORT,

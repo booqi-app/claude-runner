@@ -28,11 +28,11 @@
  * OpenClaw 2026.7.1-beta.5 `packages/ai/src/providers/openai-completions.ts`:
  *   :1389        default                   sendSessionAffinityHeaders: false
  *   :1426-1427   resolution    model.compat.sendSessionAffinityHeaders ?? detected
- *   :617-623     emission      if (sessionId && compat.sendSessionAffinityHeaders)
+ *   :620-624     emission      if (sessionId && compat.sendSessionAffinityHeaders)
  *                                headers.session_id            = sessionId
  *                                headers["x-client-request-id"] = sessionId
  *                                headers["x-session-affinity"]  = sessionId
- *   :645         those headers become the OpenAI client's `defaultHeaders`
+ *   :644         those headers become the OpenAI client's `defaultHeaders`
  * OpenClaw is not installable in this job (no dependencies, no network), so the
  * gate is reproduced rather than imported. It is kept honest by NEGATIVE
  * CONTROLS: arms N1/N2 below drive the same fixture with the flag absent and
@@ -56,7 +56,7 @@ const PROVIDER_ID = "claude-runner";
 const AFFINITY_HEADERS = ["session_id", "x-client-request-id", "x-session-affinity"] as const;
 
 /** Every arm asserts; this is the count the self-check at the bottom enforces. */
-const EXPECTED_ARMS = 20;
+const EXPECTED_ARMS = 27;
 let armsRun = 0;
 const arm = (name: string, fn: () => void | Promise<void>) =>
   test(name, async () => {
@@ -133,7 +133,7 @@ async function overTheWire(headers: AnyRec): Promise<AnyRec> {
     if (!addr || typeof addr === "string") throw new Error("no port");
     const res = await fetch(`http://127.0.0.1:${addr.port}/v1/chat/completions`, {
       method: "POST",
-      headers: { ...headers, "content-type": "application/json" },
+      headers: { ...headers, "content-type": "application/json", connection: "close" },
       body: "{}",
     });
     assert.equal(res.status, 200);
@@ -164,6 +164,17 @@ async function registerPlugin(): Promise<Registered> {
   return out;
 }
 
+type Logs = { info: string[]; error: string[] };
+const makeLogger = () => {
+  const logs: Logs = { info: [], error: [] };
+  return {
+    logs,
+    logger: {
+      info: (v: string) => logs.info.push(v),
+      error: (v: string) => logs.error.push(v),
+    },
+  };
+};
 const silentLogger = { info: () => {}, error: () => {} };
 
 /** The config shape the reference cell actually has: written by the auth flow. */
@@ -184,17 +195,27 @@ function cellLikeConfig(models: AnyRec[]) {
   };
 }
 
-async function runDiscovery(config: AnyRec): Promise<AnyRec | null> {
+async function runDiscoveryLogged(config: AnyRec): Promise<{ out: AnyRec | null; logs: Logs }> {
   const reg = await registerPlugin();
-  const result = await reg.provider.discovery.run({
-    config,
-    logger: silentLogger,
-    workspaceDir: join(REPO, ".test-workspace"),
-  });
-  // Release the socket the real `discovery.run` bound; leaving it listening
-  // would make the next arm depend on run order.
-  for (const s of reg.services) await s.stop?.({ logger: silentLogger });
-  return result as AnyRec | null;
+  const { logs, logger } = makeLogger();
+  try {
+    const result = await reg.provider.discovery.run({
+      config,
+      logger,
+      workspaceDir: join(REPO, ".test-workspace"),
+    });
+    return { out: result as AnyRec | null, logs };
+  } finally {
+    // In a `finally`, deliberately. `index.ts` keeps `bridgeServer` in a MODULE
+    // global, so an arm that threw before this ran would leave it non-null,
+    // every later `ensureBridgeRunning` would short-circuit, and E1 would fail
+    // with a message pointing at the wrong arm.
+    for (const svc of reg.services) await svc.stop?.({ logger: silentLogger });
+  }
+}
+
+async function runDiscovery(config: AnyRec): Promise<AnyRec | null> {
+  return (await runDiscoveryLogged(config)).out;
 }
 
 async function runAuth(): Promise<AnyRec> {
@@ -329,9 +350,13 @@ arm("C1 the plugin-enabled branch covers exactly the ids the explicit branch wou
 });
 
 arm("C2 every advertised id also carries the dimensions the model layer requires", async () => {
-  // provider-discovery.runtime.ts:166-168 drops any row lacking BOTH
-  // contextWindow and maxTokens. A dropped row means no provider at all, which
-  // is how the previous attempt silently built nothing.
+  // NOTE, corrected in review: the `if (!row.contextWindow || !row.maxTokens)`
+  // gate at `provider-discovery.runtime.ts:167` drops a row lacking EITHER
+  // dimension, and it lives in `modelDefinitionFromManifestRow`, i.e. on the
+  // MANIFEST path this PR reverts. `grep -an contextWindow` over that file
+  // returns only :167 and :181, so there is no equivalent gate on the
+  // provider-return path used here. This arm is kept as a plain regression
+  // guard on `MODELS`, not as a claim about that gate.
   const out = await runDiscovery({ plugins: { entries: { "claude-runner": { enabled: true } } } });
   for (const m of out!.provider.models as AnyRec[]) {
     assert.equal(typeof m.contextWindow, "number", `model ${m.id} has no contextWindow`);
@@ -342,7 +367,7 @@ arm("C2 every advertised id also carries the dimensions the model layer requires
 // ---------------------------------------------------------------------------
 // D. THE PATH-DISTINGUISHING ARMS
 // These fail if the flag is placed on `configPatch.models.providers[...]`
-// (index.ts:237) instead of on the provider return. That placement reaches
+// (the auth flow's `configPatch`) instead of on the provider return. That placement reaches
 // `openclaw.json`, where the per-model `compat` object is `.strict()` over 24
 // enumerated keys, and an unknown key there crash-loops the gateway at exit 78.
 // ---------------------------------------------------------------------------
@@ -413,7 +438,15 @@ arm("E1 the real discovery.run really did start the bridge, at the real resolved
     "startBridgeServer was never called: discovery.run did not take the real path",
   );
   const cfg = stub.calls[stub.calls.length - 1];
-  assert.equal(cfg.port, DEFAULT_PORT, "the port did not come from the real buildBridgeOptions");
+  // Port-AGNOSTIC on purpose: `register()` reads a gitignored `config.json`
+  // from the extension dir, so pinning DEFAULT_PORT would go red for a
+  // reviewer who has one -- the same "green in CI, red for the next reader"
+  // class the bridge stub exists to kill. What matters is that the port came
+  // from the real `buildBridgeOptions` and is the one the provider advertises.
+  assert.equal(typeof cfg.port, "number", "the port did not come from the real buildBridgeOptions");
+  assert.ok(cfg.port > 0 && cfg.port < 65536, `implausible port ${cfg.port}`);
+  const advertised = await runDiscovery({ plugins: { entries: { "claude-runner": { enabled: true } } } });
+  assert.equal(String(advertised!.provider.baseUrl), `http://127.0.0.1:${cfg.port}/v1`);
   assert.equal(typeof cfg.workDir, "string");
 });
 
@@ -422,6 +455,234 @@ arm("E2 a disabled plugin with no explicit models discovers nothing", async () =
   // that was genuinely built and not that the function always returns one.
   const out = await runDiscovery({ models: { providers: {} }, plugins: { entries: {} } });
   assert.equal(out, null);
+});
+
+// ---------------------------------------------------------------------------
+// H. THE HOST MERGE — the hop the first two batteries on this slice were blind to
+//
+// Round 1's battery stopped at the manifest. Round 2's stopped at the value
+// `discovery.run` RETURNS. Both were green and both were upstream of the gate
+// that threw the value away. These arms reproduce the measured host merge and
+// assert on what comes OUT of it, so the battery's observation point is now
+// past every hop a reviewer identified as a drop.
+//
+// Reproduced from OpenClaw 2026.7.1-beta.5:
+//   src/agents/models-config.providers.implicit.ts
+//     :46-53     PROVIDER_IMPLICIT_MERGERS — only `ollama`; a plugin cannot
+//                register into this host-side table
+//     :278-294   the merge itself, incl. `models: existing.models.length > 0
+//                ? existing.models : implicit.models`
+//   src/agents/models-config.merge.ts
+//     :80-118    mergeProviderModels — rebuilds each row from `explicitModel`
+//                and copies ONLY input/reasoning/contextWindow/contextTokens/
+//                maxTokens off the implicit row. `compat` is not in that list.
+// ---------------------------------------------------------------------------
+
+/** implicit.ts:46-53 — the host-side table, with its real single entry. */
+const HOST_IMPLICIT_MERGERS = new Set(["ollama"]);
+
+/** merge.ts:80-118 — the wildcard path. Note what it does NOT copy. */
+function hostMergeProviderModels(implicit: AnyRec, explicit: AnyRec): AnyRec {
+  const implicitById = new Map<string, AnyRec>(
+    (implicit.models ?? []).map((m: AnyRec) => [m.id, m] as const),
+  );
+  const seen = new Set<string>();
+  const merged: AnyRec[] = (explicit.models ?? []).map((em: AnyRec) => {
+    if (!em.id) return em;
+    seen.add(em.id);
+    const im = implicitById.get(em.id);
+    if (!im) return em;
+    return Object.assign(
+      {},
+      em,
+      {
+        input: "input" in em ? em.input : im.input,
+        reasoning: "reasoning" in em ? em.reasoning : im.reasoning,
+      },
+      "contextWindow" in em || im.contextWindow === undefined
+        ? {}
+        : { contextWindow: im.contextWindow },
+      "maxTokens" in em || im.maxTokens === undefined ? {} : { maxTokens: im.maxTokens },
+    );
+  });
+  for (const im of implicit.models ?? []) {
+    if (!im.id || seen.has(im.id)) continue;
+    seen.add(im.id);
+    merged.push(im);
+  }
+  return { ...implicit, ...explicit, models: merged };
+}
+
+/** implicit.ts:278-294 — what the host actually does with a discovery return. */
+function hostMergeImplicitProvider(params: {
+  providerId: string;
+  existing: AnyRec | undefined;
+  implicit: AnyRec;
+  dynamicProviderModels?: boolean;
+}): AnyRec {
+  const { providerId, existing, implicit } = params;
+  if (!existing) return implicit;
+  if (HOST_IMPLICIT_MERGERS.has(providerId)) return implicit;
+  if (params.dynamicProviderModels) return hostMergeProviderModels(implicit, existing);
+  return {
+    ...implicit,
+    ...existing,
+    models:
+      Array.isArray(existing.models) && existing.models.length > 0
+        ? existing.models
+        : implicit.models,
+  };
+}
+
+/**
+ * The reference cell's own provider entry, read off the dev host at
+ * 2026-10-06T09:07Z: 3 rows, no `compat`, no `api`, and `timeoutSeconds` set.
+ * Hard-coded rather than fetched: CI has no access to that host, and the point
+ * is to pin the SHAPE that was measured, not to re-measure it here.
+ */
+const CELL_PROVIDER_ENTRY = {
+  baseUrl: "http://127.0.0.1:7779/v1",
+  apiKey: "claude-runner-local",
+  authHeader: false,
+  timeoutSeconds: 600,
+  models: [
+    { id: "claude-opus-4-6", name: "Claude Opus 4.6 (SDK)", reasoning: true, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 },
+    { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6 (SDK)", reasoning: true, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 16384 },
+    { id: "claude-haiku-4-5", name: "Claude Haiku 4.5 (SDK)", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200000, maxTokens: 8192 },
+  ],
+};
+
+const cellConfig = () => ({
+  models: { providers: { [PROVIDER_ID]: structuredClone(CELL_PROVIDER_ENTRY) } },
+  plugins: { entries: { "claude-runner": { enabled: true } } },
+});
+
+arm("H1 plugin-advertised route: the flag survives the host merge and reaches the wire", async () => {
+  const config = { plugins: { entries: { "claude-runner": { enabled: true } } } };
+  const out = await runDiscovery(config);
+  const mergedProvider = hostMergeImplicitProvider({
+    providerId: PROVIDER_ID,
+    existing: undefined,
+    implicit: out!.provider,
+  });
+  const models = mergedProvider.models as AnyRec[];
+  assert.ok(models.length > 0);
+  for (const m of models) {
+    assert.equal(m.compat?.sendSessionAffinityHeaders, true, `${m.id} lost the flag in the merge`);
+    const received = await overTheWire(wireHeadersFor(m, SESSION));
+    for (const h of AFFINITY_HEADERS) {
+      assert.equal(received[h], SESSION, `${m.id}: header ${h} never arrived`);
+    }
+  }
+});
+
+arm("H2 config-declared route: the host DISCARDS the flag and nothing reaches the wire", async () => {
+  // This arm asserts the DEFECT, measured. It is red if the host merge ever
+  // stops preferring the config array -- which is the day this slice's
+  // config-declared branch starts working and the log line has to change.
+  const config = cellConfig();
+  const out = await runDiscovery(config);
+  const mergedProvider = hostMergeImplicitProvider({
+    providerId: PROVIDER_ID,
+    existing: config.models.providers[PROVIDER_ID],
+    implicit: out!.provider,
+  });
+  const models = mergedProvider.models as AnyRec[];
+  assert.equal(models.length, 3, "the cell's three rows should come through the merge");
+  for (const m of models) {
+    assert.equal(
+      m.compat?.sendSessionAffinityHeaders,
+      undefined,
+      `${m.id} unexpectedly kept the flag: re-read implicit.ts:287-294`,
+    );
+    const received = await overTheWire(wireHeadersFor(m, SESSION));
+    for (const h of AFFINITY_HEADERS) {
+      assert.equal(received[h], undefined, `${m.id}: ${h} arrived after all`);
+    }
+  }
+});
+
+arm("H3 the wildcard path is a second, independent drop", async () => {
+  const config = cellConfig();
+  const out = await runDiscovery(config);
+  const mergedProvider = hostMergeImplicitProvider({
+    providerId: PROVIDER_ID,
+    existing: config.models.providers[PROVIDER_ID],
+    implicit: out!.provider,
+    dynamicProviderModels: true,
+  });
+  for (const m of mergedProvider.models as AnyRec[]) {
+    assert.equal(
+      m.compat?.sendSessionAffinityHeaders,
+      undefined,
+      `${m.id} kept the flag through mergeProviderModels: re-read merge.ts:80-118`,
+    );
+  }
+});
+
+arm("H4 the host-merge fixture is not vacuous: with no config rows the implicit models win", async () => {
+  // Without this arm H2/H3 could pass against a fixture that drops everything.
+  const out = await runDiscovery({ plugins: { entries: { "claude-runner": { enabled: true } } } });
+  const mergedProvider = hostMergeImplicitProvider({
+    providerId: PROVIDER_ID,
+    existing: { baseUrl: "http://127.0.0.1:7779/v1", models: [] },
+    implicit: out!.provider,
+  });
+  const models = mergedProvider.models as AnyRec[];
+  assert.ok(models.length > 0, "the fixture dropped the implicit models too");
+  for (const m of models) assert.equal(m.compat?.sendSessionAffinityHeaders, true);
+});
+
+// ---------------------------------------------------------------------------
+// R. the plugin REPORTS the route rather than failing silently
+// ---------------------------------------------------------------------------
+
+arm("R1 config-declared route logs on the ERROR channel, with 0 effective and the remedy", async () => {
+  const { logs } = await runDiscoveryLogged(cellConfig());
+  const line = logs.error.find((l) => l.includes("session-affinity override"));
+  assert.ok(line, `no session-affinity verdict on the error channel; got ${JSON.stringify(logs)}`);
+  assert.match(line!, /WILL BE DISCARDED/);
+  assert.match(line!, /examined 3 model rows: 0 effective, 3 discarded-by-host\./);
+  assert.match(line!, /REMEDY: delete the "models" array/);
+  assert.equal(
+    logs.info.some((l) => l.includes("session-affinity override ACTIVE")),
+    false,
+    "it also claimed the override was active",
+  );
+});
+
+arm("R2 plugin-advertised route logs on the INFO channel and leaves the error channel clean", async () => {
+  const { out, logs } = await runDiscoveryLogged({
+    plugins: { entries: { "claude-runner": { enabled: true } } },
+  });
+  const count = (out!.provider.models as AnyRec[]).length;
+  const line = logs.info.find((l) => l.includes("session-affinity override"));
+  assert.ok(line, `no session-affinity verdict on the info channel; got ${JSON.stringify(logs)}`);
+  assert.match(line!, /ACTIVE on the plugin-advertised model catalog/);
+  assert.ok(
+    line!.includes(`examined ${count} model rows: ${count} effective, 0 discarded-by-host.`),
+    `count disagrees with the advertised catalog (${count}): ${line}`,
+  );
+  assert.equal(
+    logs.error.some((l) => l.includes("session-affinity override")),
+    false,
+    "it reported a discard on the route where the override works",
+  );
+});
+
+arm("R3 the verdict counts the rows the HOST will use, not the rows the plugin knows", async () => {
+  // The cell declares 3; the plugin advertises 4. A report that counted its own
+  // catalog would say 4 and be wrong about the cell.
+  const { out, logs } = await runDiscoveryLogged(cellConfig());
+  assert.equal((out!.provider.models as AnyRec[]).length, 3);
+  const line = logs.error.find((l) => l.includes("session-affinity override"))!;
+  assert.match(line, /examined 3 model rows/);
+  const advertised = await runDiscovery({ plugins: { entries: { "claude-runner": { enabled: true } } } });
+  assert.notEqual(
+    (advertised!.provider.models as AnyRec[]).length,
+    3,
+    "the two catalogues happen to be the same size, so this arm proves nothing",
+  );
 });
 
 // ---------------------------------------------------------------------------

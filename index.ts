@@ -29,6 +29,8 @@ import {
   isUnknownSystemPromptMode,
   normaliseSystemPromptMode,
   summariseMcpServers,
+  sessionAffinityOverrideMessage,
+  sessionAffinityOverrideReport,
 } from "./src/bridge-config.js";
 import type { ExtensionBridgeOptions } from "./src/bridge-config.js";
 
@@ -110,13 +112,20 @@ const MODELS = [
 //   packages/ai/src/providers/openai-completions.ts
 //     :1389        default                    sendSessionAffinityHeaders: false
 //     :1426-1427   resolution  model.compat.sendSessionAffinityHeaders ?? detected
-//     :617-623     emission    if (sessionId && compat.sendSessionAffinityHeaders)
+//     :620-624     emission    if (sessionId && compat.sendSessionAffinityHeaders)
 //                                headers.session_id = sessionId;
 //                                headers["x-client-request-id"] = sessionId;
 //                                headers["x-session-affinity"] = sessionId;
-//   and those headers become the OpenAI client's `defaultHeaders`, i.e. they go
-//   on the wire. So `models[].compat.sendSessionAffinityHeaders` is the whole
-//   switch.
+//   and those headers become the OpenAI client's `defaultHeaders` at :644, i.e.
+//   they go on the wire.
+//
+//   It is NOT the whole switch, and the first version of this comment said it
+//   was. There is a second condition: :170-171 passes
+//   `cacheRetention === "none" ? undefined : options?.sessionId` as the session
+//   id, so a `cacheRetention: "none"` kills the headers with the flag still
+//   true. The default is "short"
+//   (`packages/ai/src/providers/cache-retention.ts:7-15`), so the gate is
+//   normally open -- but anyone debugging an empty tools/list has to check both.
 //
 // WHY IT GOES ON THE PROVIDER RETURN AND NOWHERE ELSE.
 //   * The provider RETURN of `discovery.run` below is in-memory. It is never
@@ -138,11 +147,23 @@ const MODELS = [
 //     synthetic manifest provider. An earlier attempt did exactly that and was
 //     inert; the full record is on booqi-app/infra#327.
 //
-// Both provider-return branches are covered on purpose. The reference cell's
-// `openclaw.json` was written by the auth flow above, so it HAS a
-// `models.providers["claude-runner"]` entry with models -- which means the cell
-// takes the FIRST branch. Covering only the second would leave the flag off on
-// the one path the demo actually runs.
+// 🔴 WHICH BRANCH, AND WHAT THE HOST DOES WITH IT. The reference cell's
+// `openclaw.json` was read directly on the dev host at 2026-10-06T09:07Z:
+// `models.providers["claude-runner"]` exists and declares 3 model rows
+// (`claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5`), none carrying
+// `compat`. So the cell takes the FIRST branch below -- and on that branch the
+// host DISCARDS this override. The mechanism, the two independent drops and the
+// absence of any escape hatch are documented at
+// `sessionAffinityOverrideReport` in `src/bridge-config.ts`, where they are
+// also testable.
+//
+// Both branches are still decorated, for two reasons and neither is
+// belt-and-braces: the plugin-advertised branch is where the override DOES take
+// effect end to end, and on the config-declared branch the decoration is what
+// makes the count in the report honest. What makes the config-declared branch
+// safe is not the decoration but the LOG LINE: a silent no-op is the one
+// failure mode this slice cannot afford, so the plugin says which route it took
+// and how many rows the host will drop, with the remedy.
 const SESSION_AFFINITY_COMPAT = { sendSessionAffinityHeaders: true } as const;
 
 // Ours is merged LAST, so it wins over a pre-existing value. Deliberate: the
@@ -153,7 +174,48 @@ const SESSION_AFFINITY_COMPAT = { sendSessionAffinityHeaders: true } as const;
 function withSessionAffinityCompat<T extends { compat?: Record<string, unknown> }>(
   model: T,
 ): T & { compat: Record<string, unknown> } {
-  return { ...model, compat: { ...(model.compat ?? {}), ...SESSION_AFFINITY_COMPAT } };
+  // Read `compat` ONCE. `{ ...model }` already reads every own enumerable
+  // property, so a second `model.compat` would invoke a getter twice and let
+  // the later read win. The spread is also SHALLOW by design: nested objects
+  // (`cost`, `input`, `headers`) stay aliased into the caller's config, which
+  // is fine because nothing here writes through them -- but the next reader
+  // should not assume isolation.
+  const existing = model.compat;
+  return { ...model, compat: { ...(existing ?? {}), ...SESSION_AFFINITY_COMPAT } };
+}
+
+/**
+ * `ctx.config` has normally been through the host's config validation, which
+ * rejects a non-object model row -- but "normally" is not "always", and before
+ * this slice the array was passed through untouched, so a null row never got
+ * dereferenced on this path. A row that is not a plain object is handed back
+ * unchanged rather than turned into `{"0":"f","1":"o",compat:{...}}`.
+ */
+function decorateModelRows(rows: readonly unknown[]): unknown[] {
+  return rows.map((row) =>
+    row !== null && typeof row === "object"
+      ? withSessionAffinityCompat(row as { compat?: Record<string, unknown> })
+      : row,
+  );
+}
+
+/**
+ * Says which route was taken and how many rows the host will drop. `error`, not
+ * `info`, on the config-declared route: the consequence is a cell that starts
+ * clean, serves models, and answers `tools/list` with an empty list -- which is
+ * indistinguishable from a working one until someone asks it to do something.
+ * On the route where the override works this is `info`, so the error channel
+ * does not fire on a correct configuration.
+ */
+function reportSessionAffinityRoute(
+  ctx: { logger?: { info?: (v: string) => void; error?: (v: string) => void } },
+  route: "plugin-advertised" | "config-declared",
+  modelCount: number,
+) {
+  const report = sessionAffinityOverrideReport({ route, modelCount });
+  const message = sessionAffinityOverrideMessage(report);
+  if (report.effective > 0) ctx.logger?.info?.(message);
+  else ctx.logger?.error?.(message);
 }
 
 let bridgeServer: Awaited<ReturnType<typeof startBridgeServer>> | null = null;
@@ -332,6 +394,7 @@ const claudeRunnerPlugin = {
           const explicit = ctx.config.models?.providers?.[PROVIDER_ID];
           if (explicit && Array.isArray(explicit.models) && explicit.models.length > 0) {
             await ensureBridgeRunning(ctx, bridgeOpts);
+            reportSessionAffinityRoute(ctx, "config-declared", explicit.models.length);
             return {
               provider: {
                 ...explicit,
@@ -339,10 +402,10 @@ const claudeRunnerPlugin = {
                 api: explicit.api ?? ("openai-completions" as const),
                 apiKey: explicit.apiKey ?? "claude-runner-local",
                 authHeader: false,
-                // The branch the reference cell takes. The models come from the
-                // config file, so the override has to be applied HERE too --
-                // and here only, in memory, never written back.
-                models: explicit.models.map(withSessionAffinityCompat),
+                // The branch the reference cell takes. Decorated in memory and
+                // never written back -- writing it back would put an
+                // unrecognised key on the strict config path.
+                models: decorateModelRows(explicit.models),
               },
             };
           }
@@ -350,6 +413,7 @@ const claudeRunnerPlugin = {
           const pluginEnabled = ctx.config.plugins?.entries?.["claude-runner"];
           if (pluginEnabled) {
             await ensureBridgeRunning(ctx, bridgeOpts);
+            reportSessionAffinityRoute(ctx, "plugin-advertised", MODELS.length);
             return {
               provider: {
                 baseUrl: `http://127.0.0.1:${port}/v1`,
