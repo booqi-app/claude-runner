@@ -93,6 +93,69 @@ const MODELS = [
   },
 ];
 
+// ---------------------------------------------------------------------------
+// Session-affinity override (slice S2' of booqi-app/infra#327, route A)
+//
+// MEASURED PROBLEM. The OpenClaw host sends NO session-affinity header on the
+// model-fetch request. Read in the reference cell at 2026-10-06T07:13:42Z:
+//   examined 3 session-affinity header names: 0 accepted, 0 present-but-refused,
+//   3 ABSENT ["session_id"=ABSENT, "x-client-request-id"=ABSENT,
+//   "x-session-affinity"=ABSENT]
+// `0 present-but-refused` means there was nothing to refuse, so the cell
+// gateway answers tools/list with an empty list and the demo canvas stays
+// empty. The three names are emitted together by the openai-completions
+// provider, gated on ONE flag that defaults to false.
+//
+// MEASURED CONSUMER (OpenClaw 2026.7.1-beta.5):
+//   packages/ai/src/providers/openai-completions.ts
+//     :1389        default                    sendSessionAffinityHeaders: false
+//     :1426-1427   resolution  model.compat.sendSessionAffinityHeaders ?? detected
+//     :617-623     emission    if (sessionId && compat.sendSessionAffinityHeaders)
+//                                headers.session_id = sessionId;
+//                                headers["x-client-request-id"] = sessionId;
+//                                headers["x-session-affinity"] = sessionId;
+//   and those headers become the OpenAI client's `defaultHeaders`, i.e. they go
+//   on the wire. So `models[].compat.sendSessionAffinityHeaders` is the whole
+//   switch.
+//
+// WHY IT GOES ON THE PROVIDER RETURN AND NOWHERE ELSE.
+//   * The provider RETURN of `discovery.run` below is in-memory. It is never
+//     zod-validated (the config schema is applied only to the loaded config
+//     FILE, at src/config/validation.ts:1055), and it is exactly the object
+//     that src/plugins/provider-discovery.runtime.ts:510-523 keeps in
+//     PREFERENCE to any manifest-derived provider. Its models[].compat reaches
+//     discoveredModel.compat at
+//     src/agents/embedded-agent-runner/model.ts:788.
+//   * 🔴 It must NOT go on `configPatch.models.providers[...]` in the auth flow
+//     above. That lands in `openclaw.json`, which IS validated: the per-model
+//     `compat` object is `ModelCompatSchema`, `.strict()` over 24 enumerated
+//     keys, and `sendSessionAffinityHeaders` is not one of them. An unknown key
+//     there fails validation and the gateway exits 78 in a crash-loop. That is
+//     a measured incident, not a hypothesis.
+//   * 🔴 It must NOT go in `openclaw.plugin.json`'s `modelCatalog` either. That
+//     shape loads and normalises cleanly and then changes nothing, because the
+//     live `discovery.run` registered below makes :510-523 discard the
+//     synthetic manifest provider. An earlier attempt did exactly that and was
+//     inert; the full record is on booqi-app/infra#327.
+//
+// Both provider-return branches are covered on purpose. The reference cell's
+// `openclaw.json` was written by the auth flow above, so it HAS a
+// `models.providers["claude-runner"]` entry with models -- which means the cell
+// takes the FIRST branch. Covering only the second would leave the flag off on
+// the one path the demo actually runs.
+const SESSION_AFFINITY_COMPAT = { sendSessionAffinityHeaders: true } as const;
+
+// Ours is merged LAST, so it wins over a pre-existing value. Deliberate: the
+// only way an operator could have set this key in `openclaw.json` is the strict
+// path, which crashes the gateway before this code runs, so a value found here
+// cannot be a considered operator choice. Any OTHER compat key the operator did
+// set is preserved.
+function withSessionAffinityCompat<T extends { compat?: Record<string, unknown> }>(
+  model: T,
+): T & { compat: Record<string, unknown> } {
+  return { ...model, compat: { ...(model.compat ?? {}), ...SESSION_AFFINITY_COMPAT } };
+}
+
 let bridgeServer: Awaited<ReturnType<typeof startBridgeServer>> | null = null;
 
 // The shape comes from src/bridge-config.ts, which is where it can be tested.
@@ -276,6 +339,10 @@ const claudeRunnerPlugin = {
                 api: explicit.api ?? ("openai-completions" as const),
                 apiKey: explicit.apiKey ?? "claude-runner-local",
                 authHeader: false,
+                // The branch the reference cell takes. The models come from the
+                // config file, so the override has to be applied HERE too --
+                // and here only, in memory, never written back.
+                models: explicit.models.map(withSessionAffinityCompat),
               },
             };
           }
@@ -289,7 +356,9 @@ const claudeRunnerPlugin = {
                 api: "openai-completions" as const,
                 apiKey: "claude-runner-local",
                 authHeader: false,
-                models: MODELS.map((m) => ({ ...m, api: "openai-completions" as const })),
+                models: MODELS.map((m) =>
+                  withSessionAffinityCompat({ ...m, api: "openai-completions" as const }),
+                ),
               },
             };
           }
