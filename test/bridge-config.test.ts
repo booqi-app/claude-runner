@@ -18,8 +18,13 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import {
+  affinityExaminationSummary,
   applySessionHint,
   buildBridgeOptions,
+  chatSessionFromAgentSessionKey,
+  examineAffinityHeaders,
+  examineAgentSessionKey,
+  type AffinityRefusalRule,
   buildQueryOptions,
   droppedMcpServersMessage,
   normaliseChatSessionId,
@@ -1522,4 +1527,163 @@ test("the absent-key default cannot be widened at runtime", () => {
   assert.throws(() => { (DEFAULT_TOOLS_WHEN_ABSENT as string[]).push("Bash"); }, TypeError);
   assert.deepEqual([...DEFAULT_TOOLS_WHEN_ABSENT], []);
   assert.deepEqual(optionsFor(baseConfig()).tools, []);
+});
+
+// ── S1 / AC-1: the classifier names the rule, and the renderer never
+//    names the value (booqi-app/infra#327) ───────────────────────────
+//
+// FIVE refusal rules exist in the classifier, counted out of the source and
+// not taken on trust: `not-a-string`, `blank`, `not-an-agent-session-key`,
+// `blank-tail`, `tail-not-a-chat-session-id`. One arm per rule below.
+
+const AC_S1_RULE_CASES: Array<[AffinityRefusalRule, unknown[]]> = [
+  ["not-a-string", [undefined, null, 123, ["agent:a:chat-1"], { v: 1 }]],
+  ["blank", ["", "   ", "\t\n"]],
+  // A bare uuid -- the exact value route A would start sending -- lands here,
+  // and so does a key whose tail is empty or whitespace: the whole value is
+  // trimmed BEFORE the pattern runs, so such a key never matches at all.
+  ["not-an-agent-session-key", [
+    "b66bdf67-0f4d-46d8-8051-4c9251fdde62", "chat-7", "agent:a:", "agent:a: ", "agent::x",
+  ]],
+  ["tail-not-a-chat-session-id", [
+    "agent:a:chat A", "agent:a:agent:b:chat-9", "agent:b:chat-A, agent:b:chat-B", "agent:a:" + "x".repeat(201),
+  ]],
+];
+
+for (const [rule, values] of AC_S1_RULE_CASES) {
+  test(`AC-1 arm: the classifier names the rule \`${rule}\` rather than a bare refusal`, () => {
+    // Kill: collapse the rules into one, or drop `rule` from the verdict.
+    for (const value of values) {
+      const got = examineAgentSessionKey(value);
+      assert.equal(got.chatSessionId, undefined, `${JSON.stringify(value)} was accepted`);
+      assert.equal(got.verdict.kind, "refused");
+      assert.equal(
+        got.verdict.kind === "refused" ? got.verdict.rule : undefined,
+        rule,
+        `${JSON.stringify(value)} reported the wrong rule`,
+      );
+    }
+  });
+}
+
+test("AC-1 arm: `blank-tail` is the fifth rule and is defensive-only, by construction", () => {
+  // The fifth `return undefined` path exists in the source but is UNREACHABLE
+  // today, and this arm is what makes that a measured claim instead of a
+  // guess. `normaliseChatSessionId` trims the WHOLE value before the pattern
+  // runs, and JS `String.prototype.trim` strips exactly the set regex `\s`
+  // matches -- so an all-whitespace tail implies the already-trimmed key ends
+  // in whitespace, a contradiction. Such values are refused one rule EARLIER.
+  //
+  // If anyone reorders the trim or widens `AGENT_SESSION_KEY`, this arm goes
+  // red and the reporting of that rule stops being dead code -- which is
+  // exactly when someone needs to know.
+  for (const value of ["agent:a: ", "agent:a:\t", "agent:a:\n", "agent:a:\u00a0", "agent:a:\u000b"]) {
+    const got = examineAgentSessionKey(value);
+    assert.equal(got.verdict.kind, "refused");
+    assert.equal(
+      got.verdict.kind === "refused" ? got.verdict.rule : undefined,
+      "not-an-agent-session-key",
+      `${JSON.stringify(value)} now reaches blank-tail -- the trim order moved`,
+    );
+  }
+});
+
+test("AC-1 arm: an accepted value is reported `accepted` and yields the chat session", () => {
+  for (const [value, expected] of [
+    ["agent:boekhouder:chat-7", "chat-7"],
+    ["  agent:boekhouder:chat-7  ", "chat-7"],
+    ["agent:a:" + "x".repeat(200), "x".repeat(200)],
+  ] as Array<[string, string]>) {
+    const got = examineAgentSessionKey(value);
+    assert.equal(got.verdict.kind, "accepted");
+    assert.equal(got.chatSessionId, expected);
+  }
+});
+
+test("AC-1 arm: `chatSessionFromAgentSessionKey` is a projection of the classifier, never a second copy", () => {
+  // Kill: reimplement either side independently. The reported rule and the
+  // ROUTING decision must not be able to drift apart -- a report that says
+  // `accepted` over a route that refused is worse than no report.
+  for (const [, values] of AC_S1_RULE_CASES) {
+    for (const value of values) {
+      assert.equal(chatSessionFromAgentSessionKey(value), examineAgentSessionKey(value).chatSessionId);
+    }
+  }
+  for (const value of ["agent:a:chat-7", "  agent:a:chat-7  "]) {
+    assert.equal(chatSessionFromAgentSessionKey(value), examineAgentSessionKey(value).chatSessionId);
+    assert.equal(chatSessionFromAgentSessionKey(value), "chat-7");
+  }
+});
+
+test("AC-1 arm: ABSENT is decided by the header bag, not by the classifier", () => {
+  // Kill: fold `absent` into `not-a-string`. `examineAgentSessionKey(undefined)`
+  // IS `not-a-string`; only the reader of the bag knows the header was never
+  // sent. This is the distinction the whole slice exists for.
+  const names = ["session_id", "x-client-request-id", "x-session-affinity"];
+  const absent = examineAffinityHeaders(names, {});
+  assert.deepEqual(absent.map((e) => e.verdict.kind), ["absent", "absent", "absent"]);
+
+  // A header that IS present with a non-string value is NOT absent.
+  const presentNonString = examineAffinityHeaders(names, { session_id: ["a", "b"] });
+  assert.deepEqual(presentNonString[0].verdict, { kind: "refused", rule: "not-a-string" });
+  assert.equal(presentNonString[1].verdict.kind, "absent");
+
+  assert.notEqual(
+    affinityExaminationSummary(absent),
+    affinityExaminationSummary(presentNonString),
+    "ABSENT and present-but-refused must not render identically",
+  );
+});
+
+test("AC-1 arm: the summary reports every name examined, in order, with a verdict each", () => {
+  // Kill: emit one aggregate verdict instead of per-name verdicts.
+  const names = ["session_id", "x-client-request-id", "x-session-affinity"];
+  const line = affinityExaminationSummary(examineAffinityHeaders(names, {
+    "session_id": "b66bdf67-0f4d-46d8-8051-4c9251fdde62",
+    "x-session-affinity": "agent:a:chat-7",
+  }));
+  for (const name of names) {
+    assert.ok(line.includes(JSON.stringify(name)), `${name} is not reported: ${line}`);
+  }
+  assert.match(line, /"session_id"=present-but-refused\(not-an-agent-session-key\)/);
+  assert.match(line, /"x-client-request-id"=ABSENT/);
+  assert.match(line, /"x-session-affinity"=accepted/);
+  assert.match(line, /examined 3 session-affinity header names: 1 accepted, 1 present-but-refused, 1 ABSENT/);
+});
+
+test("AC-1 arm: NO identifier value, or any fragment of one, reaches the summary", () => {
+  // Kill: render the refused value, a prefix of it, or its length.
+  const names = ["session_id", "x-client-request-id", "x-session-affinity"];
+  const planted = "chatSECRETcafe1234deadbeef";
+  const line = affinityExaminationSummary(examineAffinityHeaders(names, {
+    "session_id": planted,
+    "x-client-request-id": `agent:a:${planted} with spaces`,
+    "x-session-affinity": `agent:a:${planted}`,
+  }));
+  for (const needle of [planted, "SECRET", "cafe1234", "deadbeef", String(planted.length)]) {
+    assert.equal(line.includes(needle), false, `the summary discloses ${needle}: ${line}`);
+  }
+  // ...and it still said something useful about all three.
+  assert.match(line, /1 accepted, 2 present-but-refused, 0 ABSENT/);
+});
+
+test("AC-1 arm: the hintless log line carries the examination; the hinted one does not", () => {
+  // Kill: append the report unconditionally. When an identifier WAS found the
+  // affinity verdicts decided nothing, and printing them reads as if they had.
+  const examined = examineAffinityHeaders(
+    ["session_id", "x-client-request-id", "x-session-affinity"], {},
+  );
+  const hintless = unhintedMcpServersMessage(["booqi"], false, [], examined);
+  assert.match(hintless, /no usable chat-session identifier was available/);
+  assert.match(hintless, /3 ABSENT/);
+
+  // Identifier present, one server's URL unparseable: a different reason, and
+  // the affinity verdicts are not the explanation.
+  const other = unhintedMcpServersMessage(["booqi"], true, [], examined);
+  assert.match(other, /not a parseable URL string/);
+  assert.equal(/ABSENT/.test(other), false, `affinity verdicts leaked into the wrong branch: ${other}`);
+
+  // Backwards compatible: omitting the report degrades to the old line, it
+  // does not fabricate ABSENT.
+  assert.equal(/ABSENT/.test(unhintedMcpServersMessage(["booqi"], false)), false);
 });

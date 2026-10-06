@@ -25,8 +25,10 @@ import {
   __testing,
   executeWithRetries,
   resolveConversation,
+  SESSION_AFFINITY_HEADERS,
   type QueryFn,
 } from "../src/claude-bridge.ts";
+import type { AffinityHeaderExamination } from "../src/bridge-config.ts";
 import { buildQueryOptions, type BridgeConfig } from "../src/bridge-config.ts";
 
 const config: BridgeConfig = {
@@ -117,6 +119,8 @@ async function run(opts: {
   chatSessionId?: string;
   /** Configuration the request runs with. Defaults to the module `config`. */
   bridgeConfig?: BridgeConfig;
+  /** The per-header affinity verdicts the one log line must report. */
+  affinityHeaders?: readonly AffinityHeaderExamination[];
 }) {
   const runConfig = opts.bridgeConfig ?? config;
   const { sessionStore } = __testing.initialiseStores(runConfig);
@@ -138,6 +142,7 @@ async function run(opts: {
     await executeWithRetries(
       "hello", "claude-opus-4-6", opts.systemPrompt, conversationId,
       opts.stream ?? false, res, "req-1", runConfig, opts.chatSessionId,
+      opts.affinityHeaders,
     );
   } finally {
     __testing.setQuery(undefined);
@@ -914,3 +919,172 @@ test("a genuine stale-session error is still recognised", async () => {
   assert.ok(captured.length >= 2, `expected the stale-session retry, saw ${captured.length} call(s)`);
   assert.notEqual(sessionStore.get("conv-1")?.claudeSessionId, "stale-sdk-session");
 });
+
+// ── S1 / AC-1: the hintless line tells ABSENT from REFUSED ──────────
+//
+// booqi-app/infra#327, slice S1. Until this slice, FIFTEEN distinct worlds --
+// three header names x five refusal rules -- collapsed into the one string
+// `no usable chat-session identifier was available for this request`. A header
+// the host never sent and a header the host sent and we rejected read
+// identically, and they have OPPOSITE remedies: make the host send one (route
+// A, `compat.sendSessionAffinityHeaders`) versus relax the rule. The entire
+// chain-head reading of infra#327 rests on this one line.
+//
+// Each test below names the mutation it kills in its own title.
+
+test("AC-1 arm: every affinity header name is examined INDIVIDUALLY, none folded away", () => {
+  // Kill: report one aggregate instead of one entry per name.
+  const resolved = resolveConversation(reqWith({}), {});
+  assert.equal(
+    resolved.affinityHeaders.length,
+    SESSION_AFFINITY_HEADERS.length,
+    "the report must have one entry per affinity header name",
+  );
+  // Read from the exported constant, never retyped: adding a fourth header
+  // name cannot silently narrow the report.
+  assert.deepEqual(
+    resolved.affinityHeaders.map((e) => e.header),
+    [...SESSION_AFFINITY_HEADERS],
+  );
+});
+
+test("AC-1 arm: a header that was never sent is ABSENT, per name", () => {
+  // Kill: treat a missing header as `not-a-string` (it IS `undefined`, so the
+  // classifier alone cannot tell them apart -- only the reader of the bag can).
+  const resolved = resolveConversation(reqWith({}), {});
+  for (const entry of resolved.affinityHeaders) {
+    assert.equal(entry.verdict.kind, "absent", `${entry.header} should be ABSENT`);
+  }
+});
+
+test("AC-1 arm: a header that WAS sent and rejected is present-but-refused, with the rule named", () => {
+  // Kill: drop the rule from the verdict, or report `absent` for a refusal.
+  // The literal uuid measured in the reference cell's sessions.json -- the
+  // exact value route A would start sending.
+  const uuid = "b66bdf67-0f4d-46d8-8051-4c9251fdde62";
+  for (const header of SESSION_AFFINITY_HEADERS) {
+    const resolved = resolveConversation(reqWith({ [header]: uuid }), {});
+    const entry = resolved.affinityHeaders.find((e) => e.header === header)!;
+    assert.equal(entry.verdict.kind, "refused", `${header} must be present-but-refused`);
+    assert.equal(
+      entry.verdict.kind === "refused" ? entry.verdict.rule : undefined,
+      "not-an-agent-session-key",
+    );
+    // and the other two, which were genuinely not sent, must NOT say the same
+    for (const other of resolved.affinityHeaders.filter((e) => e.header !== header)) {
+      assert.equal(other.verdict.kind, "absent", `${other.header} must stay ABSENT`);
+    }
+  }
+});
+
+test("AC-1 arm: an accepted header is reported as accepted and still wins the routing", () => {
+  // Kill: examining all three names must not change "first that unwraps wins".
+  const resolved = resolveConversation(
+    reqWith({
+      "session_id": "not-a-key-at-all",
+      "x-client-request-id": "agent:boekhouder:chat-first",
+      "x-session-affinity": "agent:boekhouder:chat-second",
+    }),
+    {},
+  );
+  assert.equal(resolved.chatSessionId, "chat-first", "first ACCEPTED header must win");
+  assert.deepEqual(
+    resolved.affinityHeaders.map((e) => `${e.header}:${e.verdict.kind}`),
+    [
+      "session_id:refused",
+      "x-client-request-id:accepted",
+      "x-session-affinity:accepted",
+    ],
+    "every name is examined, including the ones after the winner",
+  );
+});
+
+test("AC-1 arm: the affinity headers are examined even when another channel names the session", () => {
+  // Kill: compute the examination inside the `??` chain, which short-circuits
+  // -- "not looked at" would then be reported as if it were a finding.
+  const resolved = resolveConversation(
+    reqWith({ "x-booqi-chat-session": "chat-named", "session_id": "garbage" }),
+    {},
+  );
+  assert.equal(resolved.chatSessionId, "chat-named");
+  assert.equal(resolved.affinityHeaders.length, SESSION_AFFINITY_HEADERS.length);
+  assert.equal(resolved.affinityHeaders[0].verdict.kind, "refused");
+});
+
+for (const stream of [false, true]) {
+  const via = stream ? "streaming" : "non-streaming";
+
+  test(`AC-1 arm: ABSENT and present-but-refused produce DIFFERENT log lines (${via})`, async () => {
+    // THE arm that matters. An implementation that merely adds nouns to the
+    // message survives every other arm here and dies on this one, because
+    // before S1 these two runs produced the byte-identical string.
+    const uuid = "b66bdf67-0f4d-46d8-8051-4c9251fdde62";
+    const absentRun = await run({
+      systemPrompt: undefined, behaviour: "success", stream,
+      bridgeConfig: configWithMcp,
+      affinityHeaders: resolveConversation(reqWith({}), {}).affinityHeaders,
+    });
+    const refusedRun = await run({
+      systemPrompt: undefined, behaviour: "success", stream,
+      bridgeConfig: configWithMcp,
+      affinityHeaders: resolveConversation(
+        reqWith(Object.fromEntries(SESSION_AFFINITY_HEADERS.map((h) => [h, uuid]))),
+        {},
+      ).affinityHeaders,
+    });
+
+    assert.equal(absentRun.logs.length, 1, `one line, got: ${absentRun.logs}`);
+    assert.equal(refusedRun.logs.length, 1, `one line, got: ${refusedRun.logs}`);
+    assert.notEqual(
+      absentRun.logs[0],
+      refusedRun.logs[0],
+      "absent and refused still collapse into one indistinguishable line",
+    );
+    assert.match(absentRun.logs[0], /3 ABSENT/);
+    assert.match(refusedRun.logs[0], /3 present-but-refused/);
+    assert.match(refusedRun.logs[0], /not-an-agent-session-key/);
+  });
+
+  test(`AC-1 arm: no identifier value reaches the log line (${via})`, async () => {
+    // Kill: render the refused value, or any part of it, into the message.
+    const planted = "agent:boekhouder:chatSECRETcafe1234";
+    const { logs } = await run({
+      systemPrompt: undefined, behaviour: "success", stream,
+      bridgeConfig: configWithMcp,
+      // Refused on the tail rule, so the classifier HELD the value and still
+      // must not print it.
+      affinityHeaders: resolveConversation(
+        reqWith({ "session_id": "agent:boekhouder:chat SECRET cafe1234" }), {},
+      ).affinityHeaders,
+    });
+    assert.equal(logs.length, 1);
+    for (const needle of ["SECRET", "cafe1234", planted]) {
+      assert.equal(
+        logs[0].includes(needle),
+        false,
+        `log discloses the identifier (${needle}): ${logs[0]}`,
+      );
+    }
+    assert.match(logs[0], /tail-not-a-chat-session-id/);
+  });
+
+  test(`AC-1 arm: the line reports COUNTS of what it examined, not a bare verdict (${via})`, async () => {
+    // Kill: replace the counts with "ok" / "none". The counts must cover every
+    // name examined, so a partial report is arithmetically detectable.
+    const { logs } = await run({
+      systemPrompt: undefined, behaviour: "success", stream,
+      bridgeConfig: configWithMcp,
+      affinityHeaders: resolveConversation(
+        reqWith({ "session_id": "b66bdf67-0f4d-46d8-8051-4c9251fdde62" }), {},
+      ).affinityHeaders,
+    });
+    assert.equal(logs.length, 1);
+    const m = /examined (\d+) session-affinity header names?: (\d+) accepted, (\d+) present-but-refused, (\d+) ABSENT/
+      .exec(logs[0]);
+    assert.ok(m, `the line does not report what it examined: ${logs[0]}`);
+    const [total, accepted, refused, absent] = m.slice(1).map(Number);
+    assert.equal(total, SESSION_AFFINITY_HEADERS.length);
+    assert.equal(accepted + refused + absent, total, "the counts must account for every name");
+    assert.deepEqual([accepted, refused, absent], [0, 1, 2]);
+  });
+}
