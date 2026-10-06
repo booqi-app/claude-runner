@@ -1539,11 +1539,16 @@ test("the absent-key default cannot be widened at runtime", () => {
 const AC_S1_RULE_CASES: Array<[AffinityRefusalRule, unknown[]]> = [
   ["not-a-string", [undefined, null, 123, ["agent:a:chat-1"], { v: 1 }]],
   ["blank", ["", "   ", "\t\n"]],
-  // A bare uuid -- the exact value route A would start sending -- lands here,
-  // and so does a key whose tail is empty or whitespace: the whole value is
+  // A key whose tail is empty or whitespace lands here: the whole value is
   // trimmed BEFORE the pattern runs, so such a key never matches at all.
+  //
+  // A bare uuid USED to be listed here. S4 (infra#327 part (iii)) made it
+  // ACCEPTED, because `apps/cell`'s relay now registers it as an alias
+  // (app#615); it is pinned accepted by the S4 arms at the end of this file.
+  // A non-uuid opaque value stays here, under the unchanged rule name, so this
+  // refusal path is still populated and S1's report still distinguishes it.
   ["not-an-agent-session-key", [
-    "b66bdf67-0f4d-46d8-8051-4c9251fdde62", "chat-7", "agent:a:", "agent:a: ", "agent::x",
+    "not-a-uuid-just-words", "chat-7", "agent:a:", "agent:a: ", "agent::x",
   ]],
   ["tail-not-a-chat-session-id", [
     "agent:a:chat A", "agent:a:agent:b:chat-9", "agent:b:chat-A, agent:b:chat-B", "agent:a:" + "x".repeat(201),
@@ -1639,7 +1644,8 @@ test("AC-1 arm: the summary reports every name examined, in order, with a verdic
   // Kill: emit one aggregate verdict instead of per-name verdicts.
   const names = ["session_id", "x-client-request-id", "x-session-affinity"];
   const line = affinityExaminationSummary(examineAffinityHeaders(names, {
-    "session_id": "b66bdf67-0f4d-46d8-8051-4c9251fdde62",
+    // Opaque and not uuid-shaped, so still refused after S4.
+    "session_id": "not-a-uuid-just-words",
     "x-session-affinity": "agent:a:chat-7",
   }));
   for (const name of names) {
@@ -1723,4 +1729,160 @@ test("AC-1 arm: ABSENT is decided by hasOwn, not by a prototype lookup", () => {
   // ...and an explicit `undefined` own-property is still ABSENT, not a refusal.
   const [explicit] = examineAffinityHeaders(["session_id"], { session_id: undefined });
   assert.deepEqual(explicit.verdict, { kind: "absent" });
+});
+
+// ── S4 (infra#327 part (iii)): the uuid relaxation, at the classifier ───────
+//
+// AC-4 is a SECURITY property, not a convenience: the relaxation must be
+// strictly NARROWER than `chatSessionIdSchema`. A uuid is a valid chat session
+// id by that schema (`/^[A-Za-z0-9_-]+$/`), so a matcher that merely deferred
+// to the schema would accept arbitrary caller junk as a tenant routing key.
+// The arms below prove the narrowness is proper and non-trivial: the uuid is
+// inside both sets, and a population of values is inside the schema and
+// outside the matcher.
+
+/** `chatSessionIdSchema`, restated so the narrowness claim is checkable here. */
+const CHAT_SESSION_ID_SCHEMA = /^[A-Za-z0-9_-]{1,200}$/;
+
+const MEASURED_HOST_SESSION_UUID = "b66bdf67-0f4d-46d8-8051-4c9251fdde62";
+
+/**
+ * STRUCTURALLY DISTINCT host-session uuids -- finding F-V1, closed on BOTH
+ * projections of the classifier rather than only on `resolveConversation`.
+ *
+ * The suite held exactly one uuid literal, so a constant-returning
+ * implementation was indistinguishable from a correct one. Verbatim-ness across
+ * distinct values is the property `apps/cell`'s alias table depends on, and the
+ * list doubles as the only arm the deliberately unconstrained version and
+ * variant nibbles have.
+ */
+const HOST_SESSION_UUIDS = [
+  MEASURED_HOST_SESSION_UUID,                 // v4, variant 8 -- the measured one
+  "00000000-0000-0000-0000-000000000000",     // the nil uuid, admitted on purpose
+  "ffffffff-ffff-ffff-ffff-ffffffffffff",     // every nibble f
+  "0c4fbf75-1234-1abc-0def-0123456789ab",     // version nibble 1, variant nibble 0
+  "9a8b7c6d-5e4f-7a3b-c2d1-e0f918273645",     // version nibble 7, variant nibble c
+  "deadbeef-0000-9999-ffff-012345678900",     // mixed, trailing zeroes
+] as const;
+
+test("S4 AC-4: every host-session uuid shape is accepted and yielded VERBATIM", () => {
+  // Kill: revert the relaxation -> red. Kill: return a constant instead of
+  // `key` -> red on every member but the first (finding F-V1; a single
+  // exemplar could not see this).
+  assert.equal(new Set(HOST_SESSION_UUIDS).size, HOST_SESSION_UUIDS.length, "the population must be distinct");
+  assert.ok(HOST_SESSION_UUIDS.length >= 3);
+  for (const uuid of HOST_SESSION_UUIDS) {
+    const got = examineAgentSessionKey(uuid);
+    assert.deepEqual(got.verdict, { kind: "accepted" }, `not accepted: ${uuid}`);
+    assert.equal(got.chatSessionId, uuid, `not verbatim: ${uuid}`);
+    // Verbatim through the projection too, because the cell's alias table is
+    // keyed by the exact string the host returned from `sessions.describe`.
+    assert.equal(chatSessionFromAgentSessionKey(uuid), uuid, `projection not verbatim: ${uuid}`);
+  }
+  // The version and variant nibbles are NOT constrained, and that is a
+  // decision rather than an oversight: the cell never interprets this value,
+  // it only looks it up. Stated as an arm so the next reader finds the reason
+  // instead of "tightening" it and fail-closing on real host uuids.
+  const versions = new Set(HOST_SESSION_UUIDS.map((u) => u[14]));
+  assert.ok(versions.size >= 3, `the population must exercise several version nibbles, got ${[...versions].join(",")}`);
+  const variants = new Set(HOST_SESSION_UUIDS.map((u) => u[19]));
+  assert.ok(variants.size >= 3, `the population must exercise several variant nibbles, got ${[...variants].join(",")}`);
+});
+
+test("S4 AC-4: the uuid matcher is STRICTLY NARROWER than chatSessionIdSchema", () => {
+  // THE AC-4 ARM. Every value below is ADMITTED by `chatSessionIdSchema` and
+  // MUST STILL BE REFUSED. The first assertion in the loop is what makes this
+  // a narrowness proof rather than a list of refusals: if a sample stopped
+  // being schema-legal the arm would fail rather than quietly weaken.
+  //
+  // Kill: widen the matcher to `[A-Za-z0-9_-]+` -> every case goes red.
+  const inSchemaButNotAUuid = [
+    "not-a-uuid-just-words",
+    "chat-7",
+    "default",
+    // uuid-ish near misses, all schema-legal
+    "B66BDF67-0F4D-46D8-8051-4C9251FDDE62",            // upper case
+    "b66bdf670f4d46d880514c9251fdde62",                 // hyphens stripped
+    "b66bdf67-0f4d-46d8-8051-4c9251fdde6",              // last group 11
+    "b66bdf67-0f4d-46d8-8051-4c9251fdde623",            // last group 13
+    "b66bdf67-0f4d-46d8-8051-4c9251fdde62-b66bdf67",    // suffixed
+    "zz6bdf67-0f4d-46d8-8051-4c9251fdde62",             // non-hex
+    "b66bdf6-70f4d-46d8-8051-4c9251fdde62",             // regrouped
+    "_66bdf67-0f4d-46d8-8051-4c9251fdde62",             // underscore for hex
+  ];
+  for (const value of inSchemaButNotAUuid) {
+    assert.equal(
+      CHAT_SESSION_ID_SCHEMA.test(value),
+      true,
+      `sample is not schema-legal, so it proves no narrowness: ${JSON.stringify(value)}`,
+    );
+    const got = examineAgentSessionKey(value);
+    assert.equal(
+      got.chatSessionId,
+      undefined,
+      `accepted a schema-legal non-uuid as a routing key: ${JSON.stringify(value)}`,
+    );
+    assert.equal(got.verdict.kind, "refused");
+  }
+  // ...and the narrowing is PROPER: the uuid is in both sets.
+  assert.equal(CHAT_SESSION_ID_SCHEMA.test(MEASURED_HOST_SESSION_UUID), true);
+  assert.equal(examineAgentSessionKey(MEASURED_HOST_SESSION_UUID).chatSessionId, MEASURED_HOST_SESSION_UUID);
+});
+
+test("S4 AC-4: an UPPER-CASE uuid is refused, not case-folded", () => {
+  // Folding the case would be worse than refusing it. The host writes these
+  // lower-cased into `sessions.json` and the cell's alias map is keyed by that
+  // exact string, so an upper-case value that we accepted and did not fold
+  // would produce a `bound: true` log line over a `tenant_unavailable` answer
+  // -- the false green the original refusal existed to prevent. Folding it
+  // instead would fabricate an identifier the host never issued.
+  //
+  // Kill: add the `i` flag to the uuid matcher -> red.
+  const upper = MEASURED_HOST_SESSION_UUID.toUpperCase();
+  const got = examineAgentSessionKey(upper);
+  assert.equal(got.chatSessionId, undefined);
+  assert.equal(got.verdict.kind, "refused");
+});
+
+test("S4 AC-4: a uuid wrapped in an agent session key still unwraps to the tail", () => {
+  // The two accepted shapes do not interfere. A keyed run whose chat session
+  // id happens to be uuid-shaped unwraps, it does not get taken whole.
+  const got = examineAgentSessionKey(`agent:boekhouder:${MEASURED_HOST_SESSION_UUID}`);
+  assert.deepEqual(got.verdict, { kind: "accepted" });
+  assert.equal(got.chatSessionId, MEASURED_HOST_SESSION_UUID);
+});
+
+test("S4 AC-4: a uuid with surrounding whitespace is trimmed, then accepted", () => {
+  // `normaliseChatSessionId` runs before the matcher, so the anchored pattern
+  // sees a trimmed value. Pinned because an unanchored matcher would accept
+  // `prefix <uuid> suffix`, which is a different and much wider rule.
+  assert.equal(examineAgentSessionKey(`  ${MEASURED_HOST_SESSION_UUID}  `).chatSessionId, MEASURED_HOST_SESSION_UUID);
+  for (const value of [
+    `junk ${MEASURED_HOST_SESSION_UUID}`,
+    `${MEASURED_HOST_SESSION_UUID} junk`,
+    `${MEASURED_HOST_SESSION_UUID},${MEASURED_HOST_SESSION_UUID}`,
+  ]) {
+    assert.equal(
+      examineAgentSessionKey(value).chatSessionId,
+      undefined,
+      `unanchored match accepted: ${JSON.stringify(value)}`,
+    );
+  }
+});
+
+test("S4: the summary reports an accepted uuid as accepted, and never prints it", () => {
+  // The S1 report and the S4 routing decision are projections of one
+  // classifier and must not drift: a value that routes must not be reported
+  // refused. And the uuid is an identifier, so it stays out of the line.
+  const names = ["session_id", "x-client-request-id", "x-session-affinity"];
+  const line = affinityExaminationSummary(examineAffinityHeaders(names, {
+    "session_id": MEASURED_HOST_SESSION_UUID,
+    "x-client-request-id": "not-a-uuid-just-words",
+  }));
+  assert.match(line, /"session_id"=accepted/);
+  assert.match(line, /"x-client-request-id"=present-but-refused\(not-an-agent-session-key\)/);
+  assert.match(line, /"x-session-affinity"=ABSENT/);
+  assert.match(line, /1 accepted, 1 present-but-refused, 1 ABSENT/);
+  assert.equal(line.includes(MEASURED_HOST_SESSION_UUID), false, `the uuid reached the line: ${line}`);
+  assert.equal(line.includes("b66bdf67"), false, `a fragment of the uuid reached the line: ${line}`);
 });
