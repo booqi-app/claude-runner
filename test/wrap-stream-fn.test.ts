@@ -52,7 +52,7 @@ const UUID = "4f0a1c2e-7b3d-4e8a-9c61-25d7f8ab9013";
  * that only re-read a constant's length, which is false assurance in precisely
  * the repo that was bitten by false green.
  */
-const EXPECTED_ARMS = 22;
+const EXPECTED_ARMS = 21;
 let armsRun = 0;
 const arm = (name: string, fn: () => void | Promise<void>) =>
   test(name, async () => {
@@ -264,42 +264,56 @@ arm("B5 a non-plain header bag is passed through UNTOUCHED rather than spread in
   assert.equal(planSessionAffinityHeaders({ sessionId: UUID, headers: np }).written, 3);
 });
 
-/* --- MN-1: the per-call model, three states, none collapsed ---------------- */
-
-arm("C3 a per-call model belonging to ANOTHER provider gets no session header", () => {
-  // The install-time decision outlives itself: two live host callers hand the
-  // currently wrapped `agent.streamFn` to secondary generators. Not reachable
-  // on this host version, but the failure mode is our tenant's session uuid
-  // arriving at another provider's endpoint, and the fix is one comparison.
+arm("B6 `headers: null` is ABSENT, not an unwritable shape — it CARRIES", () => {
+  // Round 2 briefly regressed this: the non-plain-bag guard tested only
+  // `!== undefined`, so `null` took the decline path and the identifier was
+  // silently dropped -- the defect this carrier exists to fix, reintroduced.
+  // `{...null}` is `{}` and destroys nothing, so `null` means "nothing there"
+  // exactly as `undefined` does. The host preserves a falsy `headers` verbatim.
   const { rec, call } = wrapped();
-  call({ provider: "openai", id: "gpt" }, {}, { sessionId: UUID, headers: {} });
-  const h = rec.calls[0]!.options!.headers!;
+  call("m", {}, { sessionId: UUID, headers: null as never });
   for (const name of SESSION_AFFINITY_HEADER_NAMES) {
-    assert.equal(h[name], undefined, `a foreign provider must not receive ${name}`);
+    assert.equal(rec.calls[0]!.options!.headers![name], UUID, `headers:null must still carry ${name}`);
   }
+  assert.equal(planSessionAffinityHeaders({ sessionId: UUID, headers: null as never }).written, 3);
+  // ...and it is symmetric with `undefined`, which has always carried.
+  assert.equal(planSessionAffinityHeaders({ sessionId: UUID }).written, 3);
 });
 
-arm("C4 a per-call model that IS ours, in any host-normalised spelling, is carried", () => {
-  for (const variant of [CARRIER_PROVIDER_ID, "Claude-Runner", "  CLAUDE-RUNNER  "]) {
-    const { rec, call } = wrapped();
-    call({ provider: variant }, {}, { sessionId: UUID, headers: {} });
-    assert.equal(rec.calls[0]!.options!.headers!.session_id, UUID, `model provider ${variant}`);
-  }
-});
+/* --- the per-call model does NOT gate the carrier, and that is a DECISION --- */
 
-arm("C5 a per-call model with an ABSENT or unreadable provider falls back to the install-time decision, and that arm is named", () => {
-  // ABSENT is not silently either of the other two states: it is a decided,
-  // tested third case. `ctx.provider` is the only evidence available and it
-  // said yes, so we carry -- and this arm exists so that choice is visible
-  // rather than a fallthrough.
-  for (const model of [{ id: "m" }, { provider: 7 }, null, "a string model", undefined]) {
+arm("C3 the per-call model is forwarded by identity and does NOT gate the carrier, whatever its provider says", () => {
+  // This pins a REMOVED guard. A `perCallModelIsForeign` check was added in
+  // round 2 to close reviewer A's MN-1 and removed in the same round: the leak
+  // it closed is unreachable on this host version, while the silent DECLINE it
+  // introduced is reachable, because `model.provider` is an ONGEMETEN field and
+  // the resolved model may legitimately carry the api, the upstream vendor, or
+  // a composite id. Fail-closed on an unmeasured field would reintroduce
+  // exactly the `"bound": false` this carrier exists to fix.
+  //
+  // So: the carrier is gated by `ctx.provider` at install time and by nothing
+  // else, and this arm fails the moment someone re-adds a per-call gate without
+  // first measuring the field.
+  for (const model of [
+    { provider: "openai", id: "gpt" },
+    { provider: "anthropic" },
+    { provider: "openai-completions" },
+    { provider: "claude-runner/claude-opus-4-6" },
+    { provider: CARRIER_PROVIDER_ID },
+    { id: "m" },
+    { provider: 7 },
+    null,
+    "a string model",
+    undefined,
+  ]) {
     const { rec, call } = wrapped();
     call(model, {}, { sessionId: UUID, headers: {} });
     assert.equal(
       rec.calls[0]!.options!.headers!.session_id,
       UUID,
-      `an unreadable per-call provider (${JSON.stringify(model)}) must not disable the carrier`,
+      `a per-call model of ${JSON.stringify(model)} must not disable the carrier`,
     );
+    assert.equal(rec.calls[0]!.model, model, "the model must be forwarded by identity");
   }
 });
 

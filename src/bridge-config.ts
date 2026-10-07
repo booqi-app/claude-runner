@@ -1667,13 +1667,25 @@ export function planSessionAffinityHeaders(
   if (typeof sessionId !== "string" || sessionId.length === 0) return none;
 
   const existing = options.headers;
+  // THREE states for the bag itself, and `null` belongs with `undefined`.
+  //
   // A NON-PLAIN object -- a `Headers` instance, a `Map` -- spreads to `{}`, so
   // copying it would DROP every header the host set (including authorization)
   // on the good path. We cannot write into a shape we do not understand, so we
   // decline rather than destroy: no plan, the bag goes through untouched.
-  if (existing !== undefined && !isPlainHeaderBag(existing)) return none;
+  //
+  // 🔴 But `null` is NOT such a shape: `{...null}` is `{}` and destroys
+  // nothing, so `null` means "nothing there" exactly as `undefined` does and
+  // must CARRY. An earlier version of this guard tested only `!== undefined`,
+  // which put `null` on the decline path and silently dropped the identifier --
+  // reintroducing the very defect this carrier exists to fix, measured as a
+  // behaviour change against the previous head. The host preserves a falsy
+  // `headers` verbatim (`provider-stream-*.js:1391-1392` returns `options` by
+  // identity when `headers === options?.headers`), so it reaches us unchanged.
+  if (existing !== undefined && existing !== null && !isPlainHeaderBag(existing)) return none;
 
-  const headers: Record<string, unknown> = existing === undefined ? {} : { ...existing };
+  const headers: Record<string, unknown> =
+    existing === undefined || existing === null ? {} : { ...existing };
   const decisions: { header: string; decision: SessionAffinityHeaderDecision }[] = [];
   let written = 0;
 
@@ -1719,33 +1731,42 @@ export function applySessionAffinityHeaders(
   return { ...options, headers: plan.headers };
 }
 
-/**
- * Is this per-call model one of ours?
+/*
+ * 🔴 A GUARD THAT WAS ADDED HERE AND THEN REMOVED, recorded so it is not
+ * re-added blindly — this is round-2 review fallout on round-2 code.
  *
- * THREE states, and they are not collapsed. The hook decides "is this
- * claude-runner?" once, at install time, from `ctx.provider` — but the wrapper
- * it installs outlives that decision, and two live host callers hand the
+ * Reviewer A (round 1, MN-1) observed that the hook decides "is this
+ * claude-runner?" once at install time from `ctx.provider`, while the wrapper
+ * it installs outlives that decision, and that two live host callers hand the
  * CURRENTLY WRAPPED `agent.streamFn` to secondary generators
- * (`sessions-*.js:10715` compaction, `:11337` branch summary). On this host
- * version those cannot reach another provider's model (`selection-*.js:12878/12926`
- * and `compact-*.js:173` reinstall the pristine base first), but the cost of
- * closing the class is one comparison and the cost of not closing it is our
- * tenant's session uuid arriving at another provider's endpoint.
+ * (`sessions-*.js:10715` compaction, `:11337` branch summary). A
+ * `perCallModelIsForeign(model)` check was added to decline when the per-call
+ * model's `provider` is not ours.
  *
- * - present and ours        -> carry
- * - present and NOT ours    -> do not carry (this is the case being closed)
- * - ABSENT / unreadable     -> carry, because the install-time decision from
- *   `ctx.provider` is the only evidence available and it said yes. This arm is
- *   named and tested rather than left as a fallthrough, because an absent field
- *   silently taking the happy path is the defect class this file argues about
- *   everywhere else.
+ * It was REMOVED in the same round, because the trade is inverted:
+ *
+ *  - The leak it closes is NOT REACHABLE on this host version. Reviewer A
+ *    measured that `selection-*.js:12878/12926` and `compact-*.js:173`
+ *    reinstall `agent.streamFn` from the cached pristine base before
+ *    `applyExtraParamsToAgent` runs.
+ *  - The decline it introduces IS reachable, and it is silent. `model.provider`
+ *    is an **ONGEMETEN** field: every other field this module reads is
+ *    justified by a probe (the context shape by the measured `ctx_keys`, the
+ *    arity by `provider-hook-runtime-*.js:261-263`, the wrapped signature by
+ *    `openai-transport-stream-*.js:2374/2404`) and there is no measured
+ *    `model_keys` anywhere. If the resolved model's `provider` is the api
+ *    (`"openai-completions"`), the upstream vendor (`"anthropic"`), or a
+ *    composite (`"claude-runner/claude-opus-4-6"` — the spelling this plugin's
+ *    own `defaultModel` uses), the carrier declines, all three headers are
+ *    ABSENT, and the chat is back to `"bound": false` with a green suite.
+ *
+ * Fail-closed on an unmeasured field is the defect class this whole file
+ * argues against. So MN-1 is deliberately LEFT OPEN as a MINOR, with its
+ * reason, rather than closed by a guard that can reintroduce the bug it is
+ * neighbours with. To close it properly, first MEASURE `model.provider` on a
+ * real turn (the probe data for it was never collected), then decline only for
+ * a provider id that is positively known to belong to someone else.
  */
-function perCallModelIsForeign(model: unknown): boolean {
-  if (model === null || typeof model !== "object") return false;
-  const provider = (model as { provider?: unknown }).provider;
-  if (typeof provider !== "string") return false;
-  return provider.trim().toLowerCase() !== CARRIER_PROVIDER_ID;
-}
 
 /**
  * The `wrapStreamFn` provider-runtime hook.
@@ -1773,7 +1794,5 @@ export function wrapClaudeRunnerStreamFn(
   const baseFn = base as ProviderStreamFn;
 
   return (model, context, options, ...rest) =>
-    perCallModelIsForeign(model)
-      ? baseFn(model, context, options, ...rest)
-      : baseFn(model, context, applySessionAffinityHeaders(options), ...rest);
+    baseFn(model, context, applySessionAffinityHeaders(options), ...rest);
 }
