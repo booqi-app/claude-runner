@@ -27,7 +27,9 @@ import {
   chatSessionFromAgentSessionKey,
   examineAffinityHeaders,
   normaliseChatSessionId,
+  normaliseSystemPromptMode,
   resolveSystemPrompt,
+  wrapSystemPromptAsInstructions,
 } from "./bridge-config.ts";
 import type { AffinityHeaderExamination, BridgeConfig } from "./bridge-config.ts";
 export type { AffinityHeaderExamination } from "./bridge-config.ts";
@@ -664,24 +666,62 @@ export async function executeWithRetries(
       }
 
       try {
-        // The system prompt goes out on EVERY turn, resumed or not. The CLI
-        // rebuilds it from the current query options each time; `--resume`
-        // replays the transcript, not the prompt. Omitting it on a resumed
-        // turn therefore does not inherit it, it sends an empty one, and the
-        // agent's persona flips silently after turn 1. The rule lives in
-        // resolveSystemPrompt so that it is testable without the SDK -- this
-        // module imports the SDK at the top level and the hermetic unit suite
-        // cannot load it. booqi-app/infra#202.
-        const effectiveSystemPrompt = resolveSystemPrompt(systemPrompt, compactSummary, resumeSessionId);
+        // In `"replace"` mode the system prompt goes out as an OPTION on
+        // EVERY turn, resumed or not. The CLI rebuilds it from the current
+        // query options each time; `--resume` replays the transcript, not the
+        // prompt. Omitting it on a resumed turn therefore does not inherit it,
+        // it sends an empty one, and the agent's persona flips silently after
+        // turn 1. The rule lives in resolveSystemPrompt so that it is testable
+        // without the SDK -- this module imports the SDK at the top level and
+        // the hermetic unit suite cannot load it. booqi-app/infra#202.
+        let effectiveSystemPrompt = resolveSystemPrompt(systemPrompt, compactSummary, resumeSessionId);
+        let effectivePrompt = prompt;
+
+        // `"append"` mode inverts that, and the reasoning above does not carry
+        // over: there is no usable system-prompt option on this SDK (see
+        // `BridgeConfig.systemPromptMode` for the measurements), so the prompt
+        // is delivered as CONTENT on the first turn and the SDK's own transcript
+        // carries it from then on. Because `--resume` replays that transcript,
+        // resending it would duplicate it on every turn -- the same reasoning
+        // that keeps a consumed compaction summary from being replayed. No
+        // system-prompt option is set in either case. booqi-app/infra#333.
+        if (normaliseSystemPromptMode(config.systemPromptMode) === "append" && effectiveSystemPrompt) {
+          // Gate on DELIVERY, not on `!resumeSessionId` alone.
+          //
+          // A pending compaction summary MUST go out even on a resumed turn.
+          // `resolveSystemPrompt` folds the summary into `effectiveSystemPrompt`
+          // regardless of the resume id (it `void`s that argument), and the
+          // summary has already been CONSUMED from the store by this point. So
+          // a resumed turn that skipped the block sent the summary nowhere --
+          // no instructions block and, two lines below, no system-prompt option
+          // either -- while success still set `summaryDelivered = true`, which
+          // suppresses the `finally` restore. The only record of a rotated-away
+          // conversation was then gone for good.
+          //
+          // That state is reachable: `rotateSession` clears `claudeSessionId`,
+          // but the restore path calls `setCompactSummary`, which does NOT, so a
+          // pending summary can coexist with a live resumable id. Measured
+          // before this fix: in `"append"` mode such a turn dispatched exactly
+          // `"hello"` with no `systemPrompt` key, where `"replace"` on the same
+          // path dispatched the summary in the option.
+          //
+          // Re-sending the instructions costs one duplicated system prompt in
+          // the transcript, on the rare turn where a summary is pending. Losing
+          // the summary costs the conversation. booqi-app/infra#333.
+          if (!resumeSessionId || compactSummary) {
+            effectivePrompt = wrapSystemPromptAsInstructions(effectiveSystemPrompt, prompt);
+          }
+          effectiveSystemPrompt = undefined;
+        }
 
         if (stream) {
           await handleStreamingResponse(
-            prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
+            effectivePrompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
             res, requestId, config, chatSessionId, hintLog, affinityHeaders,
           );
         } else {
           await handleNonStreamingResponse(
-            prompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
+            effectivePrompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
             res, requestId, config, chatSessionId, hintLog, affinityHeaders,
           );
         }

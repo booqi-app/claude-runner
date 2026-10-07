@@ -81,9 +81,39 @@ export interface BridgeConfig {
    * - `"replace"` (default) -- `systemPrompt: <the caller's prompt>` as a
    *   plain string. The session's system prompt is the agent's own prompt and
    *   nothing else.
-   * - `"append"` -- `systemPrompt: { type: "preset", preset: "claude_code",
-   *   append: <the caller's prompt> }`. The Claude Code preset comes first,
-   *   the caller's prompt after it.
+   * - `"append"` -- NO system-prompt option is sent at all, and the caller's
+   *   prompt is delivered as CONTENT on the first turn of the SDK session,
+   *   wrapped in `<agent-instructions>`. The session keeps Claude Code's own
+   *   preset prompt, which is what keeps the call first-party.
+   *
+   * ## Why `"append"` no longer sets an option (booqi-app/infra#333)
+   *
+   * Measured on `@anthropic-ai/claude-agent-sdk@0.3.263` with the real 59k
+   * OpenClaw system prompt and both OAuth pool tokens:
+   *
+   * | option | billing | instructions honoured |
+   * |---|---|---|
+   * | `systemPrompt: "<string>"` | **400** `Third-party apps now draw from your extra usage, not your plan limits.` | yes |
+   * | `appendSystemPrompt: "<string>"` | ok | **no** -- silently discarded |
+   * | `systemPrompt: { type: "preset", preset: "claude_code", append }` | **400**, same message | n/a |
+   * | no system-prompt option, instructions as first-turn content | ok | yes |
+   *
+   * The "instructions honoured" column is a real probe, not a reading of the
+   * request: a prompt saying "answer every message with exactly BANANA"
+   * produced `"Paris."` under `appendSystemPrompt` and `"BANANA"` under
+   * `systemPrompt`. Replacing the preset is what Anthropic bills as a
+   * third-party app, so there is no option that is both first-party and
+   * honoured -- hence the content path.
+   *
+   * Why `appendSystemPrompt` passes billing while delivering nothing:
+   * it is STILL not a key of the SDK's `Options` type on 0.3.263 (verified
+   * with `tsc`: `"appendSystemPrompt" extends keyof Options` is `false`;
+   * the name exists only on the internal control-protocol `initialize`
+   * message, which the SDK derives from `systemPrompt`). The SDK discards the
+   * unknown key. What CHANGED since 0.2.92 is the consequence of the discard:
+   * then it still sent `systemPrompt: ""` and so suppressed the preset; on
+   * 0.3.263 the discard leaves the preset intact, which is exactly why the
+   * call bills as first-party and the instructions are simply absent.
    *
    * ## What the choice actually costs, measured
    *
@@ -95,6 +125,11 @@ export interface BridgeConfig {
    * |---|---|---|---|
    * | `"replace"` | 158 chars | yes | yes |
    * | `"append"` | 26,811 chars | yes | yes |
+   *
+   * That row for `"append"` was taken when the mode still set the preset
+   * object; booqi-app/infra#333 stopped it setting any option, so the
+   * ~26.8 KB is now the preset the SDK sends by default rather than one this
+   * bridge asks for. The size, and the point being made with it, are the same.
    *
    * **CLAUDE.md/memory loading and the environment block (today's date) are
    * NOT carried by the preset.** The CLI injects both into the first user
@@ -262,6 +297,32 @@ export function resolveSystemPrompt(
   return [systemPrompt, `${COMPACT_SUMMARY_HEADING}${compactSummary}`]
     .filter(Boolean)
     .join("");
+}
+
+/** The element the caller's system prompt is delivered inside, in append mode. */
+export const AGENT_INSTRUCTIONS_TAG = "agent-instructions";
+
+/**
+ * Deliver a system prompt as CONTENT on the first turn of a session.
+ *
+ * This is `"append"` mode's whole mechanism. Nothing can be said in the SDK's
+ * system-prompt options that is both first-party and honoured on 0.3.263 --
+ * see the table on `BridgeConfig.systemPromptMode` -- so the instructions go
+ * where the model will certainly read them: the user message. The SDK writes
+ * them into the session transcript, `--resume` replays that transcript, and so
+ * they must NOT be resent on a resumed turn; the caller decides that by
+ * calling this only when there is no resume id.
+ *
+ * Extracted here, beside `resolveSystemPrompt`, for the same reason: the
+ * transport imports the Agent SDK and the hermetic unit suite cannot load it,
+ * so anything asserted about prompt assembly has to live in this module.
+ * booqi-app/infra#333.
+ */
+export function wrapSystemPromptAsInstructions(
+  systemPrompt: string,
+  prompt: string,
+): string {
+  return `<${AGENT_INSTRUCTIONS_TAG}>\n${systemPrompt}\n</${AGENT_INSTRUCTIONS_TAG}>\n\n${prompt}`;
 }
 
 /**
@@ -1308,21 +1369,33 @@ export function buildQueryOptions(
     opts.sessionId = newSessionId;
   }
 
-  if (systemPrompt) {
-    // `systemPrompt`, NOT `appendSystemPrompt`. The latter is not a key of the
-    // SDK's `Options` type at all -- it exists only on the SDK's internal
-    // control-protocol `initialize` message, which the SDK derives from this
-    // option. Setting it did nothing except make the SDK send `systemPrompt`
-    // as `""`, which on the stream-json path is stored as-is and suppresses
-    // the preset prompt entirely. See booqi-app/infra#202 for the capture.
+  if (systemPrompt && normaliseSystemPromptMode(config.systemPromptMode) !== "append") {
+    // `systemPrompt`, NOT `appendSystemPrompt`.
     //
-    // Which of the two forms is used is configuration, not a constant; see
-    // `BridgeConfig.systemPromptMode` for the decision and the measurement
-    // behind it.
-    opts.systemPrompt =
-      normaliseSystemPromptMode(config.systemPromptMode) === "append"
-        ? { type: "preset", preset: "claude_code", append: systemPrompt }
-        : systemPrompt;
+    // `appendSystemPrompt` is still not an `Options` key on
+    // @anthropic-ai/claude-agent-sdk@0.3.263 -- verified with `tsc`, see
+    // `BridgeConfig.systemPromptMode`. CORRECTION to the rest of what this
+    // comment said until booqi-app/infra#333: setting it no longer makes the
+    // SDK send `systemPrompt: ""`. On 0.3.263 the discarded key leaves the
+    // preset intact, so the call bills fine and the instructions are merely
+    // absent -- which is a quieter failure than the one described here, and
+    // the reason the old wording read as reassuring.
+    //
+    // Neither it nor `{ type: "preset", preset: "claude_code", append }` is
+    // usable: the append-shaped option delivers nothing, and anything that
+    // replaces the preset makes Anthropic bill the call as a third-party app
+    // and answer `400 Third-party apps now draw from your extra usage, not
+    // your plan limits.` The measurement table is on
+    // `BridgeConfig.systemPromptMode`.
+    //
+    // So only `"replace"` sets an option here, and it accepts the 400 risk
+    // knowingly -- it is the mode for an install whose plan allows it. In
+    // `"append"` mode this function sets NO system-prompt option of any kind,
+    // and the caller delivers the prompt as first-turn CONTENT instead; see
+    // `wrapSystemPromptAsInstructions`. An absent key is the point, so do not
+    // "tidy" this into an empty string: this SDK stores `""` and uses it to
+    // suppress the preset (booqi-app/infra#202).
+    opts.systemPrompt = systemPrompt;
   }
 
   const mcpServers = readMcpServers(config.mcpServers);

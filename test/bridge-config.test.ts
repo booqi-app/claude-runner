@@ -42,6 +42,8 @@ import {
   DEFAULT_TOOLS_WHEN_ABSENT,
   unusableToolsMessage,
   resolveSystemPrompt,
+  wrapSystemPromptAsInstructions,
+  AGENT_INSTRUCTIONS_TAG,
   SDK_OPTION_NAMES,
   summariseMcpServers,
   type BridgeConfig,
@@ -602,13 +604,38 @@ test("systemPromptMode defaults to replace -- the agent's prompt, not the coding
   }
 });
 
-test("systemPromptMode append is still available and sends the preset form", () => {
-  const opts = buildQueryOptions(
-    "claude-opus-4-6", "P", undefined, "session-1",
-    baseConfig({ systemPromptMode: "append" }), new AbortController(), {},
-  );
+test("systemPromptMode append sets NO system-prompt option of any kind", () => {
+  // booqi-app/infra#333. Measured on @anthropic-ai/claude-agent-sdk@0.3.263:
+  // `{ type: "preset", preset: "claude_code", append }` is billed as a
+  // third-party app exactly like a plain replacing string and fails the call
+  // with `400 Third-party apps now draw from your extra usage, not your plan
+  // limits.`, while `appendSystemPrompt` is still not an `Options` key and is
+  // discarded -- on 0.3.263 that discard leaves the preset intact, so it bills
+  // fine and delivers nothing at all. So append mode sends nothing here and
+  // the transport delivers the prompt as first-turn content instead.
+  for (const resume of [undefined, "sdk-session-9"]) {
+    const opts = buildQueryOptions(
+      "claude-opus-4-6", "P", resume, resume ? undefined : "session-1",
+      baseConfig({ systemPromptMode: "append" }), new AbortController(), {},
+    );
 
-  assert.deepEqual(opts.systemPrompt, { type: "preset", preset: "claude_code", append: "P" });
+    // `in`, not a truthiness check: `systemPrompt: ""` is a present, empty
+    // prompt to this SDK and suppresses the preset, which is the whole
+    // billing problem back again.
+    assert.equal("systemPrompt" in opts, false, `resume=${resume}`);
+    assert.equal("appendSystemPrompt" in opts, false, `resume=${resume}`);
+  }
+});
+
+test("append mode's instructions block wraps the prompt, and only the prompt", () => {
+  assert.equal(
+    wrapSystemPromptAsInstructions("BE A BOOKKEEPER", "what is 2+2?"),
+    "<agent-instructions>\nBE A BOOKKEEPER\n</agent-instructions>\n\nwhat is 2+2?",
+  );
+  // The caller's turn survives verbatim -- the instructions are a prefix, not
+  // a replacement, so a mutant that drops `prompt` is caught.
+  assert.ok(wrapSystemPromptAsInstructions("I", "USER-TURN").endsWith("USER-TURN"));
+  assert.equal(AGENT_INSTRUCTIONS_TAG, "agent-instructions");
 });
 
 test("an unrecognised systemPromptMode falls back to the default, and is reported", () => {
@@ -711,13 +738,32 @@ test("the bridge takes its per-turn system prompt from resolveSystemPrompt, unco
 
   assert.match(bridge, /=\s*resolveSystemPrompt\s*\(/);
 
-  // The exact shape of the reverted bug: a system prompt gated on there being
-  // no resume id.
-  assert.equal(
-    /if\s*\(\s*!\s*resumeSessionId\s*\)/.test(bridge), false,
-    "claude-bridge.ts gates something on `!resumeSessionId` again -- if that is the system prompt, "
-      + "every resumed turn runs with an empty one (booqi-app/infra#202)",
-  );
+  // DELETED here: three structural source-text assertions that used to stand
+  // in this spot -- a loop requiring every `if (!resumeSessionId)` branch to be
+  // the instructions block, a regex forbidding the system prompt to be a
+  // ternary on the resume id, and a regex requiring the literal
+  // `normaliseSystemPromptMode(config.systemPromptMode) === "append"`.
+  //
+  // They are removed rather than repaired because both of their failure modes
+  // were measured on this very branch:
+  //
+  //   * EVADED. The infra#333 fix round changed the gate to
+  //     `if (!resumeSessionId || compactSummary)` -- a real behaviour change --
+  //     and the guard loop then matched ZERO branches and asserted nothing,
+  //     silently. A guard that stops guarding without failing is worse than no
+  //     guard, because it still reads as coverage.
+  //   * FALSE POSITIVE. The `=== "append"` regex turned RED for a strictly
+  //     behaviour-preserving hoist (`const mode = normalise...; mode === "append"`)
+  //     while every behavioural test stayed green.
+  //
+  // What they were reaching for is now held by BEHAVIOUR, in tests that observe
+  // what the SDK call receives rather than what the file says:
+  //   - `append mode on a RESUMED session does not resend the instructions`
+  //   - `append mode delivers a pending compaction summary on a RESUMED turn`
+  //   - `systemPromptMode append sets NO system-prompt option of any kind`
+  //   - `a resumed turn also carries the compaction summary` (replace mode)
+  // Those fail when the behaviour regresses, and do not fail when it does not.
+
   assert.equal(
     /\bappendSystemPrompt\b/.test(bridge), false,
     "claude-bridge.ts names appendSystemPrompt, which is not an SDK option",

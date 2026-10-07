@@ -8,10 +8,19 @@
  * `Record<string, any>`, so without this a misspelt or invented option name
  * compiles, passes every behavioural test, and is discarded by the SDK.
  *
- * That is not hypothetical: the bridge used to set `appendSystemPrompt`, which
- * is not an `Options` key at all, and the prompt was silently discarded for as
- * long as it did. booqi-app/infra#202 replaced it with the real `systemPrompt`
- * option, so KNOWN_NON_SDK_OPTION_NAMES is now EMPTY -- the intended state.
+ * That is not hypothetical: the bridge used to set `appendSystemPrompt` and
+ * the prompt was silently discarded for as long as it did. booqi-app/infra#202
+ * replaced it with the real `systemPrompt` option, so
+ * KNOWN_NON_SDK_OPTION_NAMES is now EMPTY -- the intended state.
+ *
+ * Note the limit of what a NAME check proves. `appendSystemPrompt` is still
+ * not an `Options` key on @anthropic-ai/claude-agent-sdk@0.3.263, so this file
+ * would still catch it -- but what the key DOES when discarded changed between
+ * versions (0.2.92 then sent `systemPrompt: ""`; 0.3.263 leaves the preset
+ * intact), and a legal name can be legal and still unusable:
+ * `{ type: "preset", preset: "claude_code", append }` typechecks and is billed
+ * as a third-party app. booqi-app/infra#333 therefore stopped relying on any
+ * append-shaped option rather than listing one here.
  * The second assertion below is what keeps it honest: an entry there that the
  * SDK *does* accept is a compile error, so a listed name cannot outlive the
  * defect it records.

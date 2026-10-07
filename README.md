@@ -84,7 +84,7 @@ Extension settings are in `~/.openclaw/extensions/claude-runner/config.json`:
 | `tools` | `[]` | The tools the SDK session may use. **An absent key means NO built-in tools.** The bridge sets `tools: []` when the key is missing; it does not let the Agent SDK fall back to its full built-in set (`Bash`, `Read`, `Write`, `Edit`, `WebFetch`, `WebSearch`), which it would otherwise do *under* `permissionMode: "bypassPermissions"`. A present value must be an **array** — a string, a number, `null`, `false` or an object stops the bridge at configuration load with an error naming the key, rather than being coerced or silently dropped. `"tools": []` and an absent key behave identically; write the key when you want the restriction to be visible to the next reader. Note this governs the **built-in** tool set only — MCP tools named in `mcpServers` arrive regardless. ⚠️ **Behaviour change on upgrade:** see [An absent `tools` key now means no tools](#an-absent-tools-key-now-means-no-tools). |
 | `mcpServers` | — | MCP servers handed to the SDK session as `mcpServers` in the query options. Keyed by server name; each value is a transport object the Agent SDK understands, e.g. `{"booqi": {"type": "http", "url": "http://127.0.0.1:3010/mcp"}}`. Tool names derive from the key (`mcp__<name>__<tool>`). **This value MUST NOT carry a credential:** the SDK serialises the whole map onto the `claude` subprocess command line as `--mcp-config`, where it is readable in `ps` and `/proc/<pid>/cmdline`. |
 | `strictMcpConfig` | `true` | Use only the servers in `mcpServers`, ignoring MCP configuration the SDK would otherwise discover on the filesystem (a `.mcp.json` in the working directory, user-level MCP settings). Set it to `false` for the SDK's own default. **This is a change from earlier versions of this fork**, which left the SDK to discover whatever it found. Two things to know before leaving it on: with no `mcpServers` configured the session then has no MCP server at all, and on a host carrying an **enterprise-managed MCP configuration** the `claude` subprocess refuses to start while this is enabled — set it to `false` there. |
-| `systemPromptMode` | `"replace"` | How the agent's prompt is combined with the Claude Code preset prompt. See [The system prompt](#the-system-prompt). `"replace"` (default) sends the agent's prompt alone; `"append"` prepends the ~26.6 KB Claude Code preset. **CLAUDE.md/memory loading and today's date are injected from `cwd` in both modes** and are not affected by this setting. |
+| `systemPromptMode` | `"replace"` | How the agent's prompt is combined with the Claude Code preset prompt. See [The system prompt](#the-system-prompt). `"replace"` (default) sends the agent's prompt alone as the `systemPrompt` option; `"append"` sends **no system-prompt option at all** and delivers the agent's prompt as content wrapped in `<agent-instructions>` rather than as an option — on the first turn of a session, and on any later turn that carries a pending compaction summary, which leaves the ~26.6 KB Claude Code preset in place as the session's own system prompt. (`"append"` is **not** a prepend of the preset into an option — that shape is billed as a third-party app and refused; see [The system prompt](#the-system-prompt) and booqi-app/infra#333.) **CLAUDE.md/memory loading and today's date are injected from `cwd` in both modes** and are not affected by this setting. |
 
 ### An absent `tools` key now means no tools
 
@@ -137,23 +137,44 @@ openclaw config set agents.defaults.model.fallbacks '["anthropic/claude-opus-4-5
 
 ## The system prompt
 
-The system prompt OpenClaw builds for an agent is handed to the SDK as the `systemPrompt` query option, on **every** turn of a conversation.
+The system prompt OpenClaw builds for an agent reaches the model one of two ways, chosen by `systemPromptMode`: as the `systemPrompt` query option on **every** turn (`"replace"`), or as `<agent-instructions>` content on the **first** turn of the SDK session (`"append"`).
 
-Both halves of that sentence were broken until [booqi-app/infra#202](https://github.com/booqi-app/infra/issues/202):
+Neither route worked until [booqi-app/infra#202](https://github.com/booqi-app/infra/issues/202), which fixed two defects at once:
 
-- The bridge set `appendSystemPrompt`, which is **not** a key of the SDK's `Options` type — it exists only on the SDK's internal control-protocol `initialize` message, which the SDK derives from `systemPrompt`. The key was discarded and `systemPrompt` went out as `""`. On the SDK's stream-json path an empty string is not the same as an omitted one: it is stored and used, and the preset prompt is then never built. So a session ran with **essentially no system prompt** — an 83-character billing header and a 62-character SDK identity line — not, as was long assumed, on the Claude Code default.
+- The bridge set `appendSystemPrompt`, which is **not** a key of the SDK's `Options` type — it exists only on the SDK's internal control-protocol `initialize` message, which the SDK derives from `systemPrompt`. The key was discarded and, **on 0.2.92**, `systemPrompt` went out as `""`. On the SDK's stream-json path an empty string is not the same as an omitted one: it is stored and used, and the preset prompt is then never built. So a session ran with **essentially no system prompt** — an 83-character billing header and a 62-character SDK identity line — not, as was long assumed, on the Claude Code default.
 - The prompt was sent only on the first turn, on the premise that "resumed sessions already have it". They do not. `--resume` replays the *transcript*; the CLI rebuilds the system prompt from the *current* query options on every query. Left alone, that would have made the agent's persona flip after turn 1 once the first defect was fixed, which is why the two changes landed together.
 
 ### Which form, and why
 
 `systemPromptMode` chooses, and defaults to `"replace"`:
 
-| Mode | Query option | The session's system prompt |
+| Mode | What goes on the wire | The session's system prompt |
 |---|---|---|
-| `"replace"` (default) | `systemPrompt: <prompt>` | The agent's own prompt, and nothing else. |
-| `"append"` | `systemPrompt: { type: "preset", preset: "claude_code", append: <prompt> }` | The Claude Code preset, then the agent's prompt. |
+| `"replace"` (default) | `systemPrompt: <prompt>`, every turn | The agent's own prompt, and nothing else. |
+| `"append"` | **no system-prompt option at all**; `<agent-instructions>…</agent-instructions>` prefixed to the first user turn | The Claude Code preset, with the agent's prompt delivered as content. |
 
-**What the two modes do NOT differ on.** Measured against `@anthropic-ai/claude-agent-sdk@0.2.92`, driving the real bundled `cli.js` at a local mock Messages API, with `settingSources` omitted exactly as this bridge leaves it:
+#### `"append"` sends no option — [booqi-app/infra#333](https://github.com/booqi-app/infra/issues/333)
+
+Until that issue, `"append"` set `systemPrompt: { type: "preset", preset: "claude_code", append: <prompt> }`. Measured on `@anthropic-ai/claude-agent-sdk@0.3.263`, with the real 59k OpenClaw system prompt and both OAuth pool tokens:
+
+| What the bridge sets | Billing | Instructions honoured |
+|---|---|---|
+| `systemPrompt: "<string>"` | **400** `Third-party apps now draw from your extra usage, not your plan limits.` | yes |
+| `appendSystemPrompt: "<string>"` | ok | **no** — discarded as an unknown option |
+| `systemPrompt: { type: "preset", preset: "claude_code", append }` | **400**, same message | n/a |
+| nothing; instructions as first-turn content | ok | yes |
+
+The "honoured" column is a probe, not a reading of the request: a prompt saying *answer every message with exactly BANANA* produced `"Paris."` under `appendSystemPrompt` and `"BANANA"` under `systemPrompt`. Replacing Claude Code's preset prompt is what Anthropic bills as a third-party app, so **no system-prompt option is both first-party and honoured**. Hence the content path.
+
+`appendSystemPrompt` is *still* not a key of the SDK's `Options` type on 0.3.263 — verified with `tsc`, `"appendSystemPrompt" extends keyof Options` is `false` — so the SDK discards it. What changed since 0.2.92 is the consequence of the discard: then the SDK still sent `systemPrompt: ""` and suppressed the preset; now the preset is left intact, which is precisely why the call bills as first-party while the instructions never arrive.
+
+Because the instructions are part of a user message, the SDK writes them into the session transcript, and `--resume` replays that transcript. So they are sent on a fresh session **only** and deliberately not resent on a resumed turn — the same reasoning that stops a consumed compaction summary from being replayed. (A compaction rotation clears the stored SDK session id, so the summary rides in the instructions block of the fresh session.)
+
+This keeps OpenClaw provider-agnostic: it goes on sending a plain `system` message exactly as it does for every other provider, and translating that into something this particular target honours is the adapter's job. No `CLAUDE.md` and no Claude-Code-specific files are placed in the agent workspace.
+
+Note that `"append"` mode depends on `workDir` being set in the cell configuration — it becomes the SDK's `cwd`, which is what drives the CLI's memory and environment injection.
+
+**What the two modes do NOT differ on.** Measured against `@anthropic-ai/claude-agent-sdk@0.2.92` (before infra#333, when `"append"` still asked for the preset explicitly; the preset is now simply the SDK's default, so the sizes are unchanged), driving the real bundled `cli.js` at a local mock Messages API, with `settingSources` omitted exactly as this bridge leaves it:
 
 | mode | system prompt | CLAUDE.md loaded | today's date present |
 |---|---|---|---|
@@ -174,7 +195,7 @@ So the only real difference is ~26.6 KB of Claude Code preset: a coding-agent id
 
 ### Compaction summaries
 
-When a session rotates at 75% context fill, the summary is prepended into the next request's system prompt. It is consumed from the session store once, before the retry loop, and **put back if no attempt delivered it** — otherwise a request that failed non-transiently would take the only record of the rotated-away conversation with it. Delivery is tracked by an explicit flag, not by `res.headersSent`: the 502 is written before the restore runs and would mask it.
+When a session rotates at 75% context fill, the summary is prepended into the next request's system prompt (in `"append"` mode, into the instructions block of the fresh session). It is consumed from the session store once, before the retry loop, and **put back if no attempt delivered it** — otherwise a request that failed non-transiently would take the only record of the rotated-away conversation with it. Delivery is tracked by an explicit flag, not by `res.headersSent`: the 502 is written before the restore runs and would mask it.
 
 Caveat, honestly recorded: on the **streaming** path (the default) a mid-stream SDK error is turned into an SSE `Error: …` chunk rather than rethrown, so the turn counts as delivered and the summary is not restored. That is pre-existing behaviour, not a regression — the summary was lost there before this change too — but it means the restore is effective for `stream: false` and for failures that occur before any output.
 
@@ -308,7 +329,7 @@ MIT
 
 ## Known limitations
 
-- **A request with no system prompt gets no preset either, and `""` is the same as omitting it.** When the caller sends no prompt the bridge sets no `systemPrompt` option; the SDK turns both that and an explicit `""` into the same present-and-empty prompt, so the Claude Code preset is not built in either case. `systemPromptMode` only takes effect when there is a prompt to combine with. In OpenClaw's own use there always is one; a caller that wants the bare preset has no way to ask for it today.
+- **`""` is not the same as omitting the system-prompt option, and which one you get is SDK-version-dependent.** This bullet previously said that an absent option and an explicit `""` both leave the Claude Code preset unbuilt. That was measured on `@anthropic-ai/claude-agent-sdk` **0.2.92** and does **not** hold on **0.3.263**, where the two differ and the difference is the whole of booqi-app/infra#333: an **absent** option leaves the preset **intact** (which is what keeps the call first-party), whereas a **present** option — including `""` — replaces the rendered prompt and makes Anthropic bill the call as a third-party app, answering `400 Third-party apps now draw from your extra usage, not your plan limits.` This is why `"append"` mode must set no key at all rather than an empty one, and why `buildQueryOptions` tests absence with `in` rather than truthiness. On 0.3.263 a caller that wants the bare preset gets it by sending no system prompt at all (in either mode — with no prompt `"replace"` sets no option either). ⚠️ Note the version carefully: `package.json` still declares `^0.2.92`, which for a `0.x` range resolves to `>=0.2.92 <0.3.0` and therefore cannot install 0.3.263 — so on the **declared** range the older behaviour above is what you get. That mismatch between the declared range and the version the cell actually runs is pre-existing and tracked separately; it is not resolved here.
 - `src/bridge-config.ts` keeps a `KNOWN_NON_SDK_OPTIONS` escape hatch for query-option names the SDK does not accept. **It is currently empty, which is the intended state.** An entry there is a shipped defect with a tracking issue, certified by `typecheck/sdk-options.ts` in both directions: a name the bridge sets that is not an `Options` key fails the build unless it is listed, and a listed name the SDK *does* accept also fails the build, so an entry cannot outlive its fix.
 
 ## Relationship to upstream
