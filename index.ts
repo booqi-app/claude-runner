@@ -31,6 +31,7 @@ import {
   summariseMcpServers,
   sessionAffinityOverrideMessage,
   sessionAffinityOverrideReport,
+  wrapClaudeRunnerStreamFn,
 } from "./src/bridge-config.js";
 import type { ExtensionBridgeOptions } from "./src/bridge-config.js";
 
@@ -466,13 +467,40 @@ const claudeRunnerPlugin = {
           },
         },
       ],
-      // Registered at the TOP level of the provider object, next to `discovery`,
-      // because that is the object `normalizeRegisteredProvider` spreads
-      // (`provider-validation.ts:378-401`) and the object
-      // `findProviderRuntimePluginInRegistry` looks this key up on
-      // (`provider-hook-runtime.ts:178-193`). Inside `discovery` it would be
-      // destructured away and silently never called.
+      // PROVIDER-RUNTIME HOOKS, registered at the TOP level of this object,
+      // next to `discovery`.
+      //
+      // CORRECTED 2026-10-07 (booqi-app/infra#337). The previous note here
+      // justified this placement by `normalizeRegisteredProvider` spreading the
+      // provider object (`provider-validation.ts:378-401`) and by
+      // `findProviderRuntimePluginInRegistry` looking the key up on it
+      // (`provider-hook-runtime.ts:178-193`). The PLACEMENT is right; that
+      // ACCOUNT of why is wrong, and it would send the next reader to the wrong
+      // file. What was measured on the live cell is that the host reads these
+      // hooks off the EXTERNALLY-LOADED PLUGIN HANDLE, not off a provider found
+      // in the registry: `provider-hook-runtime-*.js:261-263` does
+      //     ensureProviderRuntimePluginHandle(params).plugin?.<hook>?.(params.context)
+      // and the probe reported `handle=PRESENT`, `handle.plugin=PRESENT`,
+      // `pluginId=claude-runner`, with
+      //     plugin_keys = ["auth","discovery","docsPath","id","label",
+      //                    "normalizeResolvedModel","pluginId","wizard"]
+      // That key list IS this object, which is the direct evidence that a hook
+      // belongs at this level: `normalizeResolvedModel` appears in it and is
+      // the one hook of ours proven to fire, while `wrapStreamFn` was reported
+      // `ABSENT` here and was therefore never called. Inside `discovery` a hook
+      // would not appear in `plugin_keys` at all and would be silently dead.
       normalizeResolvedModel: normalizeResolvedClaudeRunnerModel,
+      // The carrier for the chat-session identifier. OpenClaw's managed
+      // completions transport drops `options.sessionId`
+      // (`openai-transport-stream-*.js:2404`, four arguments), so the id never
+      // becomes a header and the cell's chat ends up with no bound tools
+      // (`"bound": false`). This hook wraps the function the host hands over in
+      // `ctx.streamFn` and copies the id into `options.headers`, which IS
+      // threaded end to end. Implementation and full rationale live in
+      // `src/bridge-config.ts` — that is where it can be typechecked and
+      // behaviourally tested; this file is excluded from both because it
+      // imports `openclaw/plugin-sdk/core`.
+      wrapStreamFn: wrapClaudeRunnerStreamFn,
       discovery: {
         order: "late",
         run: async (ctx: ProviderDiscoveryContext) => {

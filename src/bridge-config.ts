@@ -1449,3 +1449,166 @@ export function buildQueryOptions(
 
   return opts;
 }
+
+/* ------------------------------------------------------------------------- *
+ * `wrapStreamFn` — the carrier that repairs OpenClaw's dropped `sessionId`
+ * ------------------------------------------------------------------------- *
+ *
+ * WHY THIS EXISTS. OpenClaw's managed *completions* transport loses
+ * `options.sessionId` by construction: the caller has it
+ * (`openai-transport-stream-*.js:2374`, `typeof options.sessionId === "string"`)
+ * but the client factory is invoked with FOUR arguments
+ * (`:2404`, `createOpenAICompletionsClient(model, context, apiKey, options?.headers)`)
+ * and no `sessionId` parameter exists at `:2321`, so
+ * `buildOpenAIClientHeaders` (`:1834`) receives `undefined` and emits no
+ * session-affinity header. The *responses* transport threads it correctly
+ * (`:1897`, five arguments). That asymmetry is upstream OpenClaw, not ours.
+ *
+ * WHY NOT THE COMPAT FLAG. `model.compat.sendSessionAffinityHeaders` is set by
+ * {@link normalizeResolvedClaudeRunnerModel} and measurably reaches the model,
+ * but the gate it feeds (`openai-completions-*.mjs:416`) never executes on this
+ * path: because `claude-runner` registers a LOCAL service, OpenClaw overrides
+ * the api (`provider-stream-*.js:1272/1317/1386`) with a transport that emits
+ * no session-affinity header at all. Measured booqi-app/infra#337. Adjusting
+ * the flag cannot help; the flag's gate is dead code here.
+ *
+ * WHAT `options.headers` IS. It is the ONE argument that IS threaded end to end
+ * (it is the fourth argument at `:2404`). So a wrapper placed around
+ * `agent.streamFn` can copy the identifier the caller still holds into the
+ * channel that survives. This is the change that was simulated end to end on
+ * the live cell and moved the chat from `"bound": false` to **`"bound": true`**
+ * for the first time on this estate (booqi-app/infra#337, comments 6038102981
+ * and 6038277467).
+ *
+ * WHERE THE SIGNATURE COMES FROM — derived, not invented:
+ *
+ *  - The ARITY of this function and its single argument come from the host's
+ *    own consumer, `provider-hook-runtime-*.js:261-263`:
+ *        `ensureProviderRuntimePluginHandle(params).plugin?.wrapStreamFn?.(params.context)`
+ *    One argument (the context), and the return value is installed verbatim at
+ *    `extra-params-*.js:695`: `agent.streamFn = pluginWrappedStreamFn ?? providerStreamBase`.
+ *    Hence returning `undefined` is the documented "no change" answer — exactly
+ *    the convention {@link normalizeResolvedClaudeRunnerModel} already follows,
+ *    which is the one hook of ours proven to fire.
+ *
+ *  - The CONTEXT SHAPE comes from the measured `ctx_keys` of that same call:
+ *        agentDir, agentId, config, extraParams, model, modelId,
+ *        nativeWebSearchAllowedByToolPolicy, provider, streamFn,
+ *        thinkingLevel, workspaceDir
+ *    with `typeof ctx.streamFn === "function"` and `ctx.provider === "claude-runner"`.
+ *    Only `provider` and `streamFn` are read here; the rest is passed through
+ *    untouched because this wrapper has no business in it.
+ *
+ *  - The WRAPPED FUNCTION's parameter list comes from the call site that loses
+ *    the argument, `openai-transport-stream-*.js:2374/2404`: `(model, context,
+ *    options)` with `options.headers` and `options.sessionId`. It is declared
+ *    rest-tolerant so a future host argument is forwarded rather than dropped.
+ *
+ * ⚠️ MEASUREMENT SCOPE, stated rather than glossed: the hook was observed
+ * firing on `openclaw agent --local`. `applyExtraParamsToAgent` lives in the
+ * embedded-agent runner that the gateway path shares, but no gateway-driven
+ * turn was instrumented, so the gateway path is **ONGEMETEN** — consistent
+ * with, not proven by, that reading.
+ */
+
+/**
+ * The header names the bridge examines, in the order it prefers them.
+ *
+ * Duplicated from `SESSION_AFFINITY_HEADERS` in `src/claude-bridge.ts:411`
+ * rather than imported, because this module is deliberately IMPORT-FREE: the
+ * unit suite runs it with no `node_modules` at all and `claude-bridge.ts`
+ * pulls in the Agent SDK's types. The duplication is not trusted — a test
+ * asserts the two arrays are equal, so a divergence fails the suite instead of
+ * silently writing a header nobody reads.
+ */
+export const SESSION_AFFINITY_HEADER_NAMES = [
+  "session_id",
+  "x-client-request-id",
+  "x-session-affinity",
+] as const;
+
+/** The options bag of OpenClaw's provider stream function, as far as we read it. */
+export interface ProviderStreamOptions {
+  sessionId?: unknown;
+  headers?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+/** `agent.streamFn` as the host hands it over and as the host reinstalls it. */
+export type ProviderStreamFn = (
+  model: unknown,
+  context: unknown,
+  options?: ProviderStreamOptions,
+  ...rest: unknown[]
+) => unknown;
+
+/** `params.context` of `wrapProviderStreamFn`; keys per the measured `ctx_keys`. */
+export interface ProviderStreamWrapContext {
+  provider?: unknown;
+  streamFn?: unknown;
+  [key: string]: unknown;
+}
+
+/**
+ * Copies a chat-session identifier into the headers of one options bag.
+ *
+ * An identifier is carried only when it is a non-empty string. A header that
+ * already holds a non-empty string value is LEFT ALONE: such a value was put
+ * there by the host (the responses transport does thread `sessionId`), and the
+ * host's own value is authoritative. Absent and empty are therefore both
+ * "nothing there", and only those are filled in.
+ *
+ * When there is nothing to carry, the options bag is returned BY IDENTITY, not
+ * copied. That is deliberate and it is asserted: a wrapper that reallocates on
+ * every call on a path it does not change is a wrapper whose inertness cannot
+ * be observed.
+ */
+export function applySessionAffinityHeaders(
+  options?: ProviderStreamOptions,
+): ProviderStreamOptions | undefined {
+  if (options === null || typeof options !== "object") return options;
+  const sessionId = options.sessionId;
+  if (typeof sessionId !== "string" || sessionId.length === 0) return options;
+
+  const existing = options.headers;
+  const headers: Record<string, unknown> =
+    existing !== null && typeof existing === "object" ? { ...existing } : {};
+
+  let wrote = 0;
+  for (const name of SESSION_AFFINITY_HEADER_NAMES) {
+    const held = headers[name];
+    if (typeof held === "string" && held.length > 0) continue;
+    headers[name] = sessionId;
+    wrote += 1;
+  }
+  if (wrote === 0) return options;
+
+  return { ...options, headers };
+}
+
+/**
+ * The `wrapStreamFn` provider-runtime hook.
+ *
+ * Returns `undefined` — the host's "leave `agent.streamFn` as it was" answer at
+ * `extra-params-*.js:695` — for any context this hook has no business in: a
+ * non-object context, another provider, or a context whose `streamFn` is not a
+ * function. It never throws into the host's turn setup.
+ */
+export function wrapClaudeRunnerStreamFn(
+  ctx: ProviderStreamWrapContext,
+): ProviderStreamFn | undefined {
+  if (ctx === null || typeof ctx !== "object") return undefined;
+  // Resolved the way the HOST resolves a provider id (`trim().toLowerCase()`),
+  // for the same reason as in `normalizeResolvedClaudeRunnerModel`: an exact-key
+  // comparison diverges on any case or whitespace variant. An ABSENT provider is
+  // not treated as ours.
+  if (typeof ctx.provider !== "string") return undefined;
+  if (ctx.provider.trim().toLowerCase() !== "claude-runner") return undefined;
+
+  const base = ctx.streamFn;
+  if (typeof base !== "function") return undefined;
+  const baseFn = base as ProviderStreamFn;
+
+  return (model, context, options, ...rest) =>
+    baseFn(model, context, applySessionAffinityHeaders(options), ...rest);
+}
