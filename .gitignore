@@ -4,6 +4,8 @@ config.json
 *.js.map
 *.d.ts.map
 
-# A symlink named node_modules -- "node_modules/" does not match one, and the
-# typecheck job creates exactly that.
+# No trailing slash on purpose: this must match BOTH a real directory (the
+# typecheck job now runs `npm ci` in place, booqi-app/infra#333) and a symlink
+# named node_modules (which is what that job used to create, and which
+# "node_modules/" does not match).
 node_modules
