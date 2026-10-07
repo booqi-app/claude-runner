@@ -738,36 +738,32 @@ test("the bridge takes its per-turn system prompt from resolveSystemPrompt, unco
 
   assert.match(bridge, /=\s*resolveSystemPrompt\s*\(/);
 
-  // The exact shape of the reverted bug: the system prompt gated on there
-  // being no resume id.
+  // DELETED here: three structural source-text assertions that used to stand
+  // in this spot -- a loop requiring every `if (!resumeSessionId)` branch to be
+  // the instructions block, a regex forbidding the system prompt to be a
+  // ternary on the resume id, and a regex requiring the literal
+  // `normaliseSystemPromptMode(config.systemPromptMode) === "append"`.
   //
-  // This used to forbid `if (!resumeSessionId)` anywhere in the file, which is
-  // no longer the right rule: booqi-app/infra#333 made `"append"` mode deliver
-  // the prompt as first-turn CONTENT, and a content block MUST be gated that
-  // way because the SDK's transcript -- which `--resume` replays -- already
-  // carries it from turn 2. So the guard is narrowed rather than dropped:
-  // every `!resumeSessionId` branch must be that content block, and nothing
-  // may make the system-prompt VALUE depend on the resume id.
-  for (const guard of bridge.match(/if\s*\(\s*!\s*resumeSessionId\s*\)[\s\S]{0,300}/g) ?? []) {
-    assert.match(
-      guard, /wrapSystemPromptAsInstructions/,
-      "claude-bridge.ts gates something other than the append-mode instructions block on "
-        + "`!resumeSessionId` -- if that is the system prompt, every resumed turn runs with an "
-        + "empty one (booqi-app/infra#202)",
-    );
-  }
-  assert.equal(
-    /(?:effectiveSystemPrompt|systemPrompt)\s*=\s*[^;]*\bresumeSessionId\s*\?/.test(bridge), false,
-    "claude-bridge.ts makes the system prompt a ternary on resumeSessionId again "
-      + "(booqi-app/infra#202)",
-  );
-  // The replace path still goes out unconditionally: the one legitimate reason
-  // to clear it is append mode, which replaces it with content.
-  assert.match(
-    bridge, /normaliseSystemPromptMode\s*\(\s*config\.systemPromptMode\s*\)\s*===\s*"append"/,
-    "nothing in the transport distinguishes append mode, so either the content path is gone or "
-      + "the replace path has been cleared for every mode (booqi-app/infra#333)",
-  );
+  // They are removed rather than repaired because both of their failure modes
+  // were measured on this very branch:
+  //
+  //   * EVADED. The infra#333 fix round changed the gate to
+  //     `if (!resumeSessionId || compactSummary)` -- a real behaviour change --
+  //     and the guard loop then matched ZERO branches and asserted nothing,
+  //     silently. A guard that stops guarding without failing is worse than no
+  //     guard, because it still reads as coverage.
+  //   * FALSE POSITIVE. The `=== "append"` regex turned RED for a strictly
+  //     behaviour-preserving hoist (`const mode = normalise...; mode === "append"`)
+  //     while every behavioural test stayed green.
+  //
+  // What they were reaching for is now held by BEHAVIOUR, in tests that observe
+  // what the SDK call receives rather than what the file says:
+  //   - `append mode on a RESUMED session does not resend the instructions`
+  //   - `append mode delivers a pending compaction summary on a RESUMED turn`
+  //   - `systemPromptMode append sets NO system-prompt option of any kind`
+  //   - `a resumed turn also carries the compaction summary` (replace mode)
+  // Those fail when the behaviour regresses, and do not fail when it does not.
+
   assert.equal(
     /\bappendSystemPrompt\b/.test(bridge), false,
     "claude-bridge.ts names appendSystemPrompt, which is not an SDK option",

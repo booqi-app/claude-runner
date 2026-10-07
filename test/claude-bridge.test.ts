@@ -388,6 +388,47 @@ test("a resumed turn also carries the compaction summary", async () => {
   assert.ok(sent.includes("SUMMARY-TEXT"));
 });
 
+// The arm above runs in the DEFAULT mode (`"replace"`), so until this test
+// existed the append path of the very same assertion was pinned by nothing --
+// and it was broken. A pending summary is consumed from the store before the
+// first attempt, so a turn that neither wraps it into the instructions block
+// nor sets a system-prompt option loses it permanently: success sets
+// `summaryDelivered`, which suppresses the `finally` restore. Both transports,
+// because each builds its own options. booqi-app/infra#333.
+for (const stream of [false, true]) {
+  const via = stream ? "streaming" : "non-streaming";
+
+  test(`append mode delivers a pending compaction summary on a RESUMED turn (${via})`, async () => {
+    const { captured, sessionStore, conversationId } = await run({
+      systemPrompt: "P", compactSummary: "SUMMARY-TEXT",
+      resumeSessionId: "sdk-session-9", behaviour: "success", stream,
+      bridgeConfig: { ...config, systemPromptMode: "append" },
+    });
+
+    assert.equal(captured.length, 1);
+    const dispatched = String(captured[0].prompt);
+
+    // The summary reached the model. This is the assertion whose absence let
+    // silent data loss through.
+    assert.ok(
+      dispatched.includes("SUMMARY-TEXT"),
+      `the pending compaction summary was not delivered on a resumed turn; dispatched ${JSON.stringify(dispatched)}`,
+    );
+    // It travels as CONTENT, inside the instructions block -- append mode must
+    // still set no system-prompt option of any kind, or the 400 is back.
+    assert.ok(dispatched.includes("<agent-instructions>"));
+    assert.ok(dispatched.includes("</agent-instructions>"));
+    assert.equal("systemPrompt" in captured[0].options, false);
+    assert.equal("appendSystemPrompt" in captured[0].options, false);
+    // The caller's own turn still survives, last.
+    assert.ok(dispatched.endsWith("hello"));
+    // It really was the resumed path.
+    assert.equal(captured[0].options.resume, "sdk-session-9");
+    // Delivered, so correctly not left pending in the store.
+    assert.equal(sessionStore.get(conversationId)?.compactSummary, undefined);
+  });
+}
+
 // ── the mode actually reaches the wire ──────────────────────────────
 
 

@@ -686,7 +686,29 @@ export async function executeWithRetries(
         // that keeps a consumed compaction summary from being replayed. No
         // system-prompt option is set in either case. booqi-app/infra#333.
         if (normaliseSystemPromptMode(config.systemPromptMode) === "append" && effectiveSystemPrompt) {
-          if (!resumeSessionId) {
+          // Gate on DELIVERY, not on `!resumeSessionId` alone.
+          //
+          // A pending compaction summary MUST go out even on a resumed turn.
+          // `resolveSystemPrompt` folds the summary into `effectiveSystemPrompt`
+          // regardless of the resume id (it `void`s that argument), and the
+          // summary has already been CONSUMED from the store by this point. So
+          // a resumed turn that skipped the block sent the summary nowhere --
+          // no instructions block and, two lines below, no system-prompt option
+          // either -- while success still set `summaryDelivered = true`, which
+          // suppresses the `finally` restore. The only record of a rotated-away
+          // conversation was then gone for good.
+          //
+          // That state is reachable: `rotateSession` clears `claudeSessionId`,
+          // but the restore path calls `setCompactSummary`, which does NOT, so a
+          // pending summary can coexist with a live resumable id. Measured
+          // before this fix: in `"append"` mode such a turn dispatched exactly
+          // `"hello"` with no `systemPrompt` key, where `"replace"` on the same
+          // path dispatched the summary in the option.
+          //
+          // Re-sending the instructions costs one duplicated system prompt in
+          // the transcript, on the rare turn where a summary is pending. Losing
+          // the summary costs the conversation. booqi-app/infra#333.
+          if (!resumeSessionId || compactSummary) {
             effectivePrompt = wrapSystemPromptAsInstructions(effectiveSystemPrompt, prompt);
           }
           effectiveSystemPrompt = undefined;
