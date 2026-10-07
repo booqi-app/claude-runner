@@ -48,15 +48,25 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { test } from "node:test";
-import { DEFAULT_PORT } from "../src/bridge-config.ts";
+import {
+  DEFAULT_PORT,
+  examineAffinityHeaders,
+  examineAgentSessionKey,
+} from "../src/bridge-config.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, "..");
 const PROVIDER_ID = "claude-runner";
 const AFFINITY_HEADERS = ["session_id", "x-client-request-id", "x-session-affinity"] as const;
 
+/**
+ * A bare lower-case uuid -- the SECOND shape `examineAgentSessionKey` admits,
+ * and the shape the host actually supplies (`sessionManager.getSessionId()`).
+ */
+const HOST_SESSION_UUID_VALUE = "4f0a1c2e-7b3d-4e8a-9c61-25d7f8ab9013";
+
 /** Every arm asserts; this is the count the self-check at the bottom enforces. */
-const EXPECTED_ARMS = 35;
+const EXPECTED_ARMS = 38;
 let armsRun = 0;
 const arm = (name: string, fn: () => void | Promise<void>) =>
   test(name, async () => {
@@ -810,6 +820,120 @@ arm("H6 the hook survives the host's registration destructure and the registry l
     undefined,
     "the lookup fixture matches any provider, so H6 proves nothing",
   );
+});
+
+arm("H6-bis the wrapStreamFn hook is REGISTERED at the provider top level and survives the same two host steps", async () => {
+  // THE GUARD THE PR THAT ADDED `wrapStreamFn` WAS MISSING, and the reason it
+  // is here and not in `test/wrap-stream-fn.test.ts`: that file imports the
+  // hook FUNCTION directly and never touches the plugin object, so deleting
+  // `wrapStreamFn:` from `index.ts` left its whole battery at 220/220 green.
+  // Three independent reviewers measured that in round 1 of booqi-app/infra#337,
+  // one of them with a positive control proving the registration line IS
+  // evaluated by this suite (made to throw -> 30 failures). The defect the
+  // carrier exists to fix -- `hook[wrapStreamFn]=ABSENT` on a PRESENT plugin --
+  // is reintroduced by deleting one line, by moving the key inside `discovery`,
+  // or by misspelling it `wrapProviderStreamFn` / `streamFnWrapper`, and only
+  // this arm sees any of them.
+  const reg = await registerPlugin();
+  assert.equal(
+    typeof reg.provider.wrapStreamFn,
+    "function",
+    "the plugin does not register wrapStreamFn at the provider top level",
+  );
+  const asRegistered = hostNormalizeRegisteredProvider(reg.provider);
+  assert.equal(
+    typeof asRegistered.wrapStreamFn,
+    "function",
+    "the hook was destructured away by normalizeRegisteredProvider",
+  );
+  const found = hostFindProviderRuntimePlugin(
+    { providers: [{ pluginId: PROVIDER_ID, provider: asRegistered }] },
+    PROVIDER_ID,
+  );
+  assert.equal(
+    typeof found?.wrapStreamFn,
+    "function",
+    "the registry lookup did not find wrapStreamFn for a non-bundled plugin",
+  );
+  // `:184`'s Object.assign is what injects `pluginId`, and it is the reason the
+  // probe's `plugin_keys` had 8 entries where this object declares 7. Pinned so
+  // the comment in index.ts cannot drift from the fixture again.
+  assert.equal(found?.pluginId, PROVIDER_ID, "the lookup fixture does not inject pluginId");
+});
+
+arm("H6-ter the REGISTERED hook, invoked exactly as the host invokes it, puts the id in the headers the base streamFn receives", async () => {
+  // H6-bis proves the key is there; this proves the thing behind the key is the
+  // carrier and not a stub. End-to-end through both host steps, then one call.
+  const reg = await registerPlugin();
+  const asRegistered = hostNormalizeRegisteredProvider(reg.provider);
+  const found = hostFindProviderRuntimePlugin(
+    { providers: [{ pluginId: PROVIDER_ID, provider: asRegistered }] },
+    PROVIDER_ID,
+  );
+  const seen: AnyRec[] = [];
+  const base = (_model: unknown, _context: unknown, options: AnyRec) => {
+    seen.push(options);
+    return "BASE_RETURN";
+  };
+  // The host calls the hook with `params.context`, whose measured keys include
+  // `provider` and `streamFn`.
+  const wrapped = found?.wrapStreamFn?.({ provider: PROVIDER_ID, streamFn: base });
+  assert.equal(typeof wrapped, "function", "the registered hook returned no wrapper");
+  const out = wrapped("model-x", {}, { sessionId: HOST_SESSION_UUID_VALUE, headers: {} });
+  assert.equal(out, "BASE_RETURN", "the wrapper did not return the base's value");
+  assert.equal(seen.length, 1, "the base was not called exactly once");
+  for (const name of AFFINITY_HEADERS) {
+    assert.equal(
+      seen[0]!.headers[name],
+      HOST_SESSION_UUID_VALUE,
+      `the registered hook did not carry the id on ${name}`,
+    );
+  }
+});
+
+arm("H6-quater the value the REGISTERED hook delivers is ACCEPTED by the bridge's own classifier, not merely present", async () => {
+  // A carrier that delivers a value the bridge then refuses delivers nothing:
+  // `examineAgentSessionKey` admits only `agent:<agentId>:<chatSessionId>` or a
+  // bare lower-case HOST_SESSION_UUID, and everything else is `refused` with
+  // all three headers PRESENT -- i.e. `bound: false` that looks like success.
+  // So the hand-off is asserted at the classifier, which is the real boundary.
+  const reg = await registerPlugin();
+  const found = hostFindProviderRuntimePlugin(
+    { providers: [{ pluginId: PROVIDER_ID, provider: hostNormalizeRegisteredProvider(reg.provider) }] },
+    PROVIDER_ID,
+  );
+  const seen: AnyRec[] = [];
+  const wrapped = found?.wrapStreamFn?.({
+    provider: PROVIDER_ID,
+    streamFn: (_m: unknown, _c: unknown, o: AnyRec) => void seen.push(o),
+  });
+  wrapped("model-x", {}, { sessionId: HOST_SESSION_UUID_VALUE, headers: {} });
+
+  const examined = examineAffinityHeaders([...AFFINITY_HEADERS], seen[0]!.headers);
+  assert.equal(examined.length, AFFINITY_HEADERS.length, "the classifier examined a smaller population than it was given");
+  for (const e of examined) {
+    assert.equal(e.verdict.kind, "accepted", `the bridge refuses what the carrier wrote on ${e.header}`);
+  }
+  // ...and the accepted value resolves to the chat session the relay routes on.
+  assert.equal(
+    examineAgentSessionKey(seen[0]!.headers.session_id).chatSessionId,
+    HOST_SESSION_UUID_VALUE,
+    "the accepted header does not yield the chat session id",
+  );
+  // NEGATIVE CONTROL, so "accepted" above is not a constant: the carrier does
+  // NOT reshape a value, so an out-of-shape id is delivered and then REFUSED.
+  // This is the deliberate division of labour -- the bridge owns admission --
+  // and it is pinned so nobody "fixes" it by lower-casing in the carrier.
+  const seen2: AnyRec[] = [];
+  const wrapped2 = found?.wrapStreamFn?.({
+    provider: PROVIDER_ID,
+    streamFn: (_m: unknown, _c: unknown, o: AnyRec) => void seen2.push(o),
+  });
+  wrapped2("model-x", {}, { sessionId: HOST_SESSION_UUID_VALUE.toUpperCase(), headers: {} });
+  const examined2 = examineAffinityHeaders([...AFFINITY_HEADERS], seen2[0]!.headers);
+  for (const e of examined2) {
+    assert.equal(e.verdict.kind, "refused", `an upper-case uuid must be refused, not ${e.verdict.kind}`);
+  }
 });
 
 arm("H7 the hook's result survives the compat normalization the host runs next", async () => {

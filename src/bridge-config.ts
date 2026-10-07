@@ -1465,12 +1465,16 @@ export function buildQueryOptions(
  * (`:1897`, five arguments). That asymmetry is upstream OpenClaw, not ours.
  *
  * WHY NOT THE COMPAT FLAG. `model.compat.sendSessionAffinityHeaders` is set by
- * {@link normalizeResolvedClaudeRunnerModel} and measurably reaches the model,
- * but the gate it feeds (`openai-completions-*.mjs:416`) never executes on this
+ * `normalizeResolvedClaudeRunnerModel` and measurably reaches the model, but
+ * the gate it feeds (`openai-completions-*.mjs:416`) never executes on this
  * path: because `claude-runner` registers a LOCAL service, OpenClaw overrides
  * the api (`provider-stream-*.js:1272/1317/1386`) with a transport that emits
  * no session-affinity header at all. Measured booqi-app/infra#337. Adjusting
- * the flag cannot help; the flag's gate is dead code here.
+ * the flag cannot help; the flag's gate is dead code here. The same is true of
+ * the more idiomatic-looking `resolveTransportTurnState` hook: turn state is
+ * resolved only at `:1934`/`:2222`, the *responses* transports, and `:2347`
+ * passes three arguments — so that hook is dead for `openai-completions` too,
+ * and `wrapStreamFn` is not merely one option among several.
  *
  * WHAT `options.headers` IS. It is the ONE argument that IS threaded end to end
  * (it is the fourth argument at `:2404`). So a wrapper placed around
@@ -1482,27 +1486,54 @@ export function buildQueryOptions(
  *
  * WHERE THE SIGNATURE COMES FROM — derived, not invented:
  *
- *  - The ARITY of this function and its single argument come from the host's
- *    own consumer, `provider-hook-runtime-*.js:261-263`:
- *        `ensureProviderRuntimePluginHandle(params).plugin?.wrapStreamFn?.(params.context)`
- *    One argument (the context), and the return value is installed verbatim at
- *    `extra-params-*.js:695`: `agent.streamFn = pluginWrappedStreamFn ?? providerStreamBase`.
- *    Hence returning `undefined` is the documented "no change" answer — exactly
- *    the convention {@link normalizeResolvedClaudeRunnerModel} already follows,
- *    which is the one hook of ours proven to fire.
+ *  - The ARITY of this hook and its single argument come from the host's own
+ *    consumer, `provider-hook-runtime-*.js:261-263`:
+ *        ensureProviderRuntimePluginHandle(params).plugin?.wrapStreamFn?.(params.context) ?? void 0
+ *    Note the trailing `?? void 0`: THAT is the clause that makes a nullish
+ *    return mean "no change", and the install site then does
+ *    `extra-params-*.js:695  agent.streamFn = pluginWrappedStreamFn ?? providerStreamBase`.
+ *    The SDK's own type agrees: `wrapStreamFn?: (ctx) => StreamFn | null | undefined`
+ *    (`types-*.d.ts:11211`). Returning `undefined` is therefore the documented
+ *    "leave it alone" answer — the convention `normalizeResolvedClaudeRunnerModel`
+ *    already follows, which is the one hook of ours proven to fire.
  *
  *  - The CONTEXT SHAPE comes from the measured `ctx_keys` of that same call:
  *        agentDir, agentId, config, extraParams, model, modelId,
  *        nativeWebSearchAllowedByToolPolicy, provider, streamFn,
  *        thinkingLevel, workspaceDir
  *    with `typeof ctx.streamFn === "function"` and `ctx.provider === "claude-runner"`.
- *    Only `provider` and `streamFn` are read here; the rest is passed through
- *    untouched because this wrapper has no business in it.
+ *    Only `provider` and `streamFn` are read here.
  *
  *  - The WRAPPED FUNCTION's parameter list comes from the call site that loses
  *    the argument, `openai-transport-stream-*.js:2374/2404`: `(model, context,
- *    options)` with `options.headers` and `options.sessionId`. It is declared
- *    rest-tolerant so a future host argument is forwarded rather than dropped.
+ *    options)`. It is declared rest-tolerant, but be honest about what that
+ *    buys: every host layer between the agent core and the transport passes
+ *    exactly THREE arguments (`provider-stream-*.js:1397`, `extra-params-*.js:596`),
+ *    so `...rest` cannot currently fire. It is forward-tolerance, not a closed
+ *    risk, and the arm that covers it pins a property the host does not yet
+ *    produce.
+ *
+ * ⚠️ ONE MORE EFFECT OF RETURNING A WRAPPER, which "install or don't" hides.
+ * `extra-params-*.js:697` sets `providerWrapperHandled = true` whenever this
+ * hook returns anything, and `:516-533` then SKIPS six of the host's own
+ * wrappers (DeepSeek thinking + sanitizer, MiMo, thinking-only-final-text,
+ * Google thinking payload, OpenAI-responses context management). That is benign
+ * here — each is internally gated on a model predicate that is false for
+ * `openai-completions` Claude rows — but it is not nothing, and a future reader
+ * who adds a seventh host wrapper needs to know this hook suppresses it.
+ *
+ * ⚠️ WHICH SHAPE THIS CARRIER ACTUALLY PRODUCES. The value is carried verbatim.
+ * The host supplies the OpenClaw session RECORD uuid
+ * (`sessions-*.js:12412`, `sessionManager.getSessionId()`), i.e. a bare
+ * lower-case uuid — which is {@link examineAgentSessionKey}'s *second*
+ * admitted shape ({@link HOST_SESSION_UUID}), admitted only because the relay
+ * gained an alias table. It is NOT the `agent:<agentId>:<chatSessionId>` shape.
+ * This carrier deliberately does NOT normalise or reshape the value: the bridge
+ * refuses an upper-case uuid on purpose and an arm pins that refusal, so
+ * lower-casing here would silently subvert a deliberate bridge rule and move
+ * the admission decision out of the one function that owns it. A value the
+ * classifier rejects is delivered and then refused, visibly — which is the
+ * correct failure, not a hidden one.
  *
  * ⚠️ MEASUREMENT SCOPE, stated rather than glossed: the hook was observed
  * firing on `openclaw agent --local`. `applyExtraParamsToAgent` lives in the
@@ -1512,14 +1543,27 @@ export function buildQueryOptions(
  */
 
 /**
+ * The provider id this carrier is for.
+ *
+ * `index.ts` imports this rather than declaring its own literal. That is the
+ * point: a second hardcoded `"claude-runner"` in this file would be an
+ * UNTRUSTED DUPLICATION of `index.ts`'s `PROVIDER_ID`, and renaming one would
+ * make the hook decline forever, silently — the same failure class this
+ * module's header comment is about, and the one the duplicated header-name list
+ * below is pinned against. There is nothing to pin if there is one declaration.
+ */
+export const CARRIER_PROVIDER_ID = "claude-runner";
+
+/**
  * The header names the bridge examines, in the order it prefers them.
  *
  * Duplicated from `SESSION_AFFINITY_HEADERS` in `src/claude-bridge.ts:411`
  * rather than imported, because this module is deliberately IMPORT-FREE: the
  * unit suite runs it with no `node_modules` at all and `claude-bridge.ts`
  * pulls in the Agent SDK's types. The duplication is not trusted — a test
- * asserts the two arrays are equal, so a divergence fails the suite instead of
- * silently writing a header nobody reads.
+ * asserts the two arrays are equal AND that the names this module writes are
+ * the names {@link examineAffinityHeaders} actually classifies, so a divergence
+ * fails the suite instead of silently writing a header nobody reads.
  */
 export const SESSION_AFFINITY_HEADER_NAMES = [
   "session_id",
@@ -1542,7 +1586,7 @@ export type ProviderStreamFn = (
   ...rest: unknown[]
 ) => unknown;
 
-/** `params.context` of `wrapProviderStreamFn`; keys per the measured `ctx_keys`. */
+/** `params.context` of the host's `wrapStreamFn` consumer; keys per the measured `ctx_keys`. */
 export interface ProviderStreamWrapContext {
   provider?: unknown;
   streamFn?: unknown;
@@ -1550,46 +1594,164 @@ export interface ProviderStreamWrapContext {
 }
 
 /**
- * Copies a chat-session identifier into the headers of one options bag.
+ * What was decided for ONE header name. FOUR distinguishable states, and
+ * `absent` is one of them.
  *
- * An identifier is carried only when it is a non-empty string. A header that
- * already holds a non-empty string value is LEFT ALONE: such a value was put
- * there by the host (the responses transport does thread `sessionId`), and the
- * host's own value is authoritative. Absent and empty are therefore both
- * "nothing there", and only those are filled in.
+ * This type exists for the same reason {@link AffinityVerdict} does: the three
+ * states a header can be in have DIFFERENT remedies, and collapsing them is
+ * how a guard certifies something it never examined. `host-value-kept` (the
+ * host sent a real value) and `written-over-empty` (the host sent an empty
+ * one) are not the same event even though both mean "the key was present", and
+ * `written-into-absent` is not the same as either.
+ */
+export type SessionAffinityHeaderDecision =
+  | "written-into-absent"
+  | "written-over-empty"
+  | "host-value-kept";
+
+/** What {@link planSessionAffinityHeaders} examined, per name. Never carries a value. */
+export interface SessionAffinityCarryPlan {
+  /** `undefined` when there was nothing to carry; otherwise the new header bag. */
+  readonly headers: Record<string, unknown> | undefined;
+  /** One entry per examined name, in the order examined. */
+  readonly decisions: readonly { readonly header: string; readonly decision: SessionAffinityHeaderDecision }[];
+  /** How many names this carrier wrote. `0` means it changed nothing. */
+  readonly written: number;
+}
+
+/**
+ * Look up a header by name CASE-INSENSITIVELY.
+ *
+ * Header names are case-insensitive, and the host dedupes them that way with
+ * `precedence: "caller-wins"` (`provider-request-config-*.js:165-180`, `:351`)
+ * while comparing lowercased itself (`openai-transport-stream-*.js:1854`). An
+ * exact-key lookup here would therefore MISS a host-set `Session_Id`, we would
+ * add our own `session_id`, and the host's merge would delete the host's key
+ * and keep ours — the exact INVERSE of the "a host value is authoritative"
+ * rule this function exists to implement. (Review finding, reviewer A, round 1.)
+ */
+function findHeaderEntry(
+  headers: Record<string, unknown>,
+  name: string,
+): { key: string; value: unknown } | undefined {
+  const wanted = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === wanted) return { key, value: headers[key] };
+  }
+  return undefined;
+}
+
+/** A plain object — `{}` or `Object.create(null)` — and not a `Map`, `Headers` or array. */
+function isPlainHeaderBag(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Decide, per header name, what this carrier would do — and report it.
+ *
+ * Separated from {@link applySessionAffinityHeaders} so the decision is
+ * OBSERVABLE: a carrier that only returns a bag can be tested for its happy
+ * path, but the three states of an existing header (absent / present-and-empty
+ * / present-and-real) are indistinguishable from the outside. This function
+ * reports what it EXAMINED, which is the same discipline
+ * {@link affinityExaminationSummary} applies on the bridge side.
+ */
+export function planSessionAffinityHeaders(
+  options?: ProviderStreamOptions,
+): SessionAffinityCarryPlan {
+  const none = { headers: undefined, decisions: [], written: 0 } as const;
+  if (options === null || typeof options !== "object") return none;
+  const sessionId = options.sessionId;
+  if (typeof sessionId !== "string" || sessionId.length === 0) return none;
+
+  const existing = options.headers;
+  // A NON-PLAIN object -- a `Headers` instance, a `Map` -- spreads to `{}`, so
+  // copying it would DROP every header the host set (including authorization)
+  // on the good path. We cannot write into a shape we do not understand, so we
+  // decline rather than destroy: no plan, the bag goes through untouched.
+  if (existing !== undefined && !isPlainHeaderBag(existing)) return none;
+
+  const headers: Record<string, unknown> = existing === undefined ? {} : { ...existing };
+  const decisions: { header: string; decision: SessionAffinityHeaderDecision }[] = [];
+  let written = 0;
+
+  for (const name of SESSION_AFFINITY_HEADER_NAMES) {
+    const found = findHeaderEntry(headers, name);
+    if (found === undefined) {
+      headers[name] = sessionId;
+      written += 1;
+      decisions.push({ header: name, decision: "written-into-absent" });
+      continue;
+    }
+    if (typeof found.value === "string" && found.value.length > 0) {
+      // The host sent a real value. The responses transport DOES thread
+      // `sessionId`, so such a value is the host's own and is authoritative.
+      decisions.push({ header: name, decision: "host-value-kept" });
+      continue;
+    }
+    // Present but carrying nothing. Written under the host's own spelling of
+    // the key, so the host's case-insensitive merge cannot end up with two.
+    headers[found.key] = sessionId;
+    written += 1;
+    decisions.push({ header: name, decision: "written-over-empty" });
+  }
+
+  if (written === 0) return { headers: undefined, decisions, written: 0 };
+  return { headers, decisions, written };
+}
+
+/**
+ * Copy a chat-session identifier into the headers of one options bag.
  *
  * When there is nothing to carry, the options bag is returned BY IDENTITY, not
- * copied. That is deliberate and it is asserted: a wrapper that reallocates on
- * every call on a path it does not change is a wrapper whose inertness cannot
- * be observed.
+ * copied. That is deliberate and it is asserted on BOTH of its paths (no
+ * identifier, and every name already host-set): a wrapper that reallocates on
+ * a path it does not change is a wrapper whose inertness cannot be observed.
  */
 export function applySessionAffinityHeaders(
   options?: ProviderStreamOptions,
 ): ProviderStreamOptions | undefined {
   if (options === null || typeof options !== "object") return options;
-  const sessionId = options.sessionId;
-  if (typeof sessionId !== "string" || sessionId.length === 0) return options;
+  const plan = planSessionAffinityHeaders(options);
+  if (plan.headers === undefined) return options;
+  return { ...options, headers: plan.headers };
+}
 
-  const existing = options.headers;
-  const headers: Record<string, unknown> =
-    existing !== null && typeof existing === "object" ? { ...existing } : {};
-
-  let wrote = 0;
-  for (const name of SESSION_AFFINITY_HEADER_NAMES) {
-    const held = headers[name];
-    if (typeof held === "string" && held.length > 0) continue;
-    headers[name] = sessionId;
-    wrote += 1;
-  }
-  if (wrote === 0) return options;
-
-  return { ...options, headers };
+/**
+ * Is this per-call model one of ours?
+ *
+ * THREE states, and they are not collapsed. The hook decides "is this
+ * claude-runner?" once, at install time, from `ctx.provider` — but the wrapper
+ * it installs outlives that decision, and two live host callers hand the
+ * CURRENTLY WRAPPED `agent.streamFn` to secondary generators
+ * (`sessions-*.js:10715` compaction, `:11337` branch summary). On this host
+ * version those cannot reach another provider's model (`selection-*.js:12878/12926`
+ * and `compact-*.js:173` reinstall the pristine base first), but the cost of
+ * closing the class is one comparison and the cost of not closing it is our
+ * tenant's session uuid arriving at another provider's endpoint.
+ *
+ * - present and ours        -> carry
+ * - present and NOT ours    -> do not carry (this is the case being closed)
+ * - ABSENT / unreadable     -> carry, because the install-time decision from
+ *   `ctx.provider` is the only evidence available and it said yes. This arm is
+ *   named and tested rather than left as a fallthrough, because an absent field
+ *   silently taking the happy path is the defect class this file argues about
+ *   everywhere else.
+ */
+function perCallModelIsForeign(model: unknown): boolean {
+  if (model === null || typeof model !== "object") return false;
+  const provider = (model as { provider?: unknown }).provider;
+  if (typeof provider !== "string") return false;
+  return provider.trim().toLowerCase() !== CARRIER_PROVIDER_ID;
 }
 
 /**
  * The `wrapStreamFn` provider-runtime hook.
  *
- * Returns `undefined` — the host's "leave `agent.streamFn` as it was" answer at
+ * Returns `undefined` — the host's "leave `agent.streamFn` as it was" answer,
+ * via the `?? void 0` at `provider-hook-runtime-*.js:262` and the `??` at
  * `extra-params-*.js:695` — for any context this hook has no business in: a
  * non-object context, another provider, or a context whose `streamFn` is not a
  * function. It never throws into the host's turn setup.
@@ -1598,17 +1760,20 @@ export function wrapClaudeRunnerStreamFn(
   ctx: ProviderStreamWrapContext,
 ): ProviderStreamFn | undefined {
   if (ctx === null || typeof ctx !== "object") return undefined;
-  // Resolved the way the HOST resolves a provider id (`trim().toLowerCase()`),
-  // for the same reason as in `normalizeResolvedClaudeRunnerModel`: an exact-key
-  // comparison diverges on any case or whitespace variant. An ABSENT provider is
-  // not treated as ours.
+  // Resolved the way the HOST resolves a provider id -- `normalizeProviderId`
+  // is `trim().toLowerCase()` (`packages/model-catalog-core/src/provider-id.ts:6-8`,
+  // reached via `matchesProviderId`) -- for the same reason as in
+  // `normalizeResolvedClaudeRunnerModel`: an exact-key comparison diverges on
+  // any case or whitespace variant. An ABSENT provider is not treated as ours.
   if (typeof ctx.provider !== "string") return undefined;
-  if (ctx.provider.trim().toLowerCase() !== "claude-runner") return undefined;
+  if (ctx.provider.trim().toLowerCase() !== CARRIER_PROVIDER_ID) return undefined;
 
   const base = ctx.streamFn;
   if (typeof base !== "function") return undefined;
   const baseFn = base as ProviderStreamFn;
 
   return (model, context, options, ...rest) =>
-    baseFn(model, context, applySessionAffinityHeaders(options), ...rest);
+    perCallModelIsForeign(model)
+      ? baseFn(model, context, options, ...rest)
+      : baseFn(model, context, applySessionAffinityHeaders(options), ...rest);
 }
