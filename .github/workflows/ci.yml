@@ -6,6 +6,16 @@
 # checkout. Node's own type stripping runs the TypeScript sources directly,
 # which is also how OpenClaw loads this extension, so the suite exercises the
 # same files the runtime does rather than a compiled copy of them.
+#
+# THE SDK VERSION IS NOT A DETAIL OF THIS FILE, it is the thing the typecheck
+# job exists to read. Until booqi-app/infra#333 the `typecheck` job installed
+# `@anthropic-ai/claude-agent-sdk@0.2.92` as a hard-coded literal while the
+# Booqi cell image installed 0.3.263 -- so the only job that reads the SDK's
+# types read a MAJOR-DIFFERENT copy from the one the product runs, and a 0.3.x
+# change in system-prompt handling was structurally invisible to it. The
+# version is now taken from `package.json` via the lockfile (`npm ci`), which
+# is the same place a human reads it, so the two cannot diverge again without
+# the manifest saying so.
 name: CI
 
 on:
@@ -32,15 +42,18 @@ jobs:
         with:
           node-version: '24'
 
-      # No `npm ci`: there is no lockfile and the suite has no dependencies.
-      # If that ever stops being true this step is where it breaks, loudly.
+      # Still no install in THIS job, and that is deliberate: the unit suite is
+      # hermetic and must stay runnable with no network and no node_modules.
+      # There IS a lockfile now (booqi-app/infra#333) -- the `typecheck` job
+      # installs from it -- but the suite does not need it. If `npm test` ever
+      # starts needing a dependency this step is where it breaks, loudly.
       - name: unit tests
         run: npm test
 
       - name: the JSON files parse
         run: |
           set -euo pipefail
-          for f in package.json openclaw.plugin.json config.example.json tsconfig.json; do
+          for f in package.json package-lock.json openclaw.plugin.json config.example.json tsconfig.json; do
             node -e "JSON.parse(require('node:fs').readFileSync('$f','utf8'))" \
               && echo "ok  $f"
           done
@@ -68,41 +81,92 @@ jobs:
         with:
           node-version: '24'
 
+      # The manifest must name ONE exact version, not a range.
+      #
+      # This is the guard on the gap that produced booqi-app/infra#333. A caret
+      # range is not a pin: `^0.2.92` means `>=0.2.92 <0.3.0`, so the manifest
+      # could NEVER reach the 0.3.263 the cell image installs, and the two
+      # drifted two minors apart without anything going red. An exact version
+      # also makes the manifest directly comparable with
+      # `ARG CELL_CLAUDE_AGENT_SDK_VERSION` in booqi-app/infra's
+      # `docker/cell/Dockerfile`, which is the only other place the number
+      # lives. Keeping those two equal is an infra-side assertion -- this job
+      # cannot see that repository -- but a range here would make even a manual
+      # comparison meaningless, so the shape is enforced on this side.
+      - name: the Agent SDK dependency is an exact pin
+        run: |
+          set -euo pipefail
+          declared=$(node -p "require('./package.json').dependencies['@anthropic-ai/claude-agent-sdk']")
+          # A shell glob is too weak here: `[0-9]*.[0-9]*.[0-9]*` also accepts
+          # `0.3.263 || 0.4.0`, which is a range. Anchored regex instead.
+          if ! node -e "process.exit(/^\d+\.\d+\.\d+$/.test(process.argv[1]) ? 0 : 1)" "$declared"; then
+            echo "::error::package.json declares @anthropic-ai/claude-agent-sdk as '$declared'. It must be ONE exact version (no ^, ~, range, tag or disjunction): the cell image installs an exact version via ARG CELL_CLAUDE_AGENT_SDK_VERSION in booqi-app/infra's docker/cell/Dockerfile, and a range here cannot be compared with it. That divergence is booqi-app/infra#333."
+            exit 1
+          fi
+          echo "ok  @anthropic-ai/claude-agent-sdk pinned exactly at $declared"
+
+      # `npm ci` rather than a hard-coded version, and that is the fix.
+      #
+      # The previous version of this job installed the SDK into a scratch
+      # directory at a LITERAL `@0.2.92`, so the typecheck was pinned to a
+      # version this repository had already stopped running. Installing from
+      # the lockfile means the types `tsc` reads are by construction the types
+      # `package.json` declares -- bumping the dependency is what moves this
+      # job, and nothing else can.
+      #
+      # typescript and @types/node are NOT dependencies of this package (it
+      # ships TypeScript sources that Node type-strips at load; it never
+      # compiles), so they come in with `--no-save`, which leaves the manifest
+      # and the lockfile untouched. `--ignore-scripts` on the `npm ci`: no
+      # lifecycle script is needed to read a `.d.ts`, and not running arbitrary
+      # install scripts in CI is free.
+      - name: install the declared SDK from the lockfile
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm install --no-save --no-audit --no-fund typescript@5 @types/node@24
+
+      # The version actually on disk, read off the installed package rather
+      # than off the manifest -- the manifest is the expectation, never the
+      # evidence. This line is also what a human reads in the log to compare
+      # against the cell image's ARG.
+      #
+      # The manifest is read by PATH, not by `require("@anthropic-ai/
+      # claude-agent-sdk/package.json")`: the SDK's `exports` map does not
+      # expose `./package.json`, so the specifier form fails with
+      # ERR_PACKAGE_PATH_NOT_EXPORTED. `node_modules/<name>/` is the directory
+      # tsc resolves the types out of, so reading it there is reading the same
+      # copy the next step typechecks against.
+      - name: the installed SDK is the declared SDK
+        run: |
+          set -euo pipefail
+          declared=$(node -p "require('./package.json').dependencies['@anthropic-ai/claude-agent-sdk']")
+          installed=$(node -p "JSON.parse(require('node:fs').readFileSync('node_modules/@anthropic-ai/claude-agent-sdk/package.json','utf8')).version")
+          echo "declared=$declared installed=$installed"
+          if [ "$declared" != "$installed" ]; then
+            echo "::error::package.json declares $declared but node_modules carries $installed"
+            exit 1
+          fi
+          echo "ok  typechecking against @anthropic-ai/claude-agent-sdk@$installed"
+
       # Node's type stripping erases types without checking them, so the unit
       # job cannot catch a type-level mistake: dropping a field from an
       # interface is invisible to it. This job is the only thing that reads
       # them. Scope is tsconfig.json -- the Booqi-only modules and their tests,
       # plus typecheck/sdk-options.ts.
       #
-      # The Agent SDK is installed HERE and nowhere else. typecheck/sdk-options.ts
-      # asserts that every option name the bridge sets exists on the SDK's
-      # `Options` type, which is the only check that can catch an invented
-      # option name -- the query options are a Record<string, any>, so the SDK
-      # silently discards a key it does not know. `appendSystemPrompt` was
-      # exactly that until booqi-app/infra#202 replaced it with the real
-      # `systemPrompt` option; KNOWN_NON_SDK_OPTIONS is empty now and this job
-      # is what would catch the next such name. The unit suite stays
-      # dependency-free; this job pays the install cost instead.
-      # Installed into a scratch directory and symlinked in, rather than with a
-      # plain `npm install` here, so that the SDK is present for this job only
-      # and the repository keeps no node_modules of its own. `npx --package` is
-      # not an option: it resolves the packages in its own temp prefix, so tsc
-      # cannot find @types/node from this directory (`error TS2688: Cannot find
-      # type definition file for 'node'`).
+      # `typecheck/sdk-options.ts` asserts that every option name the bridge
+      # sets exists on the SDK's `Options` type, which is the only check that
+      # can catch an invented option name -- the query options are a
+      # Record<string, any>, so the SDK silently discards a key it does not
+      # know. `appendSystemPrompt` was exactly that until booqi-app/infra#202
+      # replaced it with the real `systemPrompt` option; KNOWN_NON_SDK_OPTIONS
+      # is empty now and this job is what would catch the next such name.
+      # Since booqi-app/infra#333 that file ALSO asserts the shape of
+      # `Options["systemPrompt"]` itself, so a future SDK bump that changes
+      # system-prompt handling fails here instead of silently inverting what
+      # the bridge's comments claim. Read the "WHAT THESE DO NOT PROVE" block
+      # in that file before treating a green run as a billing guarantee: it is
+      # not one, and cannot be.
       - name: tsc --noEmit
-        run: |
-          set -euo pipefail
-          scratch="$(mktemp -d)"
-          # No `npm init` here: `npm --prefix DIR init` ignores --prefix and
-          # rewrites the package.json of the CURRENT directory, i.e. this
-          # repository's own manifest. The install below creates the scratch
-          # manifest by itself.
-          npm --prefix "$scratch" install --silent --no-audit --no-fund \
-            typescript@5 @types/node@24 @anthropic-ai/claude-agent-sdk@0.2.92
-          # -sfn, and removed on any exit: a plain `ln -s` onto an existing
-          # node_modules directory creates node_modules/node_modules and the
-          # failure shows up as a baffling TS2688, and `set -e` would otherwise
-          # skip the cleanup on a tsc failure and leave the tree dirty.
-          trap 'rm -f node_modules' EXIT
-          ln -sfn "$scratch/node_modules" node_modules
-          "$scratch/node_modules/.bin/tsc" --noEmit -p tsconfig.json
+        run: ./node_modules/.bin/tsc --noEmit -p tsconfig.json
