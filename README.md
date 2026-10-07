@@ -172,7 +172,7 @@ Because the instructions are part of a user message, the SDK writes them into th
 
 This keeps OpenClaw provider-agnostic: it goes on sending a plain `system` message exactly as it does for every other provider, and translating that into something this particular target honours is the adapter's job. No `CLAUDE.md` and no Claude-Code-specific files are placed in the agent workspace.
 
-Note that `"append"` mode depends on `workDir` being set in the cell configuration — it becomes the SDK's `cwd`, which is what drives the CLI's memory and environment injection.
+Neither mode depends on a configured `workDir`. The SDK's `cwd` is the OpenClaw workspace the bridge is started in (`ctx.workspaceDir`, falling back to `~/.openclaw/workspace`); the `workDir` key of `config.json` is ignored, as the table above says. `cwd` does drive the CLI's memory and environment injection, but in both modes, as measured just below.
 
 **What the two modes do NOT differ on.** Measured against `@anthropic-ai/claude-agent-sdk@0.2.92` (before infra#333, when `"append"` still asked for the preset explicitly; the preset is now simply the SDK's default, so the sizes are unchanged), driving the real bundled `cli.js` at a local mock Messages API, with `settingSources` omitted exactly as this bridge leaves it:
 
@@ -192,6 +192,8 @@ So the only real difference is ~26.6 KB of Claude Code preset: a coding-agent id
 **`"replace"` is the default** because the consumer this fork exists for is a bookkeeping cell, which is required to have those built-in tools disabled. The preset would tell it to use tools it does not have, give it an identity that contradicts its own before its own prompt is read, and cost roughly 6.7k tokens on every request of every turn against a shared rate limit — in exchange for nothing the session did not already have.
 
 `"append"` stays available for an installation that genuinely wants the coding-agent prompt: an operational OpenClaw instance doing software work rather than a tenant cell.
+
+That reasoning holds on the declared SDK range (`^0.2.92`). It does **not** survive 0.3.263, where a present system-prompt option is billed as a third-party app and every model call fails `400` (see the note on `""` under [Known limitations](#known-limitations)). On that version `"replace"` is not usable by anyone, and a Booqi cell MUST therefore configure `"append"` — see [booqi-app/infra#333](https://github.com/booqi-app/infra/issues/333). The default here is unchanged.
 
 ### Compaction summaries
 
