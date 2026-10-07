@@ -31,10 +31,15 @@ import {
   summariseMcpServers,
   sessionAffinityOverrideMessage,
   sessionAffinityOverrideReport,
+  wrapClaudeRunnerStreamFn,
+  CARRIER_PROVIDER_ID,
 } from "./src/bridge-config.js";
 import type { ExtensionBridgeOptions } from "./src/bridge-config.js";
 
-const PROVIDER_ID = "claude-runner";
+// Imported, not re-declared. A second literal here and in src/bridge-config.ts
+// would be an untrusted duplication: renaming one would make the wrapStreamFn
+// hook decline forever, silently (reviewer A MN-5, round 1).
+const PROVIDER_ID = CARRIER_PROVIDER_ID;
 const DEFAULT_WORK_DIR = "~/.openclaw/workspace";
 
 function loadExtensionConfig(): Record<string, unknown> {
@@ -466,13 +471,64 @@ const claudeRunnerPlugin = {
           },
         },
       ],
-      // Registered at the TOP level of the provider object, next to `discovery`,
-      // because that is the object `normalizeRegisteredProvider` spreads
-      // (`provider-validation.ts:378-401`) and the object
-      // `findProviderRuntimePluginInRegistry` looks this key up on
-      // (`provider-hook-runtime.ts:178-193`). Inside `discovery` it would be
-      // destructured away and silently never called.
+      // PROVIDER-RUNTIME HOOKS, registered at the TOP level of this object,
+      // next to `discovery`.
+      //
+      // The host finds them by looking this provider up in the registry of
+      // EXTERNALLY-LOADED plugins: `findProviderRuntimePluginInRegistry`
+      // (`provider-hook-runtime.ts:178-193`) matches by provider id over
+      // `registry.providers` with no `origin === "bundled"` filter -- the
+      // absent filter is the whole reason this surface is available to a
+      // path-loaded plugin at all -- and at `:184` it returns
+      // `Object.assign({}, entry.provider, { pluginId: entry.pluginId })`.
+      // So the object the host ends up calling the hook on is THIS object plus
+      // one injected `pluginId`. Before that, `normalizeRegisteredProvider`
+      // (`provider-validation.ts:379-401`) destructures out exactly
+      // wizard/docsPath/aliases/envVars/catalog/discovery and spreads the rest,
+      // which is why a hook at this level survives and a hook placed INSIDE
+      // `discovery` would be destructured away and silently never called.
+      //
+      // 📌 A NOTE ON THIS COMMENT'S OWN HISTORY, because it was mis-corrected
+      // once and the correction cost more than the original imprecision.
+      // booqi-app/infra#337 recorded this account as "known-wrong" and a first
+      // pass at infra#337 rewrote it to say the hooks are read off the loaded
+      // plugin handle "not off a provider found in the registry". That rewrite
+      // was WRONG, and the measured object refutes it: the live probe reads
+      // `ensureProviderRuntimePluginHandle(params).plugin?.wrapStreamFn?.(params.context)`
+      // (`provider-hook-runtime-*.js:261-263`), and that resolver reaches
+      // `handle.plugin` precisely THROUGH `findProviderRuntimePluginInRegistry`
+      // (`resolveProviderRuntimePluginHandle` -> `resolveProviderRuntimePlugin` :240
+      // -> `findProviderRuntimePluginInLoadedRegistries` :140 -> :149/:165).
+      // Worse, the `pluginId` key in the probe's `plugin_keys` was cited as
+      // evidence AGAINST the registry lookup when `:184`'s `Object.assign` is
+      // what produces it -- i.e. it is evidence FOR it.
+      // The original account was therefore **underspecified, not wrong**: it
+      // never said WHICH registry. The precise statement is the paragraph
+      // above -- the externally-LOADED plugin registry
+      // (`getLoadedRuntimePluginRegistry`), not the models-config provider
+      // list. `test/session-affinity-wire.test.ts` arm `H6` and its
+      // `hostFindProviderRuntimePlugin` fixture reproduce exactly this reading
+      // and are correct as written; this comment now agrees with that test
+      // instead of contradicting it.
       normalizeResolvedModel: normalizeResolvedClaudeRunnerModel,
+      // The carrier for the chat-session identifier. OpenClaw's managed
+      // completions transport drops `options.sessionId`
+      // (`openai-transport-stream-*.js:2404`, four arguments), so the id never
+      // becomes a header and the cell's chat ends up with no bound tools
+      // (`"bound": false`). This hook wraps the function the host hands over in
+      // `ctx.streamFn` and copies the id into `options.headers`, which IS
+      // threaded end to end. Implementation and full rationale live in
+      // `src/bridge-config.ts`, because that file is inside `tsconfig.json`'s
+      // `include` and this one is not (it imports `openclaw/plugin-sdk/core`,
+      // which CI does not install), so logic placed here cannot be TYPECHECKED.
+      //
+      // 🔴 It can, however, be TESTED, and an earlier version of this comment
+      // claimed otherwise -- that `index.ts` was excluded from "both" the
+      // typecheck and the unit suite. The second half was false and it was the
+      // stated reason this registration had no guard: `test/session-affinity-wire.test.ts:147-164`
+      // imports this file for real and hands back the registered provider
+      // object (95% line coverage). The guard now exists, next to `H6`.
+      wrapStreamFn: wrapClaudeRunnerStreamFn,
       discovery: {
         order: "late",
         run: async (ctx: ProviderDiscoveryContext) => {
