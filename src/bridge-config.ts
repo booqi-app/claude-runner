@@ -62,6 +62,22 @@ export interface BridgeConfig {
    */
   mcpServers?: unknown;
   /**
+   * Whether every answer ends with the context status bar -- the
+   * `\n░░░░░░░░░░ 0% · Turn 1 · 0.2k / 1000k tokens` line the bridge appends as
+   * the last text delta (streaming) or to the result text (non-streaming).
+   *
+   * Defaults to `true`: an absent key keeps the behaviour every existing install
+   * of this runner already has. `false` switches the bar off on BOTH paths. The
+   * machine-readable usage (the `usage` and `context` fields of the final chunk
+   * or response, and the `X-Context-*` headers) is NOT affected -- the switch
+   * removes text a person reads, not data a client parses.
+   *
+   * A Booqi cell sets it to `false` (booqi-app/infra#363): the bar is a status
+   * line for an operator's own chat, and in a cell it landed under every answer
+   * a tenant's user reads. See `readContextBar` for the accepted values.
+   */
+  contextBar?: boolean;
+  /**
    * Whether the SDK session uses only the MCP servers passed in these options.
    *
    * Defaults to `true`. That is a deliberate fail-closed choice and it is a
@@ -1047,6 +1063,33 @@ export function readTools(raw: unknown): string[] {
   return raw as string[];
 }
 
+/** The value an absent `contextBar` key means: the bar is shown, as before. */
+export const DEFAULT_CONTEXT_BAR = true;
+
+/**
+ * Read a `contextBar` value out of raw configuration.
+ *
+ * - **absent** (`undefined`) -- `DEFAULT_CONTEXT_BAR`, i.e. the bar is shown.
+ *   Other users of this runner see no change unless they write the key.
+ * - **`true` / `false`** -- returned as given.
+ *
+ * Anything else -- the string `"off"`, `0`, `null`, an object -- **throws**,
+ * naming the key. It is not coerced: `"off"` is truthy, and `"false"` is too,
+ * so a coercing reader would turn the one spelling an operator is most likely
+ * to type into the opposite of what they meant, silently. Refusing at
+ * configuration load is visible; a bar that keeps appearing is not obviously a
+ * configuration error at all.
+ */
+export function readContextBar(raw: unknown): boolean {
+  if (raw === undefined) return DEFAULT_CONTEXT_BAR;
+  if (typeof raw === "boolean") return raw;
+  throw new Error(
+    `Claude Runner: the "contextBar" key in config.json is ${describeConfiguredValue(raw)};`
+      + " it must be true or false (or absent, which means true). Refusing to guess:"
+      + " a string such as \"off\" is truthy and would leave the bar ON.",
+  );
+}
+
 /** The subset of `BridgeConfig` that comes from the extension's `config.json`. */
 export type ExtensionBridgeOptions = Omit<BridgeConfig, "workDir">;
 
@@ -1313,6 +1356,9 @@ export function buildBridgeOptions(extConfig: Record<string, unknown>): Extensio
     effort: extConfig.effort as BridgeConfig["effort"],
     maxBudgetUsd: extConfig.maxBudgetUsd as number | undefined,
     systemPromptMode: extConfig.systemPromptMode as SystemPromptMode | undefined,
+    // NOT a cast, for the same reason as `tools`: a non-boolean throws here,
+    // at configuration load, rather than being read as truthy per request.
+    contextBar: readContextBar(extConfig.contextBar),
   };
 }
 
