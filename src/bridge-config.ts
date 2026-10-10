@@ -72,9 +72,10 @@ export interface BridgeConfig {
    * or response, and the `X-Context-*` headers) is NOT affected -- the switch
    * removes text a person reads, not data a client parses.
    *
-   * A Booqi cell sets it to `false` (booqi-app/infra#363): the bar is a status
-   * line for an operator's own chat, and in a cell it landed under every answer
-   * a tenant's user reads. See `readContextBar` for the accepted values.
+   * A Booqi cell is meant to set it to `false` (booqi-app/infra#363 AC-3, in
+   * booqi-app/infra): the bar is a status line for an operator's own chat, and
+   * in a cell it landed under every answer a tenant's user reads. See
+   * `readContextBar` for the accepted values.
    */
   contextBar?: boolean;
   /**

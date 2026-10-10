@@ -23,7 +23,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { __testing, startBridgeServer, type QueryFn } from "../src/claude-bridge.ts";
+import { __testing, startBridgeServer, stopBridgeServer, type QueryFn } from "../src/claude-bridge.ts";
 import {
   buildBridgeOptions,
   DEFAULT_CONTEXT_BAR,
@@ -264,10 +264,19 @@ for (const bad of ["off", "false", "on", 0, 1, null, {}, []]) {
   });
 }
 
-test("startBridgeServer refuses an unusable contextBar before binding a socket", () => {
-  // Synchronous throw: no Promise, so no listener was ever created.
-  assert.throws(
-    () => startBridgeServer({ ...baseConfig, port: 0, contextBar: "off" as unknown as boolean }),
-    /"contextBar"/,
-  );
+test("startBridgeServer refuses an unusable contextBar before binding a socket", async () => {
+  // Synchronous throw: no Promise, so no listener was ever created. If the
+  // refusal regresses, the call RETURNS a listening server -- close it, so the
+  // regression is a fast red here and not a `node --test` run that never exits
+  // because a socket is still open (review round 1, verification NIT N1).
+  let started: ReturnType<typeof startBridgeServer> | undefined;
+  let refusal: unknown;
+  try {
+    started = startBridgeServer({ ...baseConfig, port: 0, contextBar: "off" as unknown as boolean });
+  } catch (err) {
+    refusal = err;
+  }
+  if (started) await stopBridgeServer(await started);
+  assert.equal(started, undefined, "startBridgeServer accepted contextBar \"off\" and bound a socket");
+  assert.match(String((refusal as Error)?.message), /"contextBar"/);
 });
