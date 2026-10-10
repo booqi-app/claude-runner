@@ -329,7 +329,8 @@ test("buildBridgeOptions carries every other configured value", () => {
   const opts = buildBridgeOptions(
     JSON.parse('{"port":1,"skipPermissions":false,"maxTurns":2,"queueMinDelayMs":3,'
       + '"queueMaxDelayMs":4,"queueMaxConcurrency":5,"sessionTtlMs":6,"maxRetries":8,"tools":["T"],'
-      + '"strictMcpConfig":false,"effort":"high","maxBudgetUsd":7,"systemPromptMode":"replace"}'),
+      + '"strictMcpConfig":false,"effort":"high","maxBudgetUsd":7,"systemPromptMode":"replace",'
+      + '"contextBar":false}'),
   );
 
   assert.deepEqual(opts, {
@@ -347,6 +348,7 @@ test("buildBridgeOptions carries every other configured value", () => {
     effort: "high",
     maxBudgetUsd: 7,
     systemPromptMode: "replace",
+    contextBar: false,
   });
 });
 

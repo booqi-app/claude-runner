@@ -28,6 +28,7 @@ import {
   examineAffinityHeaders,
   normaliseChatSessionId,
   normaliseSystemPromptMode,
+  readContextBar,
   resolveSystemPrompt,
   wrapSystemPromptAsInstructions,
 } from "./bridge-config.ts";
@@ -916,15 +917,18 @@ async function handleStreamingResponse(
       });
     }
 
-    // Append context status bar as final text delta
-    const contextBar = buildContextBar(conversationId);
-    sendSSE({
-      id: requestId,
-      object: "chat.completion.chunk",
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{ index: 0, delta: { content: contextBar }, finish_reason: null }],
-    });
+    // Append context status bar as final text delta -- unless configuration
+    // switched it off (`contextBar: false`, booqi-app/infra#363).
+    if (readContextBar(config.contextBar)) {
+      const contextBar = buildContextBar(conversationId);
+      sendSSE({
+        id: requestId,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{ index: 0, delta: { content: contextBar }, finish_reason: null }],
+      });
+    }
 
     // Include context usage in the final SSE chunk
     const contextInfo = sessionStore.getContextInfo(conversationId);
@@ -1010,8 +1014,11 @@ async function handleNonStreamingResponse(
     activeQueries.delete(requestId);
   }
 
-  // Append context status bar to response
-  resultText += buildContextBar(conversationId);
+  // Append context status bar to response -- unless configuration switched it
+  // off (`contextBar: false`, booqi-app/infra#363).
+  if (readContextBar(config.contextBar)) {
+    resultText += buildContextBar(conversationId);
+  }
 
   const contextInfo = sessionStore.getContextInfo(conversationId);
 
@@ -1174,6 +1181,11 @@ export const __testing = {
 };
 
 export function startBridgeServer(config: BridgeConfig): Promise<ReturnType<typeof createServer>> {
+  // Refuse an unusable `contextBar` before a socket is bound. The handlers read
+  // it again at the END of each answer, and a throw there -- after the answer
+  // has streamed -- would leave the stream without its `[DONE]`. Validating
+  // here makes that throw unreachable for any config this server accepts.
+  readContextBar(config.contextBar);
   sessionStore = new SessionStore(config.sessionTtlMs);
   requestQueue = new RequestQueue(
     config.queueMaxConcurrency ?? 1,
