@@ -33,7 +33,9 @@ concurrency:
 jobs:
   unit:
     name: unit tests
-    runs-on: ubuntu-latest
+    # Self-hosted since 2026-10-12: GitHub-hosted jobs fail at start on a billing
+    # block; these jobs are plain Node (npm test, tsc) and need no Docker.
+    runs-on: [self-hosted, hetzner]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -72,7 +74,9 @@ jobs:
 
   typecheck:
     name: typecheck
-    runs-on: ubuntu-latest
+    # Self-hosted since 2026-10-12: GitHub-hosted jobs fail at start on a billing
+    # block; these jobs are plain Node (npm test, tsc) and need no Docker.
+    runs-on: [self-hosted, hetzner]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
