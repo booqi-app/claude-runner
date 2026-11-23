@@ -200,7 +200,7 @@ That reasoning holds on the declared SDK range (`^0.2.92`). It does **not** surv
 
 When a session rotates at 75% context fill, the summary is prepended into the next request's system prompt (in `"append"` mode, into the instructions block of the fresh session). It is consumed from the session store once, before the retry loop, and **put back if no attempt delivered it** — otherwise a request that failed non-transiently would take the only record of the rotated-away conversation with it. Delivery is tracked by an explicit flag, not by `res.headersSent`: the 502 is written before the restore runs and would mask it.
 
-Caveat, honestly recorded: on the **streaming** path (the default) a mid-stream SDK error is turned into an SSE `Error: …` chunk rather than rethrown, so the turn counts as delivered and the summary is not restored. That is pre-existing behaviour, not a regression — the summary was lost there before this change too — but it means the restore is effective for `stream: false` and for failures that occur before any output.
+Caveat: on the **streaming** path (the default) a turn that fails **after** answer text has gone out counts as delivered, so the summary is not restored. A failure before any output is restored on both paths (see [Runner errors](#runner-errors)).
 
 ## Available models
 
@@ -263,6 +263,17 @@ The bridge exposes additional endpoints beyond the OpenAI-compatible chat comple
 | `/v1/sessions` | GET | List all active sessions with context info |
 | `/v1/sessions/{id}` | GET | Get session details (context fill, turn count, tokens) |
 | `/v1/sessions/{id}/compact` | POST | Force session compaction |
+
+### Runner errors
+
+A failed SDK turn is answered as a **provider error**, never as answer text ([booqi-app/app#318](https://github.com/booqi-app/app/issues/318)). A turn has failed when the SDK throws, or when its `result` message has `is_error: true` (with any subtype, `success` included) or a `subtype` other than `success`. This is read from those structured fields only, never from the wording of the text, so an answer that quotes an error message is still an answer.
+
+| When the turn fails | Response |
+|---|---|
+| Before any answer text (both paths) | The existing error path: a stale-session error retries on a fresh session, an error matching the transient patterns (`maxRetries`) is retried, anything else is HTTP `502` with `{"error": {"message": …, "type": "server_error"}}`. On the streaming path the `200` header and the role chunk are only sent once the first answer text exists (or, for a turn that succeeds without any text, at its end), which is what keeps this path reachable. Once the SDK has emitted a message other than the `result` that carries a `session_id` (its `init` message, a stream event, an assistant message), the session is known to be alive, and the failure never takes the stale-session reset. A session the CLI cannot resume fails with the `result` alone and is still reset. |
+| After answer text has streamed | The stream ends with one chunk carrying `{"error": {"message": …, "type": "server_error"}}` and no `choices`. No `finish_reason: "stop"`, no context bar and no `data: [DONE]` follow. |
+
+The error text goes into the `error` object only, never into a `content` delta.
 
 ### Session info response
 

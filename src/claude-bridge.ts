@@ -305,6 +305,68 @@ function isTransientError(message: string): boolean {
   return TRANSIENT_PATTERNS.some((p) => p.test(message));
 }
 
+// ── Failed SDK results ──────────────────────────────────────────────
+
+/**
+ * Whether an SDK `result` message reports a failed turn.
+ *
+ * Read from the STRUCTURED signal only: `is_error === true` (with any
+ * subtype -- the SDK reports an upstream `API Error: 401` as
+ * `subtype: "success"` with `is_error: true`) or any subtype other than
+ * `"success"`. Never from the wording of the text: a successful answer may
+ * quote an error message, and SDK wording changes without notice.
+ * booqi-app/app#318.
+ */
+function isFailedResult(result: { is_error?: unknown; subtype?: unknown }): boolean {
+  return result.is_error === true || result.subtype !== "success";
+}
+
+/**
+ * The error a failed `result` message is turned into. The message is for the
+ * 502 body and the operator, never for an answer.
+ */
+function failedResultError(result: { subtype?: unknown; errors?: unknown; result?: unknown }): Error {
+  const errors = Array.isArray(result.errors) ? result.errors.join("; ") : "";
+  const text = typeof result.result === "string" ? result.result : "";
+  return new Error(errors || text || `SDK result ${String(result.subtype)}`);
+}
+
+/**
+ * The failure of a turn whose SDK session was demonstrably ALIVE: before it
+ * failed, the SDK had already emitted a NON-`result` message carrying a
+ * `session_id` (its `system`/`init` message, a stream event, an assistant
+ * message). A stale session -- one the CLI cannot resume -- never gets that
+ * far: on the pinned SDK 0.3.263 it yields exactly one message, a `result`
+ * with `subtype: "error_during_execution"`, `num_turns: 0`, the stale id as
+ * `session_id` and `errors: ["No conversation found ..."]` (measured by the
+ * round-2 delta review against the real `query()`). That `result` carries a
+ * `session_id` too, which is why a `result` is not evidence of a live session.
+ *
+ * `executeWithRetries` skips its stale-session reset for this error. That
+ * reset is a text match (`/no conversation found|session/i`), and the SDK
+ * words its five-hour quota "You've hit your session limit", so without this
+ * a quota error on a resumed turn would mint a fresh session, overwrite the
+ * store and so discard the user's conversation -- and retry a non-transient
+ * error (booqi-app/app#318, review round 1). The signal is the message
+ * stream, not the wording.
+ */
+class LiveSessionError extends Error {
+  constructor(cause: unknown) {
+    // The message is kept verbatim: `isTransientError` and the 502 body read it.
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "LiveSessionError";
+  }
+}
+
+/**
+ * Whether an SDK message proves its session is alive: a message other than
+ * the `result` that names its session. See `LiveSessionError`.
+ */
+function provesLiveSession(msg: unknown): boolean {
+  const m = msg as { type?: unknown; session_id?: unknown } | null;
+  return m?.type !== "result" && typeof m?.session_id === "string" && m.session_id.length > 0;
+}
+
 // ── Message extraction ──────────────────────────────────────────────
 
 function flattenContent(content: unknown): string {
@@ -750,8 +812,12 @@ export async function executeWithRetries(
         // regex itself is left as it was: narrowing it would risk missing a
         // genuine stale-session text, and the defect is the new collision, not
         // the breadth. booqi-app/app#459 part C.
+        //
+        // A failure of a turn whose session was demonstrably alive is never a
+        // stale session, whatever its text says (`LiveSessionError`).
         const errorWithoutHint = lastError.replace(/[?&]session=[^&\s"'\\]*/gi, "");
-        if (resumeSessionId && /no conversation found|session/i.test(errorWithoutHint)) {
+        if (resumeSessionId && !(err instanceof LiveSessionError)
+            && /no conversation found|session/i.test(errorWithoutHint)) {
           resumeSessionId = undefined;
           newSessionId = randomUUID();
           sessionStore.record(conversationId, newSessionId);
@@ -816,30 +882,47 @@ async function handleStreamingResponse(
   const q = (await getQuery())({ prompt, options });
   activeQueries.set(requestId, abortController);
 
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-
-  const sendSSE = (data: object) => {
+  const writeSSE = (data: object) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
-  // Initial role chunk
-  sendSSE({
-    id: requestId,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
-  });
+  // The 200 header and the role chunk are deferred until the first byte of
+  // an ANSWER. Until then a failure is still a plain error response: the catch
+  // below rethrows it to `executeWithRetries`, which keeps its stale-session
+  // and transient-retry logic and otherwise answers 502. Sending the header up
+  // front -- as this function did until booqi-app/app#318 -- meant every SDK
+  // failure happened after a 200, and the only thing left to do with it was
+  // to write it into the answer.
+  const openStream = () => {
+    if (res.headersSent) return;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    // Initial role chunk
+    writeSSE({
+      id: requestId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+    });
+  };
+
+  const sendSSE = (data: object) => {
+    openStream();
+    writeSSE(data);
+  };
 
   let resultText = "";
   let streamedDelta = false;
+  let sessionAlive = false;
 
   try {
     for await (const msg of q) {
+      if (provesLiveSession(msg)) sessionAlive = true;
+
       // Token-level streaming deltas
       if (msg.type === "stream_event") {
         const event = (msg as any).event;
@@ -873,7 +956,11 @@ async function handleStreamingResponse(
         if (result.session_id) {
           sessionStore.record(conversationId, result.session_id);
         }
-        if (result.subtype === "success" && result.result && !streamedDelta) {
+        // A failed turn is an error, never an answer -- whatever its text says.
+        if (isFailedResult(result)) {
+          throw failedResultError(result);
+        }
+        if (result.result && !streamedDelta) {
           resultText = result.result;
         }
 
@@ -892,20 +979,35 @@ async function handleStreamingResponse(
       }
     }
   } catch (err: any) {
+    // A runner error is a PROVIDER error (booqi-app/app#318). It is never
+    // written as assistant content and never closed with `finish_reason:
+    // "stop"` or `[DONE]`: to OpenClaw that is a successful completion, and
+    // the error text became the user's answer.
+    if (!res.headersSent) {
+      // Nothing streamed yet: the existing error path decides (stale-session
+      // retry, transient retry, otherwise 502).
+      throw sessionAlive ? new LiveSessionError(err) : err;
+    }
+    // Answer text already went out: end the stream with an error chunk, so
+    // the consumer sees a failed stream rather than a finished answer.
     if (!res.writableEnded) {
-      sendSSE({
+      writeSSE({
         id: requestId,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
         model,
-        choices: [{ index: 0, delta: { content: `\n\nError: ${err.message}` }, finish_reason: "stop" }],
+        error: { message: err?.message ?? String(err), type: "server_error" },
       });
+      res.end();
     }
+    return;
   } finally {
     activeQueries.delete(requestId);
   }
 
   if (!res.writableEnded) {
+    // A turn that produced no text at all still answers with a stream.
+    openStream();
     // Fallback: send result as one chunk if no streaming deltas came through
     if (resultText && !streamedDelta) {
       sendSSE({
@@ -983,20 +1085,22 @@ async function handleNonStreamingResponse(
   activeQueries.set(requestId, abortController);
 
   let resultText = "";
+  let sessionAlive = false;
 
   try {
     for await (const msg of q) {
+      if (provesLiveSession(msg)) sessionAlive = true;
       if (msg.type === "result") {
         const result = msg as any;
         if (result.session_id) {
           sessionStore.record(conversationId, result.session_id);
         }
-        if (result.subtype === "success") {
-          resultText = result.result ?? "";
-        } else {
-          const errors = result.errors?.join("; ") ?? "Unknown error";
-          throw new Error(errors);
+        // The same structured check as the streaming path: `subtype:
+        // "success"` with `is_error: true` is a failed turn too.
+        if (isFailedResult(result)) {
+          throw failedResultError(result);
         }
+        resultText = result.result ?? "";
 
         // Extract context usage
         if (result.modelUsage) {
@@ -1010,6 +1114,9 @@ async function handleNonStreamingResponse(
         }
       }
     }
+  } catch (err) {
+    // See `LiveSessionError`: the same rule as the streaming path.
+    throw sessionAlive ? new LiveSessionError(err) : err;
   } finally {
     activeQueries.delete(requestId);
   }
