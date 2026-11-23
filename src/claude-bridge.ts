@@ -333,9 +333,14 @@ function failedResultError(result: { subtype?: unknown; errors?: unknown; result
 
 /**
  * The failure of a turn whose SDK session was demonstrably ALIVE: before it
- * failed, the SDK had already emitted a message carrying a `session_id` (its
- * `system`/`init` message, a stream event, the `result`). A stale session --
- * one the CLI cannot resume -- fails before any such message exists.
+ * failed, the SDK had already emitted a NON-`result` message carrying a
+ * `session_id` (its `system`/`init` message, a stream event, an assistant
+ * message). A stale session -- one the CLI cannot resume -- never gets that
+ * far: on the pinned SDK 0.3.263 it yields exactly one message, a `result`
+ * with `subtype: "error_during_execution"`, `num_turns: 0`, the stale id as
+ * `session_id` and `errors: ["No conversation found ..."]` (measured by the
+ * round-2 delta review against the real `query()`). That `result` carries a
+ * `session_id` too, which is why a `result` is not evidence of a live session.
  *
  * `executeWithRetries` skips its stale-session reset for this error. That
  * reset is a text match (`/no conversation found|session/i`), and the SDK
@@ -347,15 +352,19 @@ function failedResultError(result: { subtype?: unknown; errors?: unknown; result
  */
 class LiveSessionError extends Error {
   constructor(cause: unknown) {
-    super(cause instanceof Error ? cause.message : String(cause));
+    // The message is kept verbatim: `isTransientError` and the 502 body read it.
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
     this.name = "LiveSessionError";
   }
 }
 
-/** Whether an SDK message names its session, i.e. the session is alive. */
-function carriesSessionId(msg: unknown): boolean {
-  const id = (msg as { session_id?: unknown } | null)?.session_id;
-  return typeof id === "string" && id.length > 0;
+/**
+ * Whether an SDK message proves its session is alive: a message other than
+ * the `result` that names its session. See `LiveSessionError`.
+ */
+function provesLiveSession(msg: unknown): boolean {
+  const m = msg as { type?: unknown; session_id?: unknown } | null;
+  return m?.type !== "result" && typeof m?.session_id === "string" && m.session_id.length > 0;
 }
 
 // ── Message extraction ──────────────────────────────────────────────
@@ -912,7 +921,7 @@ async function handleStreamingResponse(
 
   try {
     for await (const msg of q) {
-      if (carriesSessionId(msg)) sessionAlive = true;
+      if (provesLiveSession(msg)) sessionAlive = true;
 
       // Token-level streaming deltas
       if (msg.type === "stream_event") {
@@ -1080,7 +1089,7 @@ async function handleNonStreamingResponse(
 
   try {
     for await (const msg of q) {
-      if (carriesSessionId(msg)) sessionAlive = true;
+      if (provesLiveSession(msg)) sessionAlive = true;
       if (msg.type === "result") {
         const result = msg as any;
         if (result.session_id) {

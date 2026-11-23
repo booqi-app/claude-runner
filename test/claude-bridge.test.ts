@@ -1700,8 +1700,14 @@ test("a compaction summary is restored when a STREAMING request fails before any
 // reset reachable on the streaming path, so a quota error on any resumed turn
 // minted a fresh session, overwrote the store -- discarding the user's
 // conversation -- and retried a non-transient error. The fix reads the message
-// stream, not the wording: once the SDK has emitted a message carrying a
-// `session_id`, the session is alive (`LiveSessionError`).
+// stream, not the wording: once the SDK has emitted a NON-`result` message
+// carrying a `session_id`, the session is alive (`LiveSessionError`).
+//
+// Review round 2 (MAJOR): a session the pinned CLI cannot resume yields ONE
+// message, a `result` (`error_during_execution`, `num_turns: 0`, the stale id
+// as `session_id`, `errors: ["No conversation found ..."]`), measured against
+// the real `query()`. So a `result` is not evidence of a live session, and the
+// stale-session control below uses that measured shape.
 
 const SESSION_LIMIT_ENVELOPE =
   "Claude Code returned an error result: You've hit your session limit · resets 4pm (UTC)";
@@ -1724,6 +1730,7 @@ for (const stream of [true, false]) {
 
   test(`R2 resumed: an is_error result naming the session limit keeps the session (${via})`, async () => {
     const r = await driveRunnerError(async function* () {
+      yield { type: "system", subtype: "init", session_id: "sdk-session-9" };
       yield { type: "result", subtype: "success", is_error: true, result: "You've hit your session limit · resets 4pm (UTC)", session_id: "sdk-session-9" };
     }, { stream, resumeSessionId: "sdk-session-9" });
     assert.equal(r.res.statusCode, 502);
@@ -1731,7 +1738,46 @@ for (const stream of [true, false]) {
     assert.equal(r.storedSession, "sdk-session-9", "the conversation's session was discarded");
   });
 
-  test(`control: a genuine stale session (no message before the throw) still gets a fresh session (${via})`, async () => {
+  test(`control: a genuine stale session (the measured result-only shape) still gets a fresh session (${via})`, async () => {
+    // Kills: counting a `result` as proof of a live session (round-2 MAJOR).
+    const r = await driveRunnerError(async function* (call: number) {
+      if (call === 1) {
+        yield {
+          type: "result", subtype: "error_during_execution", is_error: true, num_turns: 0,
+          session_id: "sdk-session-9", errors: ["No conversation found with session ID: sdk-session-9"],
+        };
+        return;
+      }
+      yield { type: "result", subtype: "success", is_error: false, result: "fresh answer", session_id: "sdk-session-10" };
+    }, { stream, resumeSessionId: "sdk-session-9" });
+    assert.equal(r.calls, 2, "the stale session was not reset and retried");
+    assert.equal(r.res.statusCode, 200);
+    assert.equal(r.storedSession, "sdk-session-10");
+  });
+
+  test(`a transient error after init is still retried, its message intact (${via})`, async () => {
+    // Kills: a LiveSessionError that drops or replaces the original message --
+    // `isTransientError` reads it, so the retry would silently stop.
+    const r = await driveRunnerError(async function* (call: number) {
+      yield { type: "system", subtype: "init", session_id: "sdk-session-9" };
+      if (call === 1) throw new Error("529 overloaded");
+      yield { type: "result", subtype: "success", is_error: false, result: "second try", session_id: "sdk-session-9" };
+    }, { stream, resumeSessionId: "sdk-session-9" });
+    assert.equal(r.calls, 2, "the transient error after init was not retried");
+    assert.equal(r.res.statusCode, 200);
+    assert.equal(r.storedSession, "sdk-session-9");
+  });
+
+  test(`a non-transient error after init keeps its message in the 502 body (${via})`, async () => {
+    const r = await driveRunnerError(async function* () {
+      yield { type: "system", subtype: "init", session_id: "sdk-session-9" };
+      throw new Error("invalid request: model refused");
+    }, { stream, resumeSessionId: "sdk-session-9" });
+    assert.equal(r.res.statusCode, 502);
+    assert.equal(JSON.parse(r.res.body).error.message, "invalid request: model refused");
+  });
+
+  test(`control: a stale session that throws before any message still gets a fresh session (${via})`, async () => {
     // Without this arm the two above could pass because the reset never fires.
     const r = await driveRunnerError(async function* (call: number) {
       if (call === 1) throw new Error("No conversation found with session ID: sdk-session-9");
