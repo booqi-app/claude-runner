@@ -1486,13 +1486,19 @@ type StreamRead = {
   done: boolean;
   /** Chunks carrying a top-level `error` object. */
   errorChunks: any[];
+  /** The SDK session id stored for the conversation after the request. */
+  storedSession: string | undefined;
 };
+
+/** The conversation key the resumed-turn arms name through the request body. */
+const RESUMED_CONVERSATION = "chat-318";
 
 async function driveRunnerError(
   makeTurn: (call: number) => AsyncGenerator<any>,
-  opts: { stream?: boolean } = {},
+  opts: { stream?: boolean; resumeSessionId?: string } = {},
 ): Promise<StreamRead> {
-  __testing.initialiseStores(errorConfig);
+  const { sessionStore } = __testing.initialiseStores(errorConfig);
+  if (opts.resumeSessionId) sessionStore.record(RESUMED_CONVERSATION, opts.resumeSessionId);
   let calls = 0;
   __testing.setQuery(((_: any) => {
     calls += 1;
@@ -1506,6 +1512,7 @@ async function driveRunnerError(
         model: "claude-runner/claude-opus-4-6",
         stream: opts.stream ?? true,
         messages: [{ role: "user", content: "hello" }],
+        ...(opts.resumeSessionId ? { conversation_id: RESUMED_CONVERSATION } : {}),
       }),
       res as any,
       errorConfig,
@@ -1525,6 +1532,7 @@ async function driveRunnerError(
     stop: chunks.some((c: any) => (c.choices ?? []).some((ch: any) => ch.finish_reason === "stop")),
     done: lines.includes("[DONE]"),
     errorChunks: chunks.filter((c: any) => c.error !== undefined),
+    storedSession: sessionStore.get(RESUMED_CONVERSATION)?.claudeSessionId,
   };
 }
 
@@ -1682,3 +1690,55 @@ test("a compaction summary is restored when a STREAMING request fails before any
   assert.equal(res.statusCode, 502, "precondition: the streaming request failed without reaching the client");
   assert.equal(sessionStore.get(conversationId)?.compactSummary, "SUMMARY-TEXT");
 });
+
+// ── A quota error on a RESUMED turn keeps the conversation ─────────────
+//
+// Review round 1 (MAJOR, found independently by two reviewers): the pinned
+// SDK words its five-hour quota "You've hit your session limit", and the
+// stale-session reset in `executeWithRetries` is the text match
+// `/no conversation found|session/i`. Deferring the streaming header made that
+// reset reachable on the streaming path, so a quota error on any resumed turn
+// minted a fresh session, overwrote the store -- discarding the user's
+// conversation -- and retried a non-transient error. The fix reads the message
+// stream, not the wording: once the SDK has emitted a message carrying a
+// `session_id`, the session is alive (`LiveSessionError`).
+
+const SESSION_LIMIT_ENVELOPE =
+  "Claude Code returned an error result: You've hit your session limit · resets 4pm (UTC)";
+
+for (const stream of [true, false]) {
+  const via = stream ? "streaming" : "non-streaming";
+
+  test(`R1 resumed: a session-limit throw after init keeps the session and is not retried (${via})`, async () => {
+    // Kills: dropping the LiveSessionError guard from the stale-session branch,
+    // or not marking the error on this transport.
+    const r = await driveRunnerError(async function* () {
+      yield { type: "system", subtype: "init", session_id: "sdk-session-9" };
+      throw new Error(SESSION_LIMIT_ENVELOPE);
+    }, { stream, resumeSessionId: "sdk-session-9" });
+    assert.equal(r.res.statusCode, 502);
+    assert.equal(r.calls, 1, "the quota error was retried");
+    assert.equal(r.storedSession, "sdk-session-9", "the conversation's session was discarded");
+    assert.deepEqual(r.contents, []);
+  });
+
+  test(`R2 resumed: an is_error result naming the session limit keeps the session (${via})`, async () => {
+    const r = await driveRunnerError(async function* () {
+      yield { type: "result", subtype: "success", is_error: true, result: "You've hit your session limit · resets 4pm (UTC)", session_id: "sdk-session-9" };
+    }, { stream, resumeSessionId: "sdk-session-9" });
+    assert.equal(r.res.statusCode, 502);
+    assert.equal(r.calls, 1, "the quota error was retried");
+    assert.equal(r.storedSession, "sdk-session-9", "the conversation's session was discarded");
+  });
+
+  test(`control: a genuine stale session (no message before the throw) still gets a fresh session (${via})`, async () => {
+    // Without this arm the two above could pass because the reset never fires.
+    const r = await driveRunnerError(async function* (call: number) {
+      if (call === 1) throw new Error("No conversation found with session ID: sdk-session-9");
+      yield { type: "result", subtype: "success", is_error: false, result: "fresh answer", session_id: "sdk-session-10" };
+    }, { stream, resumeSessionId: "sdk-session-9" });
+    assert.equal(r.calls, 2, "the stale session was not reset and retried");
+    assert.equal(r.res.statusCode, 200);
+    assert.equal(r.storedSession, "sdk-session-10");
+  });
+}

@@ -331,6 +331,33 @@ function failedResultError(result: { subtype?: unknown; errors?: unknown; result
   return new Error(errors || text || `SDK result ${String(result.subtype)}`);
 }
 
+/**
+ * The failure of a turn whose SDK session was demonstrably ALIVE: before it
+ * failed, the SDK had already emitted a message carrying a `session_id` (its
+ * `system`/`init` message, a stream event, the `result`). A stale session --
+ * one the CLI cannot resume -- fails before any such message exists.
+ *
+ * `executeWithRetries` skips its stale-session reset for this error. That
+ * reset is a text match (`/no conversation found|session/i`), and the SDK
+ * words its five-hour quota "You've hit your session limit", so without this
+ * a quota error on a resumed turn would mint a fresh session, overwrite the
+ * store and so discard the user's conversation -- and retry a non-transient
+ * error (booqi-app/app#318, review round 1). The signal is the message
+ * stream, not the wording.
+ */
+class LiveSessionError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "LiveSessionError";
+  }
+}
+
+/** Whether an SDK message names its session, i.e. the session is alive. */
+function carriesSessionId(msg: unknown): boolean {
+  const id = (msg as { session_id?: unknown } | null)?.session_id;
+  return typeof id === "string" && id.length > 0;
+}
+
 // ── Message extraction ──────────────────────────────────────────────
 
 function flattenContent(content: unknown): string {
@@ -776,8 +803,12 @@ export async function executeWithRetries(
         // regex itself is left as it was: narrowing it would risk missing a
         // genuine stale-session text, and the defect is the new collision, not
         // the breadth. booqi-app/app#459 part C.
+        //
+        // A failure of a turn whose session was demonstrably alive is never a
+        // stale session, whatever its text says (`LiveSessionError`).
         const errorWithoutHint = lastError.replace(/[?&]session=[^&\s"'\\]*/gi, "");
-        if (resumeSessionId && /no conversation found|session/i.test(errorWithoutHint)) {
+        if (resumeSessionId && !(err instanceof LiveSessionError)
+            && /no conversation found|session/i.test(errorWithoutHint)) {
           resumeSessionId = undefined;
           newSessionId = randomUUID();
           sessionStore.record(conversationId, newSessionId);
@@ -877,9 +908,12 @@ async function handleStreamingResponse(
 
   let resultText = "";
   let streamedDelta = false;
+  let sessionAlive = false;
 
   try {
     for await (const msg of q) {
+      if (carriesSessionId(msg)) sessionAlive = true;
+
       // Token-level streaming deltas
       if (msg.type === "stream_event") {
         const event = (msg as any).event;
@@ -943,7 +977,7 @@ async function handleStreamingResponse(
     if (!res.headersSent) {
       // Nothing streamed yet: the existing error path decides (stale-session
       // retry, transient retry, otherwise 502).
-      throw err;
+      throw sessionAlive ? new LiveSessionError(err) : err;
     }
     // Answer text already went out: end the stream with an error chunk, so
     // the consumer sees a failed stream rather than a finished answer.
@@ -1042,9 +1076,11 @@ async function handleNonStreamingResponse(
   activeQueries.set(requestId, abortController);
 
   let resultText = "";
+  let sessionAlive = false;
 
   try {
     for await (const msg of q) {
+      if (carriesSessionId(msg)) sessionAlive = true;
       if (msg.type === "result") {
         const result = msg as any;
         if (result.session_id) {
@@ -1069,6 +1105,9 @@ async function handleNonStreamingResponse(
         }
       }
     }
+  } catch (err) {
+    // See `LiveSessionError`: the same rule as the streaming path.
+    throw sessionAlive ? new LiveSessionError(err) : err;
   } finally {
     activeQueries.delete(requestId);
   }

@@ -270,7 +270,7 @@ A failed SDK turn is answered as a **provider error**, never as answer text ([bo
 
 | When the turn fails | Response |
 |---|---|
-| Before any answer text (both paths) | The existing error path: a stale-session error retries on a fresh session, an error matching the transient patterns (`maxRetries`) is retried, anything else is HTTP `502` with `{"error": {"message": …, "type": "server_error"}}`. On the streaming path the `200` header and the role chunk are only sent once the first answer text exists, which is what keeps this path reachable. |
+| Before any answer text (both paths) | The existing error path: a stale-session error retries on a fresh session, an error matching the transient patterns (`maxRetries`) is retried, anything else is HTTP `502` with `{"error": {"message": …, "type": "server_error"}}`. On the streaming path the `200` header and the role chunk are only sent once the first answer text exists (or, for a turn that succeeds without any text, at its end), which is what keeps this path reachable. Once the SDK has emitted any message carrying a `session_id`, the session is known to be alive, and the failure never takes the stale-session reset. |
 | After answer text has streamed | The stream ends with one chunk carrying `{"error": {"message": …, "type": "server_error"}}` and no `choices`. No `finish_reason: "stop"`, no context bar and no `data: [DONE]` follow. |
 
 The error text goes into the `error` object only, never into a `content` delta.
