@@ -305,6 +305,32 @@ function isTransientError(message: string): boolean {
   return TRANSIENT_PATTERNS.some((p) => p.test(message));
 }
 
+// ── Failed SDK results ──────────────────────────────────────────────
+
+/**
+ * Whether an SDK `result` message reports a failed turn.
+ *
+ * Read from the STRUCTURED signal only: `is_error === true` (with any
+ * subtype -- the SDK reports an upstream `API Error: 401` as
+ * `subtype: "success"` with `is_error: true`) or any subtype other than
+ * `"success"`. Never from the wording of the text: a successful answer may
+ * quote an error message, and SDK wording changes without notice.
+ * booqi-app/app#318.
+ */
+function isFailedResult(result: { is_error?: unknown; subtype?: unknown }): boolean {
+  return result.is_error === true || result.subtype !== "success";
+}
+
+/**
+ * The error a failed `result` message is turned into. The message is for the
+ * 502 body and the operator, never for an answer.
+ */
+function failedResultError(result: { subtype?: unknown; errors?: unknown; result?: unknown }): Error {
+  const errors = Array.isArray(result.errors) ? result.errors.join("; ") : "";
+  const text = typeof result.result === "string" ? result.result : "";
+  return new Error(errors || text || `SDK result ${String(result.subtype)}`);
+}
+
 // ── Message extraction ──────────────────────────────────────────────
 
 function flattenContent(content: unknown): string {
@@ -816,24 +842,38 @@ async function handleStreamingResponse(
   const q = (await getQuery())({ prompt, options });
   activeQueries.set(requestId, abortController);
 
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-
-  const sendSSE = (data: object) => {
+  const writeSSE = (data: object) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
-  // Initial role chunk
-  sendSSE({
-    id: requestId,
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model,
-    choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
-  });
+  // The 200 header and the role chunk are deferred until the first byte of
+  // an ANSWER. Until then a failure is still a plain error response: the catch
+  // below rethrows it to `executeWithRetries`, which keeps its stale-session
+  // and transient-retry logic and otherwise answers 502. Sending the header up
+  // front -- as this function did until booqi-app/app#318 -- meant every SDK
+  // failure happened after a 200, and the only thing left to do with it was
+  // to write it into the answer.
+  const openStream = () => {
+    if (res.headersSent) return;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    // Initial role chunk
+    writeSSE({
+      id: requestId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+    });
+  };
+
+  const sendSSE = (data: object) => {
+    openStream();
+    writeSSE(data);
+  };
 
   let resultText = "";
   let streamedDelta = false;
@@ -873,7 +913,11 @@ async function handleStreamingResponse(
         if (result.session_id) {
           sessionStore.record(conversationId, result.session_id);
         }
-        if (result.subtype === "success" && result.result && !streamedDelta) {
+        // A failed turn is an error, never an answer -- whatever its text says.
+        if (isFailedResult(result)) {
+          throw failedResultError(result);
+        }
+        if (result.result && !streamedDelta) {
           resultText = result.result;
         }
 
@@ -892,20 +936,35 @@ async function handleStreamingResponse(
       }
     }
   } catch (err: any) {
+    // A runner error is a PROVIDER error (booqi-app/app#318). It is never
+    // written as assistant content and never closed with `finish_reason:
+    // "stop"` or `[DONE]`: to OpenClaw that is a successful completion, and
+    // the error text became the user's answer.
+    if (!res.headersSent) {
+      // Nothing streamed yet: the existing error path decides (stale-session
+      // retry, transient retry, otherwise 502).
+      throw err;
+    }
+    // Answer text already went out: end the stream with an error chunk, so
+    // the consumer sees a failed stream rather than a finished answer.
     if (!res.writableEnded) {
-      sendSSE({
+      writeSSE({
         id: requestId,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
         model,
-        choices: [{ index: 0, delta: { content: `\n\nError: ${err.message}` }, finish_reason: "stop" }],
+        error: { message: err?.message ?? String(err), type: "server_error" },
       });
+      res.end();
     }
+    return;
   } finally {
     activeQueries.delete(requestId);
   }
 
   if (!res.writableEnded) {
+    // A turn that produced no text at all still answers with a stream.
+    openStream();
     // Fallback: send result as one chunk if no streaming deltas came through
     if (resultText && !streamedDelta) {
       sendSSE({
@@ -991,12 +1050,12 @@ async function handleNonStreamingResponse(
         if (result.session_id) {
           sessionStore.record(conversationId, result.session_id);
         }
-        if (result.subtype === "success") {
-          resultText = result.result ?? "";
-        } else {
-          const errors = result.errors?.join("; ") ?? "Unknown error";
-          throw new Error(errors);
+        // The same structured check as the streaming path: `subtype:
+        // "success"` with `is_error: true` is a failed turn too.
+        if (isFailedResult(result)) {
+          throw failedResultError(result);
         }
+        resultText = result.result ?? "";
 
         // Extract context usage
         if (result.modelUsage) {

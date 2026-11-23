@@ -1014,11 +1014,11 @@ test("AC-C2: a retried request logs the missing hint ONCE, not once per attempt"
 
   try {
     await executeWithRetries(
-      // The NON-streaming transport: `handleStreamingResponse` writes its 200
-      // header before it iterates the query, so a failure there sets
-      // `res.headersSent` and the retry loop returns instead of retrying.
-      // Driving the retry at all requires the transport that fails before any
-      // header is written.
+      // The NON-streaming transport. Until booqi-app/app#318 the streaming
+      // one wrote its 200 header before it iterated the query, so only this
+      // transport could reach the retry. The streaming header is deferred now
+      // and retries too (pinned by "R1 control" below); this arm keeps the
+      // transport it was written against.
       "hello", "claude-opus-4-6", "you are a bookkeeper", "conv-1",
       false, res, "req-1", retrying, undefined,
     );
@@ -1444,3 +1444,241 @@ test("S1 JOIN: an accepted affinity header routes, and the hint reaches the SDK 
   assert.match(logs[0], /wrote the chat-session hint/);
 });
 
+
+// ── booqi-app/app#318 slice 1: a runner error is a PROVIDER error ──────
+//
+// Measured on 9123e5d: an SDK throw was written into the stream as an
+// assistant CONTENT delta (`\n\nError: Claude Code returned an error result:
+// You've hit your weekly limit ...`), closed with `finish_reason: "stop"` and
+// followed by the normal tail and `[DONE]`. OpenClaw saw a well-formed,
+// successful completion, so a demo user got the English runner text as the
+// answer and the turn was stored as such. A `result` message with
+// `is_error: true` -- with ANY subtype, `success` included -- was not read at
+// all on the streaming path.
+//
+// Every test below drives the real entry point, `handleCompletions`, with a
+// fake `query()`. Detection is by the STRUCTURED signal only (the throw,
+// `is_error`, `subtype`); R3 is the arm that kills any text-matching variant.
+// Each test names the mutant it kills (DoR comment 7095953954, section 7).
+
+/** The SDK's own envelope, as a demo user saw it on 2026-11-21. */
+const QUOTA_ENVELOPE =
+  "Claude Code returned an error result: You've hit your weekly limit · resets 4pm (UTC)";
+
+/** Words of the upstream error that must never reach an answer. */
+const UPSTREAM_ERROR_WORDS = /error result|weekly|limit|resets|API Error|upstream boom|max turns/i;
+
+/**
+ * One retry allowed, so "not retried" is a measurement and not a consequence
+ * of a zero retry budget. The context bar is left ON (the default) so that a
+ * tail that still runs after an error shows up as a content delta.
+ */
+const errorConfig: BridgeConfig = { ...config, maxRetries: 1 };
+
+type StreamRead = {
+  res: any;
+  calls: number;
+  /** Every non-empty `delta.content`, in order. */
+  contents: string[];
+  /** Any choice carried `finish_reason: "stop"`. */
+  stop: boolean;
+  /** A `data: [DONE]` line was written. */
+  done: boolean;
+  /** Chunks carrying a top-level `error` object. */
+  errorChunks: any[];
+};
+
+async function driveRunnerError(
+  makeTurn: (call: number) => AsyncGenerator<any>,
+  opts: { stream?: boolean } = {},
+): Promise<StreamRead> {
+  __testing.initialiseStores(errorConfig);
+  let calls = 0;
+  __testing.setQuery(((_: any) => {
+    calls += 1;
+    return makeTurn(calls);
+  }) as unknown as QueryFn);
+  __testing.setLog(() => {});
+  const res = fakeRes();
+  try {
+    await __testing.handleCompletions(
+      fakeReq({}, {
+        model: "claude-runner/claude-opus-4-6",
+        stream: opts.stream ?? true,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+      res as any,
+      errorConfig,
+    );
+  } finally {
+    __testing.setQuery(undefined);
+    __testing.setLog(undefined);
+  }
+  const lines = res.body.split("\n").filter((l: string) => l.startsWith("data: ")).map((l: string) => l.slice(6));
+  const chunks = lines.filter((l: string) => l !== "[DONE]").map((l: string) => JSON.parse(l));
+  return {
+    res,
+    calls,
+    contents: chunks
+      .flatMap((c: any) => (c.choices ?? []).map((ch: any) => ch.delta?.content ?? ""))
+      .filter((s: string) => s.length > 0),
+    stop: chunks.some((c: any) => (c.choices ?? []).some((ch: any) => ch.finish_reason === "stop")),
+    done: lines.includes("[DONE]"),
+    errorChunks: chunks.filter((c: any) => c.error !== undefined),
+  };
+}
+
+/** The shared assertions of AC-1 for a failure before any answer byte. */
+function assertFailedBeforeOutput(r: StreamRead): void {
+  assert.deepEqual(r.contents, [], `a content delta was written for a failed turn: ${JSON.stringify(r.contents)}`);
+  assert.equal(r.stop, false, "finish_reason stop after an error");
+  assert.equal(r.done, false, "[DONE] after an error");
+  assert.equal(r.res.statusCode, 502, "the failure did not take the existing 502 path");
+  assert.equal(r.calls, 1, "a non-transient error was retried");
+  // The 502 is a JSON error object, not an event stream with a role chunk.
+  const parsed = JSON.parse(r.res.body);
+  assert.equal(parsed.error?.type, "server_error");
+  assert.equal(parsed.choices, undefined);
+}
+
+test("R1: an SDK throw (the weekly-limit envelope) is a 502, never answer text, and is not retried", async () => {
+  // Kills M1 (the catch writes the error text as content), M4 (the stop /
+  // [DONE] tail still runs) and M5 (the quota error counted as transient).
+  const r = await driveRunnerError(async function* () {
+    throw new Error(QUOTA_ENVELOPE);
+  });
+  assertFailedBeforeOutput(r);
+});
+
+test("R1 control: a transient SDK throw before any output IS retried on the streaming path", async () => {
+  // Without this arm, R1's `calls === 1` could pass because the harness can
+  // never retry. Deferring the 200 header is what lets the existing retry
+  // policy reach the streaming path at all, so this pins that half too.
+  const r = await driveRunnerError(async function* (call: number) {
+    if (call === 1) throw new Error("529 overloaded");
+    yield { type: "result", subtype: "success", is_error: false, result: "second try", session_id: "s-2" };
+  });
+  assert.equal(r.calls, 2, "the transient error was not retried");
+  assert.equal(r.res.statusCode, 200);
+  assert.ok(r.contents.join("").includes("second try"));
+  assert.equal(r.stop, true);
+  assert.equal(r.done, true);
+});
+
+test("R2: a result with is_error:true and subtype error_during_execution is a 502, not an answer", async () => {
+  // Kills M3 (no envelope, no throw: a text match sees nothing here).
+  const r = await driveRunnerError(async function* () {
+    yield { type: "result", subtype: "error_during_execution", is_error: true, errors: ["upstream boom"], session_id: "s-1" };
+  });
+  assertFailedBeforeOutput(r);
+});
+
+test("R2b: a result with subtype success but is_error:true (API Error: 401) is a 502, not an answer", async () => {
+  // Kills M2 (the check reads only `subtype`) and M3.
+  const r = await driveRunnerError(async function* () {
+    yield { type: "result", subtype: "success", is_error: true, result: "API Error: 401 {\"type\":\"error\"}", session_id: "s-1" };
+  });
+  assertFailedBeforeOutput(r);
+});
+
+test("R2c: a non-success subtype is an error even without is_error", async () => {
+  // Kills the mirror of M2: a check that reads only `is_error`.
+  const r = await driveRunnerError(async function* () {
+    yield { type: "result", subtype: "error_max_turns", errors: ["max turns reached"], session_id: "s-1" };
+  });
+  assertFailedBeforeOutput(r);
+});
+
+test("R3: a successful answer QUOTING the envelope phrase streams as an answer and ends in stop", async () => {
+  // AC-2. Kills M3 and any other text-matching detection: this is green
+  // before the fix and must stay green after it.
+  const text = "The log said: Claude Code returned an error result. That line is harmless.";
+  const r = await driveRunnerError(async function* () {
+    yield { type: "result", subtype: "success", is_error: false, result: text, session_id: "s-1" };
+  });
+  assert.equal(r.res.statusCode, 200);
+  assert.ok(r.contents.join("").includes(text), "the answer was not streamed");
+  assert.equal(r.stop, true);
+  assert.equal(r.done, true);
+  assert.deepEqual(r.errorChunks, []);
+  assert.equal(r.calls, 1);
+});
+
+test("R3b: the same quoting answer arriving as text deltas also streams normally", async () => {
+  const r = await driveRunnerError(async function* () {
+    yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Claude Code returned an error result " } } };
+    yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "is a phrase." } } };
+    yield { type: "result", subtype: "success", is_error: false, result: "Claude Code returned an error result is a phrase.", session_id: "s-1" };
+  });
+  assert.equal(r.res.statusCode, 200);
+  assert.equal(r.contents.slice(0, 2).join(""), "Claude Code returned an error result is a phrase.");
+  assert.equal(r.stop, true);
+  assert.equal(r.done, true);
+});
+
+test("R4: an SDK throw AFTER text ends the stream with an error chunk, no stop and no [DONE]", async () => {
+  // Kills M1 and M4 on the after-output path.
+  const r = await driveRunnerError(async function* () {
+    yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Partial " } } };
+    throw new Error(QUOTA_ENVELOPE);
+  });
+  assert.equal(r.res.statusCode, 200, "precondition: the answer had started");
+  assert.deepEqual(r.contents, ["Partial "], `only the answer text may be content: ${JSON.stringify(r.contents)}`);
+  assert.equal(r.contents.some((c) => UPSTREAM_ERROR_WORDS.test(c)), false);
+  assert.equal(r.stop, false, "finish_reason stop after an error");
+  assert.equal(r.done, false, "[DONE] after an error");
+  assert.equal(r.errorChunks.length, 1, "the stream did not end with exactly one error chunk");
+  assert.equal(r.errorChunks[0].error.type, "server_error");
+  assert.equal(r.res.writableEnded, true, "the stream was left open");
+  assert.equal(r.calls, 1);
+});
+
+test("R4b: an is_error result AFTER text ends the stream with an error chunk, no stop and no [DONE]", async () => {
+  // Kills M2 on the after-output path.
+  const r = await driveRunnerError(async function* () {
+    yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "Partial " } } };
+    yield { type: "result", subtype: "success", is_error: true, result: "API Error: 529 overloaded", session_id: "s-1" };
+  });
+  assert.deepEqual(r.contents, ["Partial "]);
+  assert.equal(r.stop, false);
+  assert.equal(r.done, false);
+  assert.equal(r.errorChunks.length, 1);
+  assert.equal(r.res.writableEnded, true);
+});
+
+test("R2b non-streaming: subtype success with is_error:true is a 502, not an answer", async () => {
+  // The same structured check on `handleNonStreamingResponse`: before the fix
+  // it returned the upstream text as a 200 `chat.completion`.
+  const r = await driveRunnerError(async function* () {
+    yield { type: "result", subtype: "success", is_error: true, result: "API Error: 401 {\"type\":\"error\"}", session_id: "s-1" };
+  }, { stream: false });
+  assert.equal(r.res.statusCode, 502);
+  const parsed = JSON.parse(r.res.body);
+  assert.equal(parsed.choices, undefined, "the upstream error was returned as a chat completion");
+  assert.equal(parsed.error?.type, "server_error");
+  assert.equal(r.calls, 1);
+});
+
+test("R3 non-streaming: a successful answer quoting the envelope phrase is returned as the answer", async () => {
+  const text = "Claude Code returned an error result -- quoted, not an error.";
+  const r = await driveRunnerError(async function* () {
+    yield { type: "result", subtype: "success", is_error: false, result: text, session_id: "s-1" };
+  }, { stream: false });
+  assert.equal(r.res.statusCode, 200);
+  const parsed = JSON.parse(r.res.body);
+  assert.ok(parsed.choices[0].message.content.startsWith(text));
+  assert.equal(parsed.choices[0].finish_reason, "stop");
+});
+
+test("a compaction summary is restored when a STREAMING request fails before any output", async () => {
+  // Before booqi-app/app#318 the streaming header was sent before the query
+  // ran, so this failure counted as delivered and the summary was lost (the
+  // caveat the README recorded). With the header deferred, the failure reaches
+  // the 502 path and the restore, as on the non-streaming path.
+  const { res, sessionStore, conversationId } = await run({
+    systemPrompt: "P", compactSummary: "SUMMARY-TEXT", behaviour: "fail", stream: true,
+  });
+
+  assert.equal(res.statusCode, 502, "precondition: the streaming request failed without reaching the client");
+  assert.equal(sessionStore.get(conversationId)?.compactSummary, "SUMMARY-TEXT");
+});
