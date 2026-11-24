@@ -82,16 +82,23 @@ function fakeQuery(captured: Captured[], behaviour: "success" | "fail"): QueryFn
  * `failEndAfterHeaders` simulates the client disconnecting between
  * `writeHead` and `end` (EPIPE), which is the only way to reach the catch
  * block's `res.headersSent` arm.
+ *
+ * `headers` records what `writeHead` was handed, exactly as handed (names are
+ * NOT normalised), so a test can read the response headers the client would
+ * see -- `x-should-retry` is behaviour, not decoration (booqi-app/app#318
+ * row 1).
  */
 function fakeRes(opts: { failEndAfterHeaders?: boolean } = {}) {
   return {
     headersSent: false,
     writableEnded: false,
     statusCode: 0,
+    headers: {} as Record<string, string>,
     body: "",
     setHeader() {},
-    writeHead(status: number) {
+    writeHead(status: number, headers?: Record<string, string>) {
       this.statusCode = status;
+      this.headers = { ...(headers ?? {}) };
       this.headersSent = true;
       return this;
     },
@@ -1786,5 +1793,146 @@ for (const stream of [true, false]) {
     assert.equal(r.calls, 2, "the stale session was not reset and retried");
     assert.equal(r.res.statusCode, 200);
     assert.equal(r.storedSession, "sdk-session-10");
+  });
+}
+
+// ── booqi-app/app#318 row 1: no resend of a turn whose tool already ran ──
+//
+// Measured on 925ffec9 (start-FA b1124-2): a turn that announced a
+// `tool_use`, got its `tool_result` and then failed with `529 overloaded` was
+// run AGAIN by the bridge's own transient retry (`calls=2` on both paths), and
+// the 502 that followed carried `Content-Type` only. OpenClaw's bundled
+// `openai@6.45.0` client resends every 5xx twice unless the response carries
+// `x-should-retry`, so one user message ran the tool turn 6 times -- a write
+// tool included.
+//
+// Two layers, both decided by ONE per-request flag -- "this request's SDK turn
+// announced a tool call" -- and never by the error class or its text:
+//   L1  `executeWithRetries` makes no further attempt once the flag is set;
+//   L2  the 502 that follows carries `x-should-retry: false`, so the client
+//       does not resend either.
+// A failure BEFORE any tool call keeps both retries and no header (T3).
+// Each test names the mutant it kills (grant app#318 comment 7125769924).
+
+/** A recorded response header, looked up the way HTTP does: by name, case-insensitively. */
+function headerNamed(res: any, name: string): string | undefined {
+  const hit = Object.entries(res.headers ?? {}).find(([k]) => k.toLowerCase() === name);
+  return hit === undefined ? undefined : String(hit[1]);
+}
+
+/**
+ * A turn that calls a tool and then fails: `init`, an assistant `tool_use`, its
+ * `tool_result`, then `fail` throws when `failOn(call)` -- otherwise the turn
+ * answers. Every message carries the session id, as the pinned SDK's do.
+ */
+function toolTurn(failOn: (call: number) => boolean, message = "529 overloaded") {
+  return async function* (call: number) {
+    yield { type: "system", subtype: "init", session_id: "sdk-session-9" };
+    yield {
+      type: "assistant", session_id: "sdk-session-9",
+      message: { content: [{ type: "tool_use", id: `toolu_${call}`, name: "mcp__booqi__propose_booking", input: { intake_id: "i-1" } }] },
+    };
+    yield {
+      type: "user", session_id: "sdk-session-9",
+      message: { content: [{ type: "tool_result", tool_use_id: `toolu_${call}`, content: "ok" }] },
+    };
+    if (failOn(call)) throw new Error(message);
+    yield { type: "result", subtype: "success", is_error: false, result: "second try", session_id: "sdk-session-9" };
+  };
+}
+
+/** The 502 JSON error body, unchanged by row 1: `server_error`, no `choices`. */
+function assertErrorBody(r: StreamRead, message: string): void {
+  assert.equal(r.res.statusCode, 502);
+  const parsed = JSON.parse(r.res.body);
+  assert.equal(parsed.error?.type, "server_error");
+  assert.equal(parsed.error?.message, message);
+  assert.equal(parsed.choices, undefined);
+  assert.equal(r.done, false);
+}
+
+for (const stream of [true, false]) {
+  const via = stream ? "streaming" : "non-streaming";
+
+  test(`T1: a transient error AFTER a tool_use is not retried by the bridge (${via})`, async () => {
+    // AC-1. Kills M1 (flag never set) and M3 (the L1 guard dropped): the
+    // second attempt would answer, so a retry shows up as calls=2 and a 200.
+    const r = await driveRunnerError(toolTurn((call) => call === 1), { stream });
+    assert.equal(r.calls, 1, `the tool turn was run again: calls=${r.calls}`);
+    assertErrorBody(r, "529 overloaded");
+    assert.deepEqual(r.contents, []);
+  });
+
+  test(`T2: the 502 after a tool_use carries x-should-retry: false, body unchanged (${via})`, async () => {
+    // AC-2. Kills M1, M4 (header dropped) and M7 (value `true`, or a misspelt
+    // name). Fails on EVERY attempt, so the header is read on the 502 even if
+    // L1 were gone.
+    const r = await driveRunnerError(toolTurn(() => true), { stream });
+    assertErrorBody(r, "529 overloaded");
+    assert.equal(headerNamed(r.res, "x-should-retry"), "false",
+      `the 502 after a tool_use lets the client resend: ${JSON.stringify(r.res.headers)}`);
+    assert.equal(headerNamed(r.res, "content-type"), "application/json");
+  });
+
+  test(`T3 control: a transient error with NO tool_use is still retried, and its 502 has no x-should-retry (${via})`, async () => {
+    // AC-3. Kills M5 (header on every 502) and M6 (no retry on any failure).
+    // Before any tool call a resend is harmless, so the bridge retries and the
+    // client keeps its own resends.
+    const r = await driveRunnerError(async function* () {
+      yield { type: "system", subtype: "init", session_id: "sdk-session-9" };
+      throw new Error("529 overloaded");
+    }, { stream });
+    assert.equal(r.calls, 2, "the transient error before any tool call was not retried");
+    assertErrorBody(r, "529 overloaded");
+    assert.equal(headerNamed(r.res, "x-should-retry"), undefined,
+      `a 502 before any tool call forbids the client's resend: ${JSON.stringify(r.res.headers)}`);
+  });
+
+  test(`T4: a tool_use seen only as a streaming content_block_start counts as seen (${via})`, async () => {
+    // Kills M2 (flag set from assistant messages only). The tool call is
+    // announced and the turn dies before the assistant message is assembled.
+    const r = await driveRunnerError(async function* (call: number) {
+      yield { type: "system", subtype: "init", session_id: "sdk-session-9" };
+      yield {
+        type: "stream_event", session_id: "sdk-session-9",
+        event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: `toolu_${call}`, name: "mcp__booqi__propose_booking", input: {} } },
+      };
+      if (call === 1) throw new Error("529 overloaded");
+      yield { type: "result", subtype: "success", is_error: false, result: "second try", session_id: "sdk-session-9" };
+    }, { stream });
+    assert.equal(r.calls, 1, `the announced tool turn was run again: calls=${r.calls}`);
+    assertErrorBody(r, "529 overloaded");
+    assert.equal(headerNamed(r.res, "x-should-retry"), "false");
+  });
+
+  test(`T5: a stale-session error text after a tool_use is not reset, not retried, and its LiveSessionError 502 carries x-should-retry: false (${via})`, async () => {
+    // R1-A3: the header follows the tool flag, not the error class. This error
+    // is NOT transient, so it reaches the 502 through the LiveSessionError /
+    // non-transient branch. Kills M9 (header only on the transient branch).
+    const stale = "No conversation found with session ID: sdk-session-9";
+    const r = await driveRunnerError(toolTurn((call) => call === 1, stale), {
+      stream, resumeSessionId: "sdk-session-9",
+    });
+    assert.equal(r.calls, 1, `the tool turn was run again: calls=${r.calls}`);
+    assert.equal(r.storedSession, "sdk-session-9", "the conversation's session was reset");
+    assertErrorBody(r, stale);
+    assert.equal(headerNamed(r.res, "x-should-retry"), "false",
+      `the LiveSessionError 502 after a tool_use lets the client resend: ${JSON.stringify(r.res.headers)}`);
+  });
+
+  test(`T6: the tool flag is per request -- a later request without a tool_use gets its normal retry (${via})`, async () => {
+    // Kills M8 (the flag leaks across requests).
+    const first = await driveRunnerError(toolTurn(() => true), { stream });
+    assert.equal(first.calls, 1, "precondition: request 1 called a tool and was not retried");
+    assert.equal(headerNamed(first.res, "x-should-retry"), "false", "precondition: request 1's 502 forbids a resend");
+
+    const second = await driveRunnerError(async function* () {
+      yield { type: "system", subtype: "init", session_id: "sdk-session-9" };
+      throw new Error("529 overloaded");
+    }, { stream });
+    assert.equal(second.calls, 2, "request 2 inherited request 1's tool flag and lost its retry");
+    assertErrorBody(second, "529 overloaded");
+    assert.equal(headerNamed(second.res, "x-should-retry"), undefined,
+      "request 2 inherited request 1's tool flag on its 502");
   });
 }
