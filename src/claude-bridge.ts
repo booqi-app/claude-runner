@@ -367,6 +367,55 @@ function provesLiveSession(msg: unknown): boolean {
   return m?.type !== "result" && typeof m?.session_id === "string" && m.session_id.length > 0;
 }
 
+// ── Tool calls: a turn that called a tool is never run again ────────
+
+/**
+ * Per-request state that outlives a single attempt. `executeWithRetries`
+ * creates one per request -- never at module level, so one request's tool
+ * call cannot cost a later request its retry.
+ */
+interface RequestTurnState {
+  /**
+   * The SDK announced a tool call during this request. Set when the call is
+   * ANNOUNCED (the assistant `tool_use` block, or the streaming
+   * `content_block_start` of type `tool_use`), not when its `tool_result`
+   * arrives: a failure between the announcement and the tool run then counts
+   * as "after a tool", which is the safe side.
+   */
+  toolUseSeen: boolean;
+}
+
+/**
+ * Whether an SDK message announces a tool call. Read from the message
+ * STRUCTURE only (block and event types), never from any text.
+ */
+function announcesToolUse(msg: unknown): boolean {
+  const m = msg as { type?: unknown; message?: { content?: unknown }; event?: any } | null;
+  if (m?.type === "assistant") {
+    const content = m.message?.content;
+    return Array.isArray(content) && content.some((block: any) => block?.type === "tool_use");
+  }
+  if (m?.type === "stream_event") {
+    return m.event?.type === "content_block_start" && m.event.content_block?.type === "tool_use";
+  }
+  return false;
+}
+
+/**
+ * The response header that tells the client NOT to resend this request.
+ *
+ * Sent on the 502 of a request whose SDK turn announced a tool call, and on no
+ * other response. The client in a Booqi cell is OpenClaw's `openai-completions`
+ * transport, i.e. the `openai` npm SDK pinned inside OpenClaw (`openai@6.45.0`
+ * in `2026.7.1-beta.5`). That client resends every 5xx twice by default, and
+ * its `shouldRetry` obeys `x-should-retry` before it looks at the status. A
+ * resend re-runs the whole turn, tools included -- a write tool would write
+ * twice (booqi-app/app#318 row 1). The header is not a standard one; it is the
+ * pinned SDK's behaviour, and a follow-up booqi-app/infra change will make
+ * every OpenClaw bump re-check it (a tripwire in the cell image pin test).
+ */
+const NO_RESEND_HEADERS: Readonly<Record<string, string>> = { "x-should-retry": "false" };
+
 // ── Message extraction ──────────────────────────────────────────────
 
 function flattenContent(content: unknown): string {
@@ -721,6 +770,9 @@ export async function executeWithRetries(
   const compactSummary = sessionStore.consumeCompactSummary(conversationId);
   let summaryDelivered = false;
 
+  // Per request, shared by every attempt. See `RequestTurnState`.
+  const turn: RequestTurnState = { toolUseSeen: false };
+
   try {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (attempt > 0) {
@@ -780,12 +832,12 @@ export async function executeWithRetries(
         if (stream) {
           await handleStreamingResponse(
             effectivePrompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
-            res, requestId, config, chatSessionId, hintLog, affinityHeaders,
+            res, requestId, config, chatSessionId, hintLog, affinityHeaders, turn,
           );
         } else {
           await handleNonStreamingResponse(
             effectivePrompt, model, effectiveSystemPrompt, resumeSessionId, newSessionId, conversationId,
-            res, requestId, config, chatSessionId, hintLog, affinityHeaders,
+            res, requestId, config, chatSessionId, hintLog, affinityHeaders, turn,
           );
         }
         summaryDelivered = true;
@@ -798,6 +850,15 @@ export async function executeWithRetries(
           // summary in its prompt. Replaying it next turn would duplicate it.
           summaryDelivered = true;
           return;
+        }
+
+        // A turn that called a tool is never run again -- not as a transient
+        // retry and not as a stale-session retry. The tool may have written;
+        // running the turn again would write again. The 502 below then tells
+        // the client not to resend either. The decision is the flag, never
+        // the error class or its text. booqi-app/app#318 row 1.
+        if (turn.toolUseSeen) {
+          break;
         }
 
         // Stale session — retry with fresh.
@@ -831,7 +892,12 @@ export async function executeWithRetries(
     }
 
     if (!res.headersSent) {
-      res.writeHead(502, { "Content-Type": "application/json" });
+      // Whatever the error class (transient, `LiveSessionError`, anything
+      // else): after a tool call this 502 forbids the client's resend.
+      res.writeHead(502, {
+        "Content-Type": "application/json",
+        ...(turn.toolUseSeen ? NO_RESEND_HEADERS : {}),
+      });
       res.end(JSON.stringify({ error: { message: lastError || "SDK query failed after retries", type: "server_error" } }));
     }
   } finally {
@@ -872,6 +938,7 @@ async function handleStreamingResponse(
   chatSessionId: string | undefined,
   hintLog: (message: string) => void,
   affinityHeaders: readonly AffinityHeaderExamination[],
+  turn: RequestTurnState,
 ): Promise<void> {
   const abortController = new AbortController();
   const options = buildQueryOptions(
@@ -922,6 +989,7 @@ async function handleStreamingResponse(
   try {
     for await (const msg of q) {
       if (provesLiveSession(msg)) sessionAlive = true;
+      if (announcesToolUse(msg)) turn.toolUseSeen = true;
 
       // Token-level streaming deltas
       if (msg.type === "stream_event") {
@@ -1074,6 +1142,7 @@ async function handleNonStreamingResponse(
   chatSessionId: string | undefined,
   hintLog: (message: string) => void,
   affinityHeaders: readonly AffinityHeaderExamination[],
+  turn: RequestTurnState,
 ): Promise<void> {
   const abortController = new AbortController();
   const options = buildQueryOptions(
@@ -1090,6 +1159,7 @@ async function handleNonStreamingResponse(
   try {
     for await (const msg of q) {
       if (provesLiveSession(msg)) sessionAlive = true;
+      if (announcesToolUse(msg)) turn.toolUseSeen = true;
       if (msg.type === "result") {
         const result = msg as any;
         if (result.session_id) {

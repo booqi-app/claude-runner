@@ -78,7 +78,7 @@ Extension settings are in `~/.openclaw/extensions/claude-runner/config.json`:
 | `queueMaxDelayMs` | `4000` | Max delay between SDK queries (ms) |
 | `queueMaxConcurrency` | `1` | Max concurrent SDK queries |
 | `sessionTtlMs` | `3600000` | Session cache TTL (ms) |
-| `maxRetries` | `2` | How many times a transient SDK failure is retried before the request fails |
+| `maxRetries` | `2` | How many times a transient SDK failure is retried before the request fails. A turn that has called a tool is never retried, whatever this is set to (see [Runner errors](#runner-errors)) |
 | `effort` | `"medium"` | Effort level: low, medium, high, max |
 | `maxBudgetUsd` | — | Cost cap per request (optional) |
 | `tools` | `[]` | The tools the SDK session may use. **An absent key means NO built-in tools.** The bridge sets `tools: []` when the key is missing; it does not let the Agent SDK fall back to its full built-in set (`Bash`, `Read`, `Write`, `Edit`, `WebFetch`, `WebSearch`), which it would otherwise do *under* `permissionMode: "bypassPermissions"`. A present value must be an **array** — a string, a number, `null`, `false` or an object stops the bridge at configuration load with an error naming the key, rather than being coerced or silently dropped. `"tools": []` and an absent key behave identically; write the key when you want the restriction to be visible to the next reader. Note this governs the **built-in** tool set only — MCP tools named in `mcpServers` arrive regardless. ⚠️ **Behaviour change on upgrade:** see [An absent `tools` key now means no tools](#an-absent-tools-key-now-means-no-tools). |
@@ -270,10 +270,20 @@ A failed SDK turn is answered as a **provider error**, never as answer text ([bo
 
 | When the turn fails | Response |
 |---|---|
-| Before any answer text (both paths) | The existing error path: a stale-session error retries on a fresh session, an error matching the transient patterns (`maxRetries`) is retried, anything else is HTTP `502` with `{"error": {"message": …, "type": "server_error"}}`. On the streaming path the `200` header and the role chunk are only sent once the first answer text exists (or, for a turn that succeeds without any text, at its end), which is what keeps this path reachable. Once the SDK has emitted a message other than the `result` that carries a `session_id` (its `init` message, a stream event, an assistant message), the session is known to be alive, and the failure never takes the stale-session reset. A session the CLI cannot resume fails with the `result` alone and is still reset. |
+| Before any answer text and before any tool call (both paths) | The existing error path: a stale-session error retries on a fresh session, an error matching the transient patterns (`maxRetries`) is retried, anything else is HTTP `502` with `{"error": {"message": …, "type": "server_error"}}`. On the streaming path the `200` header and the role chunk are only sent once the first answer text exists (or, for a turn that succeeds without any text, at its end), which is what keeps this path reachable. Once the SDK has emitted a message other than the `result` that carries a `session_id` (its `init` message, a stream event, an assistant message), the session is known to be alive, and the failure never takes the stale-session reset. A session the CLI cannot resume fails with the `result` alone and is still reset. |
+| Before any answer text, **after a tool call** (both paths) | No further attempt of any kind (no transient retry, no stale-session retry), and the HTTP `502` carries the header **`x-should-retry: false`**. The body is the same `{"error": {"message": …, "type": "server_error"}}`. |
 | After answer text has streamed | The stream ends with one chunk carrying `{"error": {"message": …, "type": "server_error"}}` and no `choices`. No `finish_reason: "stop"`, no context bar and no `data: [DONE]` follow. |
 
 The error text goes into the `error` object only, never into a `content` delta.
+
+#### No resend after a tool call
+
+A turn that has called a tool is never run again, by the bridge or by its client ([booqi-app/app#318](https://github.com/booqi-app/app/issues/318) row 1). The tool may already have written, and running the whole turn again would run its tools again, so a write tool would write twice. A visible failure is the intended outcome; the user can resend.
+
+- **What counts as a tool call:** the SDK announced one during the request, either as a `tool_use` block in an assistant message or as a streaming `content_block_start` of type `tool_use`. The flag is set at the announcement, not when the `tool_result` arrives, so a failure between the two also counts. It is read from the message structure only, never from error text, and it is kept per request: a later request starts without it.
+- **Bridge side:** `executeWithRetries` stops at the first failure after a tool call, whatever the error class (transient, a failure of a live session, anything else).
+- **Client side:** the `502` then carries `x-should-retry: false`, and no other response does. In a Booqi cell the client is OpenClaw's `openai-completions` transport, i.e. the `openai` npm SDK pinned inside OpenClaw (`openai@6.45.0` in OpenClaw `2026.7.1-beta.5`). That SDK resends every 5xx twice by default, but its `shouldRetry` obeys `x-should-retry` first. The header is not a standard one and is not in the SDK's README: this is a dependency on the pinned SDK's behaviour. A follow-up booqi-app/infra change (not yet merged when this was written) will add a tripwire to the cell image pin test, so that every OpenClaw bump re-checks that the bundled `openai` SDK still obeys it.
+- **Before any tool call nothing changes:** transient errors are still retried, and the `502` carries no `x-should-retry`, so the client keeps its own resends. They are harmless there.
 
 ### Session info response
 
