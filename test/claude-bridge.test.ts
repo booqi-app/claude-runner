@@ -1935,4 +1935,43 @@ for (const stream of [true, false]) {
     assert.equal(headerNamed(second.res, "x-should-retry"), undefined,
       "request 2 inherited request 1's tool flag on its 502");
   });
+
+  test(`T1b: a tool_use announced in a multi-block assistant message counts BEFORE its tool_result arrives (${via})`, async () => {
+    // R1-A3: the flag is set at the announcement, not at the tool_result. The
+    // turn dies after `[text, tool_use]` and before any tool_result. Kills a
+    // flag set from `tool_result` and a check of `content[0]` only (review
+    // round 1, verification MINOR-1 and NIT-1).
+    const r = await driveRunnerError(async function* (call: number) {
+      yield { type: "system", subtype: "init", session_id: "sdk-session-9" };
+      yield {
+        type: "assistant", session_id: "sdk-session-9",
+        message: { content: [
+          { type: "text", text: "Let me file that." },
+          { type: "tool_use", id: `toolu_${call}`, name: "mcp__booqi__propose_booking", input: { intake_id: "i-1" } },
+        ] },
+      };
+      if (call === 1) throw new Error("529 overloaded");
+      yield { type: "result", subtype: "success", is_error: false, result: "second try", session_id: "sdk-session-9" };
+    }, { stream });
+    assert.equal(r.calls, 1, `the announced tool turn was run again: calls=${r.calls}`);
+    assertErrorBody(r, "529 overloaded");
+    assert.equal(headerNamed(r.res, "x-should-retry"), "false");
+  });
+
+  test(`T5b: after a tool_use the stale-session reset does not fire even when no message proved the session alive (${via})`, async () => {
+    // L1 stops the stale-session retry too, by itself: here no message carries
+    // a `session_id`, so the error is NOT a LiveSessionError and only the tool
+    // flag stands between it and the reset. Kills the L1 guard placed after
+    // the stale-session branch (review round 1, correctness MINOR).
+    const stale = "No conversation found with session ID: sdk-session-9";
+    const r = await driveRunnerError(async function* (call: number) {
+      yield { type: "assistant", message: { content: [{ type: "tool_use", id: `toolu_${call}`, name: "mcp__booqi__propose_booking", input: {} }] } };
+      if (call === 1) throw new Error(stale);
+      yield { type: "result", subtype: "success", is_error: false, result: "fresh answer", session_id: "sdk-session-10" };
+    }, { stream, resumeSessionId: "sdk-session-9" });
+    assert.equal(r.calls, 1, `the tool turn was run again on a fresh session: calls=${r.calls}`);
+    assert.equal(r.storedSession, "sdk-session-9", "the conversation's session was reset");
+    assertErrorBody(r, stale);
+    assert.equal(headerNamed(r.res, "x-should-retry"), "false");
+  });
 }

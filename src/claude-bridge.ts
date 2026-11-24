@@ -411,8 +411,8 @@ function announcesToolUse(msg: unknown): boolean {
  * its `shouldRetry` obeys `x-should-retry` before it looks at the status. A
  * resend re-runs the whole turn, tools included -- a write tool would write
  * twice (booqi-app/app#318 row 1). The header is not a standard one; it is the
- * pinned SDK's behaviour, and a follow-up booqi-app/infra change makes every
- * OpenClaw bump re-check it (a tripwire in the cell image pin test).
+ * pinned SDK's behaviour, and a follow-up booqi-app/infra change will make
+ * every OpenClaw bump re-check it (a tripwire in the cell image pin test).
  */
 const NO_RESEND_HEADERS: Readonly<Record<string, string>> = { "x-should-retry": "false" };
 
